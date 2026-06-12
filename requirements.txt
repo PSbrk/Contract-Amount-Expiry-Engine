@@ -1,0 +1,9 @@
+requests>=2.32
+pandas>=2.2
+openpyxl>=3.1
+google-api-python-client>=2.140
+google-auth>=2.32
+google-auth-httplib2>=0.2
+rapidfuzz>=3.9
+python-dotenv>=1.0
+pytest>=8.2
