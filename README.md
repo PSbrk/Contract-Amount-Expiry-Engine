@@ -1,48 +1,53 @@
 # Contract-Amount-Expiry-Engine
 
-Tracks how much money has been spent against each contract in the Asana Contractor
-Database, paces it against the contract term, writes summary numbers back to four
-Asana custom fields, and emails alerts when contracts cross budget or pace thresholds.
+Tracks how much money has been spent against each contract in the Asana
+Contractor Database, paces it against the contract term, writes five summary
+values back to Asana, and surfaces alerts via a binary `Alarms` field — an
+Asana automation rule (built by the operator) is what sends the email when
+that field flips to `ALARM`.
 
 ## Architecture
 
 | Piece | Job |
 |---|---|
-| **Engine** (this repo) | Python. Runs on GitHub Actions on a cron. Reads the Tableau transaction export from the Drive inbox, reads Asana, computes per-contract spend/pace/alarms, writes the Google Sheet dashboard, writes 4 Asana custom fields, POSTs new alerts to n8n. |
-| **n8n Cloud** | 2-node workflow: Webhook trigger → Gmail Send (via a connected Gmail OAuth node on `philip.seabrook@life.church`). Just sends what the engine hands it. |
-| **Google Sheet** | "Contract Amount Expiry Engine" dashboard + working/state tabs. Sheet ID lives in `config/settings.py`. |
-| **Google Drive inbox** | Folder where the Tableau export is dropped manually. Folder ID in `config/settings.py`. |
-| **Asana** | Contractor Database project. Source of contracts; destination of 4 custom-field values only. |
+| **Engine** (this repo) | Python. Runs on GitHub Actions cron + manual dispatch. Pulls the latest Tableau export from the Airtable Inbox, reads Asana, computes per-contract spend / pace / alarms, populates the Airtable Dashboard, writes five Asana custom-field values. |
+| **Airtable** | Single base — Inbox (attachment dropzone), Dashboard (one row per live contract), Needs Tagging (ambiguous attribution groupings), Vendor Aliases, Campus Map, Learned Mappings, State, Run Log. Hosts an Interface bar chart for `% Spent` per contract. |
+| **Asana** | Contractor Database project — source of contracts; destination of five custom-field values. The operator builds an automation rule on `Alarms` that emails when it flips to `ALARM`. |
 
 ## Hard guardrails
 
-- Asana is **read-only** except 4 custom-field values: `Spent so far`, `% Spent`,
-  `Spending Rate`, `Spending Rate Alarm`.
-- **Never** create, rename, or delete any project, section, field, option, task, or
-  other field value in the Contractor Database. No structural changes ever.
-- Until explicit approval, runs default to `DRY_RUN_ASANA=true` and never write.
-- Writes are idempotent — a value is only written when it actually changed.
+- Asana is **read-only** except five custom-field values on contracts passing the live gate: `Spent so far`, `% Spent`, `Spending Rate`, `Spending Rate Alarm`, and `Alarms`.
+- Never create, rename, delete, or modify any project, section, custom field, option, task, or non-listed field value in the Contractor Database. No structural changes ever.
+- Until explicit approval, runs default to `DRY_RUN_ASANA=true` and write nothing to Asana.
+- Writes are idempotent — a value is only written when it actually changed, so the Asana automation rule fires once per trip and doesn't re-fire on no-op runs.
+- Raw transactions (~50k rows) are processed in memory and never stored in Airtable. Airtable holds aggregates, state, and working tables only.
 
 ## Repo layout
 
 ```
-config/        Non-secret configuration (GIDs, sheet IDs, filters, bands, recipients, campus map)
-engine/        All compute and I/O modules
-tests/         Pytest suite + sample export fixture
-.github/       GitHub Actions workflow (daily cron + manual dispatch)
-n8n/           Exported n8n workflow JSON
-SETUP.md       One-time setup for the Google service account, sharing, and GitHub secrets
+config/        Non-secret configuration (Asana + Airtable + filter + threshold constants)
+engine/        Compute and I/O modules
+tests/         Pytest suite
+.github/       GitHub Actions workflows — wired in Step 8
+SETUP.md       One-time setup walkthrough (Airtable base + PAT, Asana PAT, GitHub secrets)
 ```
 
 ## Getting started
 
 1. Read [SETUP.md](SETUP.md) and complete the one-time setup.
-2. Copy `.env.example` to `.env` and fill in the three secrets for local runs.
+2. For local runs, `cp .env.example .env` and paste the three secrets.
 3. `pip install -r requirements.txt`
-4. Run a dry-run: `python -m engine.main --dry-run`.
+4. Verify the Asana schema matches the engine's expectations:
+   ```
+   python -m engine.audit
+   ```
+   Exits `0` on pass. Any `[FAIL]` line names the offending field, option, or section.
 
 ## Build order
 
-See [the original build prompt](#) (Section 15). Current step is tracked in the
-task list. Each step lands in a focused diff; no Asana writes happen until you
-approve them per-batch.
+Nine-step build per the prompt. Step 1 (config + read-only Asana audit) is
+landed; subsequent steps add Airtable wiring, ingestion, attribution,
+computation, Asana writes (gated on per-batch approval), change detection, a
+Tableau REST source stub, and the GitHub Actions schedule. Each step lands in
+a focused diff; no Asana writes happen until the operator approves them
+per-batch.

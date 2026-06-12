@@ -1,9 +1,26 @@
-requests>=2.32
+# Asana — official v5 SDK. The package name is "asana"; "python-asana" on PyPI is
+# unrelated and abandoned. v5 is a complete rewrite of v3 (Configuration + ApiClient
+# + per-resource API classes); v3-era tutorials do not apply.
+asana>=5.2,<6
+
+# Airtable — schema management (creates the 8 base tables) + record I/O + attachment
+# download. 3.x ships built-in 429 retry against the 5-req/sec/base limit.
+pyairtable==3.3.0
+
+# Data ingestion. The sample Tableau export is UTF-16 LE + tab-delimited
+# (despite the .csv extension), and Tableau occasionally produces .xlsx instead —
+# pandas + openpyxl covers both.
 pandas>=2.2
 openpyxl>=3.1
-google-api-python-client>=2.140
-google-auth>=2.32
-google-auth-httplib2>=0.2
+
+# Fuzzy vendor matching (Asana task names vs Tableau Vendor formatting variants).
 rapidfuzz>=3.9
+
+# HTTP — used to GET signed Airtable attachment URLs (no auth header sent).
+requests>=2.32
+
+# Local-run convenience: .env loaded automatically by engine.main when present.
+# CI does not use this — secrets come from GitHub Actions environment vars directly.
 python-dotenv>=1.0
+
 pytest>=8.2

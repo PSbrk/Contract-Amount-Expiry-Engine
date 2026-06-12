@@ -1,8 +1,8 @@
 """Campus crosswalk: Tableau campus codes ↔ Asana `Campus` option names.
 
-Editable defaults live here. The Google Sheet "Campus Map" tab is the runtime
+Editable defaults live here. The Airtable "Campus Map" table is the runtime
 source of truth — values from there override these defaults at run-time. This
-file just bootstraps the sheet on first run.
+file just bootstraps the table on first run.
 """
 
 from __future__ import annotations

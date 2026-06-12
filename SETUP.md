@@ -1,61 +1,53 @@
-# SETUP — one-time, do these before the engine can run
+# SETUP — one-time, do this before the engine can run
 
-You only do this once. After it's done, the engine runs headless on GitHub Actions.
+You only do this once. After it's done, the engine runs headless on GitHub
+Actions and you only return here if you rotate a token.
 
-## 1. Create the Google service account
+## 1. Create the Airtable base + PAT
 
-The engine logs into Google as a robot user called a **service account**. We're
-creating it inside the life.church Google Workspace under `philip.seabrook@life.church`.
-Workspace policies may gate some of the steps (project creation, service account
-key downloads, third-party OAuth scopes) — if Google blocks any step, capture the
-error and we'll route through IT or pivot to a personal Gmail.
+1. Sign in at https://airtable.com. The free plan is fine — the engine never
+   stores raw transactions in Airtable, only aggregates and working state.
+2. **Create the base**: Home → **+ Create a base** → **Start from scratch** →
+   name it `Contract Amount Expiry Engine` → Create. Leave it empty — the
+   engine provisions the eight tables itself on first run.
+3. **Grab the base ID**: open the base, look at the URL — the `app...` segment
+   right after `airtable.com/`. That's `AIRTABLE_BASE_ID`.
+4. **Create a Personal Access Token**: https://airtable.com/create/tokens →
+   **Create new token**.
+   - Name: `Contract Amount Expiry Engine`
+   - **Scopes** (all four are required):
+     - `data.records:read`
+     - `data.records:write`
+     - `schema.bases:read`
+     - `schema.bases:write` — lets the engine create the eight tables
+   - **Access** → **Add a base** → pick the base from step 1.2. Do **not**
+     grant access to all bases; keep the token scoped to one.
+   - **Create token** and copy it immediately — Airtable only shows it once.
+     That's `AIRTABLE_PAT`.
 
-1. Go to https://console.cloud.google.com/ and sign in as `philip.seabrook@life.church`.
-2. Top bar → project dropdown → **New Project**. Name it `contract-expiry-engine`
-   (or anything). Create it.
-3. With that project selected, open the left nav → **APIs & Services → Library**.
-   Search for and **Enable** each of these:
-   - **Google Sheets API**
-   - **Google Drive API**
-4. Left nav → **IAM & Admin → Service Accounts** → **+ Create service account**.
-   - Name: `contract-expiry-engine`
-   - Click **Create and Continue**.
-   - Skip the optional role grants (we use per-resource sharing instead). **Done**.
-5. Click into the new service account → **Keys** tab → **Add Key → Create new key →
-   JSON → Create**. A `.json` file downloads. Keep it; this is the engine's
-   identity. Treat it like a password.
-6. From the same page, copy the **service-account email** (looks like
-   `contract-expiry-engine@<project-id>.iam.gserviceaccount.com`). You'll paste it
-   into share dialogs in the next step.
+## 2. Create / rotate the Asana PAT
 
-## 2. Share the Google resources with the service account
+If a token exists from a previous build that ever touched chat or files,
+rotate it.
 
-Service accounts don't get implicit access to your files — even files that are
-"anyone with the link". You have to share each resource explicitly with the
-service-account email from step 1.6.
+1. Open https://app.asana.com/0/my-apps (Profile → **My Settings → Apps →
+   Manage Developer Apps**).
+2. Under **Personal access tokens**, **Deauthorize** any stale tokens.
+3. **+ Create new token** → description `Contract Amount Expiry Engine` →
+   Create. Copy it immediately. That's `ASANA_PAT`.
 
-| Resource | Permission | Link |
-|---|---|---|
-| Drive **inbox folder** (where Tableau exports drop) | **Viewer** | https://drive.google.com/drive/folders/1CLwDCuwCyTi8P45SvxZpEi7M4r-77ksi |
-| **Dashboard Sheet** | **Editor** | https://docs.google.com/spreadsheets/d/1FHWwbqrOrXvwj2Elec47vT6gv7-4tOIOAvFpTGX5HCo/edit |
-| **Capital Project Breakdown** (redundancy lookup only) | **Viewer** | https://docs.google.com/spreadsheets/d/1HTX7NVQYso56CL25g4TE1yxY7Nl5luSkMosyhfK7iRo/edit |
-
-For each: click **Share**, paste the service-account email, set the permission,
-**uncheck "Notify people"** (it would bounce — it's not a real mailbox), Send.
-
-## 3. Put secrets into GitHub Actions
+## 3. Put the three secrets into GitHub Actions
 
 Repo: https://github.com/PSbrk/Contract-Amount-Expiry-Engine
 → **Settings → Secrets and variables → Actions → New repository secret**.
-Create exactly these three:
 
 | Name | Value |
 |---|---|
-| `ASANA_PAT` | Your fresh Asana Personal Access Token (the one you generated). |
-| `GOOGLE_CREDENTIALS` | The **entire contents** of the JSON file from step 1.5 (open it in a text editor, copy-all, paste). |
-| `N8N_WEBHOOK_URL` | Filled in during build Step 5 once the n8n workflow exists. Leave blank for now. |
+| `AIRTABLE_PAT` | from step 1.4 |
+| `AIRTABLE_BASE_ID` | the `app...` from step 1.3 |
+| `ASANA_PAT` | from step 2.3 |
 
-## 4. (Optional) Set up local development
+## 4. (Optional) Local development
 
 For running the engine on your laptop without GitHub Actions:
 
@@ -65,28 +57,44 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 copy .env.example .env
-# edit .env: paste ASANA_PAT, point GOOGLE_CREDENTIALS_FILE at the JSON path
+# edit .env: paste ASANA_PAT, AIRTABLE_PAT, AIRTABLE_BASE_ID
+python -m engine.audit
 ```
 
-Then dry-run: `python -m engine.main --dry-run`.
+`.env` is gitignored. CI does not use it — secrets come straight from GitHub
+Actions environment variables.
 
-## 5. n8n workflow
+## 5. Your Asana automation rule (final step, deferred to build Step 5)
 
-Built in build Step 5. It's a 2-node flow: **Webhook** trigger → **Gmail Send**
-node using a Gmail OAuth credential on `philip.seabrook@life.church` (set up
-when we reach Step 5).
-Once published, copy the production webhook URL into the `N8N_WEBHOOK_URL` GitHub
-secret.
+The engine sets `Alarms` to `ALARM` on a contract when any budget band
+(75% / 90% / 100% / Over) is reached **or** runaway pace trips (subject to the
+30-day pace guard and minimum-spend floor). It writes the field idempotently —
+only when it actually changes — so a rule on this field fires once per trip
+and does not re-fire on subsequent runs while the value stays `ALARM`.
+
+Build the rule in Asana once the engine is writing the field (after build
+Step 5 approval):
+
+1. Open the Contractor Database project → **Customize → Rules → + Add rule**.
+2. **Trigger**: `Alarms` field changes to `ALARM`.
+3. **Action**: Send email to `philip.seabrook@life.church`. Add per-PM
+   recipients later as desired — the `PM Email` text field is read by the
+   engine and exposed on the task for use here.
+
+Escalation note: `Alarms` is binary. Once a contract trips `75%` and goes to
+`ALARM`, climbing to `90%` / `100%` / `Over` does **not** re-fire this rule
+(the field stays `ALARM`). If you want email at every band, build separate
+rules on the **`Spending Rate Alarm`** field instead, which the engine keeps
+current with the granular band detail.
 
 ---
 
 ### Checklist
 
-- [ ] Service account created, JSON key downloaded
-- [ ] Sheets API + Drive API enabled in the same Cloud project
-- [ ] Drive inbox folder shared (Viewer) with the service-account email
-- [ ] Dashboard Sheet shared (Editor) with the service-account email
-- [ ] Capital Project Breakdown sheet shared (Viewer) with the service-account email
-- [ ] `ASANA_PAT` secret set in GitHub
-- [ ] `GOOGLE_CREDENTIALS` secret set in GitHub (full JSON)
-- [ ] `N8N_WEBHOOK_URL` secret set in GitHub *(deferred to Step 5)*
+- [ ] Airtable base created and left empty
+- [ ] `AIRTABLE_PAT` generated (4 scopes, scoped to one base) and copied
+- [ ] `AIRTABLE_BASE_ID` (the `app...`) captured
+- [ ] `ASANA_PAT` rotated to a fresh token
+- [ ] All three secrets pasted into GitHub Actions
+- [ ] `python -m engine.audit` returns 0 once Step 1 is landed
+- [ ] Asana `Alarms → ALARM` email rule built (deferred to build Step 5)

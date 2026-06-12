@@ -1,9 +1,13 @@
-# Secrets
+# Secrets — keep this generous; cheaper to ignore broadly than to leak narrowly.
 .env
-.env.local
+.env.*
+!.env.example
+secrets/
 *.pem
+*.token
+*.secret
+credentials.json
 service-account*.json
-google-credentials*.json
 
 # Python
 __pycache__/
