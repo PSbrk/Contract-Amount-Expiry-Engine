@@ -5,12 +5,13 @@ Step 5):
 
   --audit                  verify Asana project schema matches expectations
   --provision              create/verify the 8 Airtable tables (idempotent)
-  --ingest                 full pipeline: promote -> ingest -> attribute -> write
-                           Airtable Needs Tagging + Run Log
+  --ingest                 full pipeline: promote -> ingest -> attribute ->
+                           compute -> write Airtable Dashboard + Needs
+                           Tagging + Run Log
   --ingest-file PATH       parse + filter a local export file; no attribution
                            and no Airtable writes (parser smoke-test only)
 
-The --ingest pipeline (Steps 2 + 3 combined):
+The --ingest pipeline (Steps 2 + 3 + 4 combined):
   1. Promote any operator-filled Needs Tagging rows into Learned Mappings.
   2. Pull the newest unprocessed Inbox attachment; dedup by SHA-256 content
      hash against prior Processed rows.
@@ -19,7 +20,12 @@ The --ingest pipeline (Steps 2 + 3 combined):
      in-scope DataFrame.
   5. Upsert Needs Tagging rows for ambiguous / unmatched groupings.
   6. Clean up stale Needs Tagging rows whose groups no longer need review.
-  7. Mark Inbox Processed; append Run Log row with the attribution summary.
+  7. Compute per-contract Dashboard rows for every contract passing the
+     live gate. Spent so far uses the term-window date filter against
+     attributed transactions (predecessor-term spend excluded).
+  8. Upsert Dashboard rows by Asana Task GID.
+  9. Mark Inbox Processed; append Run Log row with the attribution +
+     dashboard summaries.
 
 Pair --provision with --dry-run to see the schema plan without applying it.
 """
@@ -318,7 +324,8 @@ def _run_ingest_airtable() -> int:
                 processed_at_iso_date=today_iso,
                 notes=(
                     f"parsed {len(df):,} rows; in-scope {len(kept):,}. "
-                    f"Attribution: {attribution_summary['summary_line']}"
+                    f"Attribution: {attribution_summary['summary_line']}. "
+                    f"{attribution_summary['dashboard_line']}"
                 ),
             )
         append_run_log(
@@ -438,6 +445,30 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
     if stale_deleted:
         print(f"  cleaned up {stale_deleted} stale Needs Tagging row(s).")
 
+    # Step 4: compute per-contract Dashboard rows for live contracts.
+    from engine import compute
+    from engine.airtable_client import upsert_dashboard_row
+    today_date = datetime.now(timezone.utc).date()
+    dashboard_rows, skip_counts = compute.compute_dashboard(
+        kept_df, run, contracts, today_date,
+    )
+    alarms_count = sum(1 for r in dashboard_rows if r.alarms == "ALARM")
+    over_count = sum(1 for r in dashboard_rows if r.spending_rate_alarm == "Over")
+    print()
+    print("Dashboard compute")
+    print(f"  live rows:              {len(dashboard_rows):>6}")
+    print(f"  ALARM tripping:         {alarms_count:>6}")
+    print(f"  Over budget (>100%):    {over_count:>6}")
+    print(f"  skipped not-active:     {skip_counts['not_active']:>6}")
+    print(f"  skipped expired:        {skip_counts['expired']:>6}")
+    print(f"  skipped future-start:   {skip_counts['future_start']:>6}")
+    print(f"  skipped past-due:       {skip_counts['past_due']:>6}")
+    print(f"  skipped no-start-data:  {skip_counts['no_start_data']:>6}")
+    for dash_row in dashboard_rows:
+        upsert_dashboard_row(base, dash_row)
+    if dashboard_rows:
+        print(f"  upserted {len(dashboard_rows)} Dashboard row(s).")
+
     # Compose the audit-trail strings.
     summary_line = (
         f"auto {summary['auto']}, learned {summary['learned']}, "
@@ -449,12 +480,28 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
         notes_lines.append(f"Promoted {len(promotions)} prior Needs Tagging answers.")
     if stale_deleted:
         notes_lines.append(f"Cleaned up {stale_deleted} stale Needs Tagging rows.")
+    dashboard_line = (
+        f"Dashboard: {len(dashboard_rows)} live rows ({alarms_count} ALARM, "
+        f"{over_count} Over)."
+    )
+    notes_lines.append(dashboard_line)
+    notes_lines.append(
+        "Dashboard skips: "
+        f"not_active={skip_counts['not_active']}, "
+        f"expired={skip_counts['expired']}, "
+        f"future_start={skip_counts['future_start']}, "
+        f"past_due={skip_counts['past_due']}, "
+        f"no_start_data={skip_counts['no_start_data']}."
+    )
     review_flags = []
     if needs_tag:
         review_flags.append(f"{len(needs_tag)} group(s) in Needs Tagging awaiting Assign Contract.")
+    if alarms_count:
+        review_flags.append(f"{alarms_count} contract(s) tripping ALARM.")
 
     return {
         "summary_line": summary_line,
+        "dashboard_line": dashboard_line,
         "notes": "\n".join(notes_lines),
         "review_flags": "\n".join(review_flags),
         "run": run,

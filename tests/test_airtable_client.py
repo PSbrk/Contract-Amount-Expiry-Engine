@@ -766,3 +766,243 @@ def test_cleanup_stale_needs_tagging_with_empty_live_set_deletes_all_unfilled():
     remaining = base._tables["Needs Tagging"]
     assert len(remaining) == 1
     assert remaining[0]["fields"]["Group Key"] == "C|0|1|Z"
+
+
+# ---------------------------------------------------------------------------
+# upsert_dashboard_row — Step 4
+# ---------------------------------------------------------------------------
+
+from datetime import date  # noqa: E402
+
+from engine.compute import DashboardRow  # noqa: E402
+
+
+def _dashboard_row(**overrides) -> DashboardRow:
+    base = dict(
+        contract_name="Acme",
+        asana_task_gid="gid-acme-001",
+        campus_set="CEN, OMH",
+        contract_amount=10000.0,
+        spent_so_far=5000.0,
+        pct_spent=50.0,
+        spending_rate=1.0,
+        spending_rate_alarm=None,
+        alarms="Clear",
+        start=date(2026, 1, 1),
+        due=date(2026, 12, 31),
+        status="Active",
+        pm_email="pm@example.com",
+        last_updated=date(2026, 6, 12),
+    )
+    base.update(overrides)
+    return DashboardRow(**base)
+
+
+def test_upsert_dashboard_creates_new_row_when_no_gid_match():
+    from engine.airtable_client import upsert_dashboard_row
+    base = _RecordsBase()
+    result = upsert_dashboard_row(base, _dashboard_row())
+    assert result["fields"]["Contract"] == "Acme"
+    assert result["fields"]["Asana Task GID"] == "gid-acme-001"
+    assert result["fields"]["% Spent"] == 50.0
+    assert result["fields"]["Alarms"] == "Clear"
+    assert result["fields"]["Start"] == "2026-01-01"
+    # Exactly one create, no update.
+    creates = [op for op in base.ops if op[0] == "create"]
+    assert len(creates) == 1
+
+
+def test_upsert_dashboard_updates_existing_row_by_gid():
+    """Idempotency: same GID → update, not duplicate."""
+    from engine.airtable_client import upsert_dashboard_row
+    base = _RecordsBase()
+    upsert_dashboard_row(base, _dashboard_row(spent_so_far=1000.0, pct_spent=10.0))
+    upsert_dashboard_row(base, _dashboard_row(spent_so_far=8000.0, pct_spent=80.0,
+                                                spending_rate_alarm="75%",
+                                                alarms="ALARM"))
+    rows = base._tables["Dashboard"]
+    assert len(rows) == 1
+    assert rows[0]["fields"]["Spent so far"] == 8000.0
+    assert rows[0]["fields"]["% Spent"] == 80.0
+    assert rows[0]["fields"]["Spending Rate Alarm"] == "75%"
+    assert rows[0]["fields"]["Alarms"] == "ALARM"
+
+
+def test_upsert_dashboard_omits_none_fields_so_cells_stay_blank():
+    """When the pace guard blanks Spending Rate or the contract has no amount,
+    those fields must NOT be written as 0 — the cell stays blank."""
+    from engine.airtable_client import upsert_dashboard_row
+    base = _RecordsBase()
+    upsert_dashboard_row(base, _dashboard_row(
+        contract_amount=None,
+        pct_spent=None,
+        spending_rate=None,
+        spending_rate_alarm=None,
+    ))
+    rec = base._tables["Dashboard"][0]
+    assert "Contract Amount" not in rec["fields"]
+    assert "% Spent" not in rec["fields"]
+    assert "Spending Rate" not in rec["fields"]
+    assert "Spending Rate Alarm" not in rec["fields"]
+    # But the unconditional fields ARE present.
+    assert "Spent so far" in rec["fields"]
+    assert "Alarms" in rec["fields"]
+
+
+def test_upsert_dashboard_rejects_unknown_spending_rate_alarm():
+    """Client-side validation prevents typecast from silently spawning a
+    new singleSelect option in Airtable."""
+    from engine.airtable_client import upsert_dashboard_row
+    base = _RecordsBase()
+    with pytest.raises(ValueError, match="Spending Rate Alarm"):
+        upsert_dashboard_row(base, _dashboard_row(spending_rate_alarm="ALMOST"))
+
+
+def test_upsert_dashboard_rejects_unknown_alarms_value():
+    from engine.airtable_client import upsert_dashboard_row
+    base = _RecordsBase()
+    with pytest.raises(ValueError, match="Alarms"):
+        upsert_dashboard_row(base, _dashboard_row(alarms="MAYBE"))
+
+
+def test_upsert_dashboard_accepts_apostrophe_in_contract_name():
+    """Regression for the formula-escape fix: a contract name like Domino's
+    must round-trip through the GID lookup without breaking."""
+    from engine.airtable_client import upsert_dashboard_row
+    base = _RecordsBase()
+    upsert_dashboard_row(base, _dashboard_row(
+        contract_name="Domino's Pizza",
+        asana_task_gid="gid-with-quote",
+    ))
+    # Second upsert MUST update, not create a duplicate.
+    upsert_dashboard_row(base, _dashboard_row(
+        contract_name="Domino's Pizza",
+        asana_task_gid="gid-with-quote",
+        spent_so_far=999.0,
+    ))
+    assert len(base._tables["Dashboard"]) == 1
+    assert base._tables["Dashboard"][0]["fields"]["Spent so far"] == 999.0
+
+
+def test_upsert_dashboard_clears_cells_when_value_transitions_to_none():
+    """HIGH-severity regression from the Step 4 review: a Dashboard cell
+    that goes from a non-None value back to None must be CLEARED on update,
+    not left stale. The classic failure mode is Spending Rate Alarm showing
+    '75%' forever after the operator raised Contract Amount in Asana.
+
+    On the UPDATE path, nullable fields must be explicitly written as None
+    so Airtable's PATCH-merge clears the cell.
+    """
+    from engine.airtable_client import upsert_dashboard_row
+    base = _RecordsBase()
+
+    # Run 1: alarm tripping at 75% band.
+    upsert_dashboard_row(base, _dashboard_row(
+        pct_spent=80.0,
+        spending_rate=1.5,
+        spending_rate_alarm="75%",
+        alarms="ALARM",
+    ))
+    # Run 2: operator raised Contract Amount; %spent drops to 30, no band.
+    upsert_dashboard_row(base, _dashboard_row(
+        pct_spent=30.0,
+        spending_rate=0.5,
+        spending_rate_alarm=None,   # must clear the cell, not stay "75%"
+        alarms="Clear",
+    ))
+
+    rec = base._tables["Dashboard"][0]
+    # The cell MUST now be None / absent. Stale "75%" would be a SEV-1 bug.
+    assert rec["fields"].get("Spending Rate Alarm") is None, (
+        f"Spending Rate Alarm cell was not cleared on update; got "
+        f"{rec['fields'].get('Spending Rate Alarm')!r}. PATCH-merge bug."
+    )
+    assert rec["fields"]["Alarms"] == "Clear"
+    assert rec["fields"]["% Spent"] == 30.0
+
+
+def test_upsert_dashboard_clears_contract_amount_when_removed():
+    """Same family as the stale-cell bug above — Contract Amount removed in
+    Asana must clear the Dashboard cell."""
+    from engine.airtable_client import upsert_dashboard_row
+    base = _RecordsBase()
+    upsert_dashboard_row(base, _dashboard_row(contract_amount=10000.0))
+    upsert_dashboard_row(base, _dashboard_row(contract_amount=None,
+                                                pct_spent=None,
+                                                spending_rate=None,
+                                                spending_rate_alarm=None))
+    rec = base._tables["Dashboard"][0]
+    assert rec["fields"].get("Contract Amount") is None
+
+
+def test_dashboard_singleSelect_validators_match_settings_options():
+    """Four sources of truth must stay in lock-step:
+    1. settings.ASANA_SPENDING_RATE_ALARM_OPTIONS / ASANA_ALARMS_OPTIONS
+    2. airtable_schema._SPENDING_RATE_ALARM_CHOICES / _ALARMS_CHOICES
+    3. airtable_client._DASHBOARD_SPENDING_RATE_ALARM_VALUES / _DASHBOARD_ALARMS_VALUES
+    4. (Step 1 audit reads from settings → comparison covers that path)
+
+    A divergence between (1) and (3) means the client validator could reject
+    a valid Asana option (false negative) or accept a stale one (false
+    positive). Pin them equal here so a future edit to one fails CI.
+    """
+    from config import airtable_schema, settings
+    from engine.airtable_client import (
+        _DASHBOARD_ALARMS_VALUES,
+        _DASHBOARD_SPENDING_RATE_ALARM_VALUES,
+    )
+
+    # settings → client validator
+    assert _DASHBOARD_SPENDING_RATE_ALARM_VALUES == frozenset(
+        settings.ASANA_SPENDING_RATE_ALARM_OPTIONS
+    )
+    assert _DASHBOARD_ALARMS_VALUES == frozenset(settings.ASANA_ALARMS_OPTIONS)
+
+    # settings → Airtable schema choices
+    sra_schema_names = [
+        c["name"] for c in airtable_schema.field_spec("Dashboard", "Spending Rate Alarm")["options"]["choices"]
+    ]
+    assert set(sra_schema_names) == set(settings.ASANA_SPENDING_RATE_ALARM_OPTIONS)
+
+    alarms_schema_names = [
+        c["name"] for c in airtable_schema.field_spec("Dashboard", "Alarms")["options"]["choices"]
+    ]
+    assert set(alarms_schema_names) == set(settings.ASANA_ALARMS_OPTIONS)
+
+
+def test_upsert_dashboard_writes_all_fourteen_fields_on_create():
+    """Defensive: when a DashboardRow has every optional field set, the
+    create payload should contain all 14 keys mapping to Airtable's
+    Dashboard schema (the spec §3 fields). A regression that drops one
+    silently from the payload (e.g. someone removes 'Status' on a refactor)
+    would otherwise pass the existing tests."""
+    from engine.airtable_client import upsert_dashboard_row
+    base = _RecordsBase()
+    upsert_dashboard_row(base, _dashboard_row(
+        contract_name="Acme",
+        asana_task_gid="gid-full",
+        campus_set="CEN, OMH",
+        contract_amount=10000.0,
+        spent_so_far=5000.0,
+        pct_spent=50.0,
+        spending_rate=1.0,
+        spending_rate_alarm=None,  # validly None — band not reached
+        alarms="Clear",
+        start=date(2026, 1, 1),
+        due=date(2026, 12, 31),
+        status="Active",
+        pm_email="pm@example.com",
+        last_updated=date(2026, 6, 12),
+    ))
+    fields = base._tables["Dashboard"][0]["fields"]
+    # 13 fields populated; Spending Rate Alarm is intentionally absent
+    # because the band is None — that's the CREATE-path None-omitting
+    # behavior, verified separately.
+    for key in (
+        "Contract", "Asana Task GID", "Campus Set", "Contract Amount",
+        "Spent so far", "% Spent", "Spending Rate", "Alarms",
+        "Start", "Due", "Status", "PM Email", "Last Updated",
+    ):
+        assert key in fields, f"Dashboard create payload missing key {key!r}"
+    # And the absent one stays absent.
+    assert "Spending Rate Alarm" not in fields

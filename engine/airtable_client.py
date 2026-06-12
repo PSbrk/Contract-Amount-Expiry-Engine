@@ -611,6 +611,117 @@ def promote_filled_needs_tagging(
     return promotions
 
 
+# ---------------------------------------------------------------------------
+# Dashboard upsert — Step 4
+# ---------------------------------------------------------------------------
+
+# Pinned client-side so a typo or stale band string raises a clear error
+# rather than silently spawning a new Airtable singleSelect option via
+# typecast. Derived from config.settings to keep the four sources of truth
+# (Asana options, Airtable schema choices, Airtable client validator, Step 1
+# audit) in lock-step; a divergence in one place fails CI loudly.
+_DASHBOARD_SPENDING_RATE_ALARM_VALUES: frozenset[str] = frozenset(
+    settings.ASANA_SPENDING_RATE_ALARM_OPTIONS
+)
+_DASHBOARD_ALARMS_VALUES: frozenset[str] = frozenset(settings.ASANA_ALARMS_OPTIONS)
+
+
+# Engine-owned Dashboard fields whose value transitions None ↔ non-None
+# between runs. On the UPDATE path these MUST be sent as null (rather than
+# omitted from the payload) so a cell can transition BACK to blank — e.g.
+# Spending Rate Alarm flipping from "75%" to blank when the operator raised
+# Contract Amount and %spent dropped below 75. Without this, pyairtable's
+# default PATCH-merge keeps the prior value forever.
+_DASHBOARD_NULLABLE_FIELDS: tuple[str, ...] = (
+    "Contract Amount",
+    "% Spent",
+    "Spending Rate",
+    "Spending Rate Alarm",
+    "Due",
+    "Status",
+    "PM Email",
+)
+
+
+def _find_dashboard_by_gid(base, asana_task_gid: str) -> dict | None:
+    table = base.table(airtable_schema.table_spec("Dashboard")["name"])
+    return table.first(
+        formula=f"{{Asana Task GID}}={_formula_literal(asana_task_gid)}"
+    )
+
+
+def upsert_dashboard_row(base, row) -> dict:
+    """Idempotent upsert of a Dashboard row, keyed by Asana Task GID.
+
+    Single-select values (Spending Rate Alarm, Alarms) are validated
+    client-side before the API call — a stale or typo'd band would
+    otherwise be silently created as a new Airtable option under
+    typecast=True. None values are omitted from the payload so cells like
+    Spending Rate (blanked by the pace guard) stay empty in Airtable
+    rather than being written as 0.
+
+    `row` is an engine.compute.DashboardRow.
+    """
+    if row.spending_rate_alarm is not None and row.spending_rate_alarm not in _DASHBOARD_SPENDING_RATE_ALARM_VALUES:
+        raise ValueError(
+            f"Dashboard Spending Rate Alarm {row.spending_rate_alarm!r} is "
+            f"not one of {sorted(_DASHBOARD_SPENDING_RATE_ALARM_VALUES)}. "
+            f"Update airtable_schema + this validator together."
+        )
+    if row.alarms not in _DASHBOARD_ALARMS_VALUES:
+        raise ValueError(
+            f"Dashboard Alarms {row.alarms!r} is not one of "
+            f"{sorted(_DASHBOARD_ALARMS_VALUES)}."
+        )
+
+    # Required + unconditional fields. Spent so far is rounded defensively
+    # in case a caller passed an unrounded float; compute.py already rounds.
+    payload: dict[str, Any] = {
+        "Contract": row.contract_name,
+        "Asana Task GID": row.asana_task_gid,
+        "Campus Set": row.campus_set,
+        "Spent so far": round(row.spent_so_far, 2),
+        "Alarms": row.alarms,
+        "Start": row.start.isoformat(),
+        "Last Updated": row.last_updated.isoformat(),
+    }
+    # Optional nullable fields. On UPDATE we must EXPLICITLY send None to
+    # clear a previously-non-blank cell; pyairtable's table.update() is a
+    # PATCH-merge, so omitting the key keeps the prior value. On CREATE
+    # we omit None so we don't initialize a cell as null when blank is fine.
+    # The branch is decided below after the existing-record lookup.
+    nullable_values: dict[str, Any] = {
+        "Contract Amount":
+            round(row.contract_amount, 2) if row.contract_amount is not None else None,
+        "% Spent":
+            round(row.pct_spent, 2) if row.pct_spent is not None else None,
+        "Spending Rate":
+            round(row.spending_rate, 2) if row.spending_rate is not None else None,
+        "Spending Rate Alarm": row.spending_rate_alarm,
+        "Due": row.due.isoformat() if row.due is not None else None,
+        "Status": row.status,
+        "PM Email": row.pm_email,
+    }
+
+    table = base.table(airtable_schema.table_spec("Dashboard")["name"])
+    existing = _find_dashboard_by_gid(base, row.asana_task_gid)
+
+    if existing:
+        # UPDATE: include all nullable keys, sending None to clear the cell.
+        # This is the fix for a cell that transitioned non-None → None
+        # (e.g. Spending Rate Alarm dropping from "75%" back to blank).
+        payload.update(nullable_values)
+        return table.update(existing["id"], payload, typecast=True)
+
+    # CREATE: omit None values so we don't initialize cells as null on the
+    # first write — blank is the correct first-run state when no value has
+    # been computed yet.
+    for k, v in nullable_values.items():
+        if v is not None:
+            payload[k] = v
+    return table.create(payload, typecast=True)
+
+
 def cleanup_stale_needs_tagging(base, *, live_group_keys: set[str]) -> int:
     """Delete Needs Tagging rows whose Group Key is NOT in live_group_keys
     AND whose Assign Contract is empty.
@@ -662,4 +773,5 @@ __all__ = [
     "upsert_needs_tagging_group",
     "promote_filled_needs_tagging",
     "cleanup_stale_needs_tagging",
+    "upsert_dashboard_row",
 ]
