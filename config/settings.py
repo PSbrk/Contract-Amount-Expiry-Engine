@@ -7,8 +7,12 @@ secrets directly; local runs load a .env file via python-dotenv.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Final
+
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -180,11 +184,36 @@ MIN_SPEND_FLOOR: Final = 1000.0
 # code change)
 # ---------------------------------------------------------------------------
 
+_BOOL_TRUE_ALIASES: Final = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE_ALIASES: Final = frozenset({"0", "false", "no", "off", ""})
+
+
 def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var with a SAFE-by-default policy: an unrecognized
+    value falls back to `default` (with a warning), rather than collapsing
+    to False.
+
+    Critical for DRY_RUN_ASANA. The prior implementation returned False for
+    any value not in the truthy list — meaning a typo like
+    `DRY_RUN_ASANA=tru` (or an accidentally-blanked value mid-edit) would
+    silently flip the engine into live writes against Asana. With this
+    semantic, only an EXPLICIT false-alias turns dry-run off; anything
+    else stays at the safe default.
+    """
     raw = os.environ.get(name)
     if raw is None:
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    cleaned = raw.strip().lower()
+    if cleaned in _BOOL_TRUE_ALIASES:
+        return True
+    if cleaned in _BOOL_FALSE_ALIASES:
+        return False
+    log.warning(
+        "%s=%r is not a recognized boolean (true: 1/true/yes/on; "
+        "false: 0/false/no/off/<empty>). Falling back to default=%s.",
+        name, raw, default,
+    )
+    return default
 
 
 DRY_RUN_ASANA: Final = _env_bool("DRY_RUN_ASANA", True)  # safe default during build

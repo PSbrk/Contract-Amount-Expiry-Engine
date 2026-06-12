@@ -38,6 +38,13 @@ import sys
 from datetime import datetime, timezone
 
 
+# Module-level logger — used by helpers like _run_attribution_and_needs_tagging
+# that previously assumed `log` was available in their scope. Without this
+# the orphan-contract warning path would raise NameError on the first
+# unusual run, converting a graceful skip into a hard abort.
+log = logging.getLogger(__name__)
+
+
 def _configure_logging() -> None:
     """Sets a safe default. Critically, caps urllib3 / asana / pyairtable
     loggers at INFO so a future DEBUG toggle on the engine logger cannot
@@ -107,7 +114,6 @@ def main(argv: list[str] | None = None) -> int:
     _load_dotenv()
     _configure_logging()
     _force_utf8_stdio()
-    log = logging.getLogger(__name__)
 
     if args.audit:
         from engine.audit import main as audit_main
@@ -206,7 +212,6 @@ def _run_promotion_only(base, *, today_iso: str) -> int:
         contracts = asana_contracts.load_open_contracts(api)
         valid_names = frozenset(c.name for c in contracts if c.name)
     except Exception as exc:  # noqa: BLE001
-        log = logging.getLogger(__name__)
         log.warning("Skipping contract-name validation during promotion: %s", exc)
 
     promotions = promote_filled_needs_tagging(
@@ -469,6 +474,63 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
     if dashboard_rows:
         print(f"  upserted {len(dashboard_rows)} Dashboard row(s).")
 
+    # Step 5: Asana writes. Strictly gated:
+    #   - settings.DRY_RUN_ASANA defaults True (writes are logged, not sent).
+    #   - settings.WRITE_TEST_CONTRACT, when set to a task GID, restricts
+    #     writes to that one contract.
+    #   - Each contract's writes are computed by diffing the DashboardRow
+    #     values against the Contract's cached current Asana values; only
+    #     fields that actually changed get written (idempotent).
+    from engine import asana_writer
+    contracts_by_gid = {c.gid: c for c in contracts}
+    write_results: list[asana_writer.WriteResult] = []
+    test_gid = settings.WRITE_TEST_CONTRACT or None
+    for dash_row in dashboard_rows:
+        current_contract = contracts_by_gid.get(dash_row.asana_task_gid)
+        if current_contract is None:
+            log.warning(
+                "Skipping Asana write for gid %s (%s): no matching open "
+                "Contract object (task may have been completed/archived "
+                "between contract-load and write).",
+                dash_row.asana_task_gid, dash_row.contract_name,
+            )
+            continue
+        res = asana_writer.apply_writes(
+            asana_api, dash_row, current_contract,
+            dry_run=settings.DRY_RUN_ASANA,
+            test_contract_gid=test_gid,
+        )
+        write_results.append(res)
+
+    write_summary = asana_writer.summarize(write_results, dry_run=settings.DRY_RUN_ASANA)
+    mode_label = "DRY RUN" if settings.DRY_RUN_ASANA else "LIVE"
+    if test_gid:
+        mode_label += f" (test contract {test_gid} only)"
+    print()
+    print(f"Asana writes [{mode_label}]")
+    print(f"  contracts evaluated:        {write_summary.contracts_evaluated:>6}")
+    if test_gid:
+        print(f"  contracts filtered out:     {write_summary.contracts_filtered:>6}")
+    print(f"  contracts with changes:     {write_summary.contracts_changed:>6}")
+    print(f"  contracts no-change:        {write_summary.contracts_no_change:>6}")
+    if write_summary.contracts_errored:
+        print(f"  contracts errored:          {write_summary.contracts_errored:>6}")
+    if settings.DRY_RUN_ASANA:
+        print(f"  fields that WOULD write:    {write_summary.fields_would_write:>6}")
+    else:
+        print(f"  fields written:             {write_summary.fields_written:>6}")
+    for r in write_results:
+        if r.deltas and not r.skipped_reason:
+            marker = "[DRY]" if r.dry_run else "[ ok]" if not r.error else "[ERR]"
+            field_summary = ", ".join(
+                f"{d.field_name}: {d.old_value!r}->{d.new_value!r}"
+                for d in r.deltas
+            )
+            print(f"  {marker} {r.contract_name} ({r.contract_gid})")
+            print(f"        {field_summary}")
+            if r.error:
+                print(f"        ERROR: {r.error}")
+
     # Compose the audit-trail strings.
     summary_line = (
         f"auto {summary['auto']}, learned {summary['learned']}, "
@@ -493,11 +555,29 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
         f"past_due={skip_counts['past_due']}, "
         f"no_start_data={skip_counts['no_start_data']}."
     )
+    write_label = "Asana writes (DRY RUN)" if settings.DRY_RUN_ASANA else "Asana writes (LIVE)"
+    if test_gid:
+        write_label += f" — test contract {test_gid} only"
+    if settings.DRY_RUN_ASANA:
+        notes_lines.append(
+            f"{write_label}: would write {write_summary.fields_would_write} field(s) "
+            f"across {write_summary.contracts_changed} contract(s); "
+            f"{write_summary.contracts_no_change} no-change."
+        )
+    else:
+        notes_lines.append(
+            f"{write_label}: wrote {write_summary.fields_written} field(s) "
+            f"across {write_summary.contracts_changed} contract(s); "
+            f"{write_summary.contracts_no_change} no-change; "
+            f"{write_summary.contracts_errored} errored."
+        )
     review_flags = []
     if needs_tag:
         review_flags.append(f"{len(needs_tag)} group(s) in Needs Tagging awaiting Assign Contract.")
     if alarms_count:
         review_flags.append(f"{alarms_count} contract(s) tripping ALARM.")
+    if write_summary.contracts_errored:
+        review_flags.append(f"{write_summary.contracts_errored} Asana write(s) errored.")
 
     return {
         "summary_line": summary_line,

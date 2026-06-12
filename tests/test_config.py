@@ -103,16 +103,42 @@ def test_dry_run_default_true():
 
 
 def test_env_bool_truthy_aliases(monkeypatch):
-    """Pin the accepted truthy / falsy aliases on _env_bool so a refactor
-    can't silently drop one (which would flip CI dry-run behavior).
-    """
+    """Recognized truthy aliases parse to True."""
     eb = settings._env_bool
     for truthy in ("1", "true", "TRUE", "yes", "ON", " true ", "True"):
         monkeypatch.setenv("_CAE_TEST_BOOL", truthy)
         assert eb("_CAE_TEST_BOOL", False) is True, f"expected True for {truthy!r}"
-    for falsy in ("0", "false", "no", "off", "", "  ", "maybe", "2"):
+
+
+def test_env_bool_explicit_falsy_aliases(monkeypatch):
+    """Recognized falsy aliases (the EXPLICIT off-list) parse to False.
+    Empty / whitespace-only is included — operator clearing the value
+    likely means 'turn this off'."""
+    eb = settings._env_bool
+    for falsy in ("0", "false", "FALSE", "no", "off", "", "  "):
         monkeypatch.setenv("_CAE_TEST_BOOL", falsy)
         assert eb("_CAE_TEST_BOOL", True) is False, f"expected False for {falsy!r}"
+
+
+def test_env_bool_unrecognized_value_falls_back_to_default(monkeypatch, caplog):
+    """SAFETY-CRITICAL: a typo'd DRY_RUN_ASANA=tru must NOT flip dry-run
+    to live. Unrecognized values fall back to the supplied default so the
+    operator's safe-by-default invariant holds across copy-paste mistakes."""
+    import logging
+    eb = settings._env_bool
+    for typo in ("maybe", "2", "tru", "T", "yse", "junk"):
+        monkeypatch.setenv("_CAE_TEST_BOOL", typo)
+        # default=True must survive the typo (the DRY_RUN_ASANA case)
+        with caplog.at_level(logging.WARNING, logger="config.settings"):
+            assert eb("_CAE_TEST_BOOL", True) is True, (
+                f"typo {typo!r} flipped True default to False — UNSAFE"
+            )
+        # default=False survives too (no spurious flip in either direction)
+        assert eb("_CAE_TEST_BOOL", False) is False
+
+
+def test_env_bool_unset_uses_default(monkeypatch):
+    eb = settings._env_bool
     monkeypatch.delenv("_CAE_TEST_BOOL", raising=False)
     assert eb("_CAE_TEST_BOOL", True) is True
     assert eb("_CAE_TEST_BOOL", False) is False

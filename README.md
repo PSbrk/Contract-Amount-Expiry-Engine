@@ -55,10 +55,16 @@ SETUP.md       One-time setup walkthrough (Airtable base + PAT, Asana PAT, GitHu
    parses, applies the account/dept filter, prints signed sums, **runs
    attribution against your Asana contracts**, writes any unmatched / ambiguous
    groupings to the Airtable `Needs Tagging` table for one-time assignment,
-   writes a Run Log row, and marks the Inbox record `Processed`.
+   **computes per-contract Spent so far / % Spent / Spending Rate / Alarms
+   and populates the Airtable Dashboard**, **writes the five Asana custom-field
+   values** (idempotent — only fields that actually changed), writes a Run Log
+   row, and marks the Inbox record `Processed`.
    Each subsequent run also **promotes** any Needs Tagging rows you filled in
    to the `Learned Mappings` table, so the same grouping never needs to be
    tagged twice.
+
+   By default, Asana writes are **dry-run** (logged only) until you opt in
+   per the rollout sequence in `SETUP.md` §6.
 7. To sanity-check the parser against a file on disk without round-tripping
    through Airtable:
    ```

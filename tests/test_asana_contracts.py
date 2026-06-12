@@ -161,3 +161,85 @@ def test_task_to_contract_handles_no_membership_in_our_project():
     ]
     c = task_to_contract(task)
     assert c.section_name is None
+
+
+# ---------------------------------------------------------------------------
+# Step 5: current values of the writable fields
+# ---------------------------------------------------------------------------
+
+def _task_with_writable_currents(**overrides) -> dict:
+    """A task payload that also carries current values for the 5 writable
+    fields — what Asana returns once the engine has been writing."""
+    t = _task()
+    # Replace custom_fields with a list that includes the read fields AND
+    # the writable fields with current values populated.
+    t["custom_fields"] = t["custom_fields"] + [
+        {
+            "gid": settings.ASANA_FIELD_SPENT_SO_FAR,
+            "type": "number",
+            "number_value": overrides.get("spent_so_far", 5000.0),
+        },
+        {
+            "gid": settings.ASANA_FIELD_PCT_SPENT,
+            "type": "number",
+            "number_value": overrides.get("pct_spent", 50.0),
+        },
+        {
+            "gid": settings.ASANA_FIELD_SPENDING_RATE,
+            "type": "number",
+            "number_value": overrides.get("spending_rate", 1.0),
+        },
+        {
+            "gid": settings.ASANA_FIELD_SPENDING_RATE_ALARM,
+            "type": "enum",
+            "enum_value": overrides.get(
+                "spending_rate_alarm_option",
+                {"gid": "opt75", "name": "75%", "enabled": True},
+            ),
+        },
+        {
+            "gid": settings.ASANA_FIELD_ALARMS,
+            "type": "enum",
+            "enum_value": overrides.get(
+                "alarms_option",
+                {"gid": "optAlarm", "name": "ALARM", "enabled": True},
+            ),
+        },
+    ]
+    return t
+
+
+def test_task_to_contract_extracts_current_writable_values():
+    """The Step 5 writer's idempotency depends on these being read from
+    Asana's current task state, not assumed to be None."""
+    c = task_to_contract(_task_with_writable_currents(
+        spent_so_far=12345.67, pct_spent=80.5, spending_rate=1.61,
+    ))
+    assert c.current_spent_so_far == pytest.approx(12345.67)
+    assert c.current_pct_spent == pytest.approx(80.5)
+    assert c.current_spending_rate == pytest.approx(1.61)
+    assert c.current_spending_rate_alarm == "75%"
+    assert c.current_alarms == "ALARM"
+
+
+def test_task_to_contract_handles_writable_fields_unset():
+    """A contract that has never been written has all 5 current_* = None.
+    The base _task() fixture above doesn't include writable fields at all —
+    that mirrors a never-touched contract."""
+    c = task_to_contract(_task())
+    assert c.current_spent_so_far is None
+    assert c.current_pct_spent is None
+    assert c.current_spending_rate is None
+    assert c.current_spending_rate_alarm is None
+    assert c.current_alarms is None
+
+
+def test_task_to_contract_writable_enum_can_be_none():
+    """A Spending Rate Alarm with enum_value=None (band cleared) loads as
+    None, distinct from a missing field."""
+    c = task_to_contract(_task_with_writable_currents(
+        spending_rate_alarm_option=None,  # enum_value: None
+        alarms_option={"gid": "optClear", "name": "Clear", "enabled": True},
+    ))
+    assert c.current_spending_rate_alarm is None
+    assert c.current_alarms == "Clear"

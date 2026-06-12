@@ -51,6 +51,10 @@ def test_import_compute():
     import engine.compute  # noqa: F401
 
 
+def test_import_asana_writer():
+    import engine.asana_writer  # noqa: F401
+
+
 def test_engine_modules_re_export_apiexception():
     """audit catches ApiException via engine.asana_client — pin that surface."""
     from engine.asana_client import ApiException

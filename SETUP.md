@@ -136,7 +136,69 @@ You can iterate later — add a stacked bar for `Spent so far` vs
 `Contract Amount`, a count of contracts in each `Spending Rate Alarm` band,
 etc. The engine's contract is just to keep `Dashboard` current.
 
-## 6. Your Asana automation rule (final step, deferred to build Step 5)
+## 6. Turn on Asana writes (gated rollout)
+
+The engine ships with `DRY_RUN_ASANA=true` as the default — every
+`--ingest` logs what it would write to Asana but does not call the API.
+This protects against any first-run surprises. The recommended rollout:
+
+### 6a. Inspect the dry-run output
+
+Run `python -m engine.main --ingest` against your real Airtable + Asana
+setup and look at the `Asana writes [DRY RUN]` section:
+
+```
+Asana writes [DRY RUN]
+  contracts evaluated:    NN
+  contracts with changes: NN
+  contracts no-change:    NN
+  fields that WOULD write: NN
+  [DRY] <Contract Name> (<gid>)
+        Spent so far: 0->1234.56, % Spent: 0->12.35, ...
+```
+
+For each contract you'll see exactly which fields would be touched and the
+old → new transitions. **Eyeball this carefully before continuing.**
+Especially look for:
+- contracts you don't recognize getting writes (suggests attribution drift)
+- huge transitions (e.g. 0 → very large numbers) that look implausible
+- alarm transitions you didn't expect (Clear → ALARM on a contract you
+  thought was fine; ALARM → Clear that should still be tripping)
+
+### 6b. Write to ONE test contract first
+
+Pick a single contract you want to verify. Get its Asana task GID from the
+URL when you open the task in Asana (`https://app.asana.com/0/<project_gid>/<task_gid>`).
+Add to your local `.env`:
+
+```
+WRITE_TEST_CONTRACT=<that_task_gid>
+DRY_RUN_ASANA=false
+```
+
+Run `python -m engine.main --ingest`. The output will say
+`[LIVE (test contract <gid> only)]` and write to only that one task.
+Open the task in Asana, verify the five fields look right.
+
+### 6c. Broaden to all live contracts
+
+Once the test contract looks correct in Asana, edit `.env`:
+
+```
+WRITE_TEST_CONTRACT=
+DRY_RUN_ASANA=false
+```
+
+(blank `WRITE_TEST_CONTRACT` removes the filter). Next `--ingest` writes to
+every live contract. The write is **idempotent** — only fields that actually
+changed get touched, so re-running on the same data is a no-op.
+
+### 6d. Hand off to the scheduled cron (when Step 8 lands)
+
+Once you trust the live writes, set `DRY_RUN_ASANA=false` in the GitHub
+Actions repository secrets and let the daily cron drive it.
+
+## 7. Your Asana automation rule (final step)
 
 The engine sets `Alarms` to `ALARM` on a contract when any budget band
 (75% / 90% / 100% / Over) is reached **or** runaway pace trips (subject to the
@@ -172,4 +234,6 @@ current with the granular band detail.
 - [ ] `python -m engine.main --provision` creates the 8 tables (Step 2)
 - [ ] `python -m engine.main --ingest` processes an Inbox attachment (Step 2)
 - [ ] Airtable Interface bar chart built (after Dashboard starts populating in Step 4)
-- [ ] Asana `Alarms → ALARM` email rule built (deferred to build Step 5)
+- [ ] Dry-run `--ingest` output reviewed; one test contract written and verified (§6a + 6b)
+- [ ] `DRY_RUN_ASANA=false` + `WRITE_TEST_CONTRACT=` (empty) in `.env`; all live contracts writing (§6c)
+- [ ] Asana `Alarms → ALARM` email rule built

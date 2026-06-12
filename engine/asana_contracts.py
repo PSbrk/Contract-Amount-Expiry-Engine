@@ -32,6 +32,12 @@ class Contract:
     that matches every Tableau campus.
     section_name is whichever section in the Contractor Database project
     this task belongs to (e.g. "Active - Compliant", "Pending Onboarding").
+
+    current_* fields hold the CURRENT VALUES of the five writable fields,
+    snapshotted at load time. Step 5's writer diffs the computed values
+    against these and only writes the deltas — that keeps Asana's activity
+    log clean and prevents the operator's email-on-ALARM automation rule
+    from re-firing on no-op rewrites.
     """
     gid: str
     name: str
@@ -43,6 +49,12 @@ class Contract:
     expire_countdown: str | None
     pm_email: str | None
     section_name: str | None
+    # Current values of the five writable fields (Step 5 idempotent diff).
+    current_spent_so_far: float | None = None
+    current_pct_spent: float | None = None
+    current_spending_rate: float | None = None
+    current_spending_rate_alarm: str | None = None   # option name e.g. "75%"
+    current_alarms: str | None = None                # option name "Clear"/"ALARM"
 
 
 def _parse_iso_date(s: str | None) -> date | None:
@@ -114,6 +126,11 @@ def task_to_contract(task: dict, project_gid: str = settings.ASANA_PROJECT_GID) 
     if pm is not None:
         pm_email = pm.get("text_value") or None
 
+    # Current values of the writable fields — Step 5 diffs against these.
+    def _number(field_gid: str) -> float | None:
+        f = cf.get(field_gid)
+        return f.get("number_value") if f else None
+
     return Contract(
         gid=task["gid"],
         name=task.get("name") or "",
@@ -125,6 +142,11 @@ def task_to_contract(task: dict, project_gid: str = settings.ASANA_PROJECT_GID) 
         expire_countdown=_enum_name(cf.get(settings.ASANA_FIELD_EXPIRE_COUNTDOWN)),
         pm_email=pm_email,
         section_name=_section_name_for_project(task, project_gid),
+        current_spent_so_far=_number(settings.ASANA_FIELD_SPENT_SO_FAR),
+        current_pct_spent=_number(settings.ASANA_FIELD_PCT_SPENT),
+        current_spending_rate=_number(settings.ASANA_FIELD_SPENDING_RATE),
+        current_spending_rate_alarm=_enum_name(cf.get(settings.ASANA_FIELD_SPENDING_RATE_ALARM)),
+        current_alarms=_enum_name(cf.get(settings.ASANA_FIELD_ALARMS)),
     )
 
 
