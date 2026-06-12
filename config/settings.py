@@ -53,8 +53,8 @@ ASANA_WRITE_GATE_SECTIONS: Final = ("Active - Compliant",)
 # Google
 # ---------------------------------------------------------------------------
 
-GOOGLE_DASHBOARD_SHEET_ID: Final = "16JEcoVozcOuV_6kxMxqcHMSfRiuWOivmqwKWyT_DA3I"
-GOOGLE_DRIVE_INBOX_FOLDER_ID: Final = "1q_SdjiC-0VKhYdbsz2TX5WP5VulU-h3j"
+GOOGLE_DASHBOARD_SHEET_ID: Final = "1FHWwbqrOrXvwj2Elec47vT6gv7-4tOIOAvFpTGX5HCo"
+GOOGLE_DRIVE_INBOX_FOLDER_ID: Final = "1CLwDCuwCyTi8P45SvxZpEi7M4r-77ksi"
 GOOGLE_CAPITAL_BREAKDOWN_SHEET_ID: Final = "1HTX7NVQYso56CL25g4TE1yxY7Nl5luSkMosyhfK7iRo"
 
 # Sheet tabs the engine reads/writes. Tab names are stable contracts — changing
@@ -121,8 +121,8 @@ ALERT_RECIPIENTS: Final = ("philip.seabrook@life.church",)
 # notifications per-project.
 INCLUDE_PM_EMAIL: Final = False
 
-# Sender is always the ls.tipsandtricks@gmail.com OAuth account on the n8n
-# Gmail node. The engine doesn't choose the sender — n8n does.
+# Sender is the Gmail OAuth account configured on the n8n Gmail node
+# (philip.seabrook@life.church). The engine doesn't choose the sender — n8n does.
 
 
 # ---------------------------------------------------------------------------

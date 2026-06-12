@@ -4,11 +4,13 @@ You only do this once. After it's done, the engine runs headless on GitHub Actio
 
 ## 1. Create the Google service account
 
-The engine logs into Google as a robot user called a **service account**. You create
-it under a Google Cloud project owned by your personal `ls.tipsandtricks@gmail.com`
-account — no life.church admin involvement needed.
+The engine logs into Google as a robot user called a **service account**. We're
+creating it inside the life.church Google Workspace under `philip.seabrook@life.church`.
+Workspace policies may gate some of the steps (project creation, service account
+key downloads, third-party OAuth scopes) — if Google blocks any step, capture the
+error and we'll route through IT or pivot to a personal Gmail.
 
-1. Go to https://console.cloud.google.com/ and sign in as `ls.tipsandtricks@gmail.com`.
+1. Go to https://console.cloud.google.com/ and sign in as `philip.seabrook@life.church`.
 2. Top bar → project dropdown → **New Project**. Name it `contract-expiry-engine`
    (or anything). Create it.
 3. With that project selected, open the left nav → **APIs & Services → Library**.
@@ -34,8 +36,8 @@ service-account email from step 1.6.
 
 | Resource | Permission | Link |
 |---|---|---|
-| Drive **inbox folder** (where Tableau exports drop) | **Viewer** | https://drive.google.com/drive/folders/1q_SdjiC-0VKhYdbsz2TX5WP5VulU-h3j |
-| **Dashboard Sheet** | **Editor** | https://docs.google.com/spreadsheets/d/16JEcoVozcOuV_6kxMxqcHMSfRiuWOivmqwKWyT_DA3I/edit |
+| Drive **inbox folder** (where Tableau exports drop) | **Viewer** | https://drive.google.com/drive/folders/1CLwDCuwCyTi8P45SvxZpEi7M4r-77ksi |
+| **Dashboard Sheet** | **Editor** | https://docs.google.com/spreadsheets/d/1FHWwbqrOrXvwj2Elec47vT6gv7-4tOIOAvFpTGX5HCo/edit |
 | **Capital Project Breakdown** (redundancy lookup only) | **Viewer** | https://docs.google.com/spreadsheets/d/1HTX7NVQYso56CL25g4TE1yxY7Nl5luSkMosyhfK7iRo/edit |
 
 For each: click **Share**, paste the service-account email, set the permission,
@@ -71,7 +73,8 @@ Then dry-run: `python -m engine.main --dry-run`.
 ## 5. n8n workflow
 
 Built in build Step 5. It's a 2-node flow: **Webhook** trigger → **Gmail Send**
-node using the already-connected `ls.tipsandtricks@gmail.com` OAuth Gmail account.
+node using a Gmail OAuth credential on `philip.seabrook@life.church` (set up
+when we reach Step 5).
 Once published, copy the production webhook URL into the `N8N_WEBHOOK_URL` GitHub
 secret.
 

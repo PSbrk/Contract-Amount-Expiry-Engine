@@ -9,7 +9,7 @@ Asana custom fields, and emails alerts when contracts cross budget or pace thres
 | Piece | Job |
 |---|---|
 | **Engine** (this repo) | Python. Runs on GitHub Actions on a cron. Reads the Tableau transaction export from the Drive inbox, reads Asana, computes per-contract spend/pace/alarms, writes the Google Sheet dashboard, writes 4 Asana custom fields, POSTs new alerts to n8n. |
-| **n8n Cloud** | 2-node workflow: Webhook trigger → Gmail Send (via the connected `ls.tipsandtricks@gmail.com` OAuth Gmail node). Just sends what the engine hands it. |
+| **n8n Cloud** | 2-node workflow: Webhook trigger → Gmail Send (via a connected Gmail OAuth node on `philip.seabrook@life.church`). Just sends what the engine hands it. |
 | **Google Sheet** | "Contract Amount Expiry Engine" dashboard + working/state tabs. Sheet ID lives in `config/settings.py`. |
 | **Google Drive inbox** | Folder where the Tableau export is dropped manually. Folder ID in `config/settings.py`. |
 | **Asana** | Contractor Database project. Source of contracts; destination of 4 custom-field values only. |
