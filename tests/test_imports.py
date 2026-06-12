@@ -35,6 +35,18 @@ def test_import_airtable_schema():
     from config import airtable_schema  # noqa: F401
 
 
+def test_import_asana_contracts():
+    import engine.asana_contracts  # noqa: F401
+
+
+def test_import_campus_map():
+    import engine.campus_map  # noqa: F401
+
+
+def test_import_attribution():
+    import engine.attribution  # noqa: F401
+
+
 def test_engine_modules_re_export_apiexception():
     """audit catches ApiException via engine.asana_client — pin that surface."""
     from engine.asana_client import ApiException

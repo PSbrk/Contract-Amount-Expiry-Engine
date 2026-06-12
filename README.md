@@ -51,9 +51,14 @@ SETUP.md       One-time setup walkthrough (Airtable base + PAT, Asana PAT, GitHu
    ```
    python -m engine.main --ingest
    ```
-   The engine pulls the newest unprocessed attachment, hashes it for dedup, parses,
-   applies the account/dept filter, prints signed sums, writes a Run Log row,
-   and marks the Inbox record `Processed`.
+   The engine: pulls the newest unprocessed attachment, hashes it for dedup,
+   parses, applies the account/dept filter, prints signed sums, **runs
+   attribution against your Asana contracts**, writes any unmatched / ambiguous
+   groupings to the Airtable `Needs Tagging` table for one-time assignment,
+   writes a Run Log row, and marks the Inbox record `Processed`.
+   Each subsequent run also **promotes** any Needs Tagging rows you filled in
+   to the `Learned Mappings` table, so the same grouping never needs to be
+   tagged twice.
 7. To sanity-check the parser against a file on disk without round-tripping
    through Airtable:
    ```

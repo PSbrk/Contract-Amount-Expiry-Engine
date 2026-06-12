@@ -146,7 +146,13 @@ TABLES_SCHEMA: Final = [
              )},
             {"name": "Created At", "type": "date",
              "options": {"dateFormat": {"name": "iso", "format": "YYYY-MM-DD"}}},
-            {"name": "Notes", "type": "multilineText"},
+            {"name": "Engine Candidates", "type": "multilineText",
+             "description": (
+                 "Engine-managed: the candidate contract names the vendor "
+                 "fuzzy-matched on the last run. Rewritten every upsert."
+             )},
+            {"name": "Notes", "type": "multilineText",
+             "description": "Operator-editable. The engine never writes here."},
         ],
     },
     {

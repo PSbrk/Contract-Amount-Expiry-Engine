@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -216,9 +217,8 @@ def file_hash_already_processed(base, sha256_hex: str) -> bool:
     """True if a prior Processed Inbox record carries this exact File Hash."""
     if not sha256_hex:
         return False
-    safe = sha256_hex.replace("'", "\\'")
     table = base.table(airtable_schema.table_spec("Inbox")["name"])
-    hit = table.first(formula=f"AND({{File Hash}}='{safe}', {{Processed}})")
+    hit = table.first(formula=f"AND({{File Hash}}={_formula_literal(sha256_hex)}, {{Processed}})")
     return hit is not None
 
 
@@ -329,9 +329,324 @@ def append_run_log(
     return table.create(payload)
 
 
+# ---------------------------------------------------------------------------
+# Vendor Aliases / Campus Map / Learned Mappings / Needs Tagging — Step 3
+# ---------------------------------------------------------------------------
+
+# Operator-editable aliases / campus overrides / learned attributions live in
+# small Airtable tables. We fetch all rows at startup; volumes are tiny
+# (dozens to low hundreds) so unsorted .all() is fine.
+
+_SPLIT_ALIASES = re.compile(r"[,\n]")
+
+
+def _formula_literal(value: str) -> str:
+    """Return a safe Airtable formula string literal for `value`.
+
+    Uses DOUBLE-quoted form. Airtable's formula language does not support
+    backslash escapes inside single-quoted literals — a value like
+    "Domino's" interpolated into `{Field}='...'` produces an unterminated
+    string. Double-quoted form sidesteps the apostrophe case entirely;
+    Tableau vendor names virtually never contain double quotes. If a value
+    ever does, raise loudly rather than risk a malformed formula that
+    silently fails to find a row and creates a duplicate on upsert.
+    """
+    if '"' in value:
+        raise ValueError(
+            f"Airtable formula value contains a literal double-quote, which "
+            f"cannot be safely interpolated: {value!r}"
+        )
+    return f'"{value}"'
+
+
+def _split_multiline_list(raw: str | None) -> list[str]:
+    """Split a multilineText cell's value into a clean list. Operators use
+    either newlines or commas; both work."""
+    if not raw:
+        return []
+    return [p.strip() for p in _SPLIT_ALIASES.split(raw) if p.strip()]
+
+
+def load_vendor_aliases(base) -> dict[str, list[str]]:
+    """Return {contract_name: [alias, ...]} from the Vendor Aliases table.
+
+    Empty alias cells produce an empty list — Step 3 attribution treats this
+    as "no aliases for this contract" and falls back to the contract name
+    alone."""
+    table = base.table(airtable_schema.table_spec("Vendor Aliases")["name"])
+    out: dict[str, list[str]] = {}
+    for record in table.all():
+        fields = record.get("fields") or {}
+        name = (fields.get("Contract Name") or "").strip()
+        if not name:
+            continue
+        aliases = _split_multiline_list(fields.get("Aliases"))
+        # Merge if a name appears in multiple rows (operator quirk).
+        out.setdefault(name, []).extend(a for a in aliases if a not in out.get(name, []))
+    return out
+
+
+def load_campus_map_overrides(base) -> tuple[dict[str, frozenset[str]], frozenset[str] | None]:
+    """Return (forward_overrides, drop_codes_override) from the Campus Map table.
+
+    forward_overrides: {tableau_code: frozenset[asana_option_names]} — only
+        codes the operator has explicitly set. Codes not present here keep
+        their config defaults.
+    drop_codes_override: frozenset of Tableau codes where Drop=true. None if
+        the operator has not used the Drop checkbox on any row (which means
+        "fall back to config defaults"); empty frozenset means "the operator
+        has deliberately turned off all drops".
+    """
+    table = base.table(airtable_schema.table_spec("Campus Map")["name"])
+    overrides: dict[str, frozenset[str]] = {}
+    drop_codes: set[str] = set()
+    any_drop_checkbox_seen = False
+
+    for record in table.all():
+        fields = record.get("fields") or {}
+        code = (fields.get("Tableau Code") or "").strip()
+        if not code:
+            continue
+        is_drop = bool(fields.get("Drop", False))
+        if is_drop:
+            drop_codes.add(code)
+            any_drop_checkbox_seen = True
+            continue
+        options = frozenset(_split_multiline_list(fields.get("Asana Option Names")))
+        if options:
+            overrides[code] = options
+
+    return overrides, frozenset(drop_codes) if any_drop_checkbox_seen else None
+
+
+def load_learned_mappings(base) -> dict[tuple[str, str, str, str], str]:
+    """Return {(Campus, Dept, Account No, Vendor): Contract Name}."""
+    table = base.table(airtable_schema.table_spec("Learned Mappings")["name"])
+    out: dict[tuple[str, str, str, str], str] = {}
+    for record in table.all():
+        fields = record.get("fields") or {}
+        key = (
+            (fields.get("Campus") or "").strip(),
+            (fields.get("Dept") or "").strip(),
+            (fields.get("Account No") or "").strip(),
+            (fields.get("Vendor") or "").strip(),
+        )
+        contract = (fields.get("Contract Name") or "").strip()
+        if not contract or not all(key):
+            continue
+        out[key] = contract
+    return out
+
+
+def _find_needs_tagging_by_group_key(base, group_key: str) -> dict | None:
+    table = base.table(airtable_schema.table_spec("Needs Tagging")["name"])
+    return table.first(formula=f"{{Group Key}}={_formula_literal(group_key)}")
+
+
+def upsert_needs_tagging_group(
+    base,
+    *,
+    group_key: str,
+    campus: str,
+    dept: str,
+    account_no: str,
+    vendor: str,
+    sample_description: str,
+    amount: float,
+    candidate_names: list[str],
+    created_at_iso_date: str,
+) -> dict:
+    """Idempotent upsert keyed by Group Key.
+
+    If a row with that Group Key exists, the engine updates the rolling
+    fields (Sample Record Description, $ in group, candidate Notes) but
+    NEVER overwrites a non-empty Assign Contract — that's the operator's
+    answer and gets promoted to Learned Mappings on the next run.
+
+    candidate_names lands in Notes so the operator sees the engine's vendor
+    matches (if any) when filling in Assign Contract. Empty list means the
+    vendor was unrecognized.
+    """
+    table = base.table(airtable_schema.table_spec("Needs Tagging")["name"])
+    existing = _find_needs_tagging_by_group_key(base, group_key)
+    candidate_lines = []
+    if candidate_names:
+        candidate_lines.append("Engine vendor candidates:")
+        for n in candidate_names:
+            candidate_lines.append(f"  - {n}")
+    else:
+        candidate_lines.append("No vendor candidates found.")
+    engine_candidates = "\n".join(candidate_lines)
+
+    if existing:
+        # Engine owns these three rolling fields; Notes belongs to the
+        # operator and is never touched on update (would clobber annotations).
+        return table.update(
+            existing["id"],
+            {
+                "Sample Record Description": sample_description,
+                "$ in group": amount,
+                "Engine Candidates": engine_candidates,
+            },
+            typecast=True,
+        )
+    return table.create(
+        {
+            "Group Key": group_key,
+            "Campus": campus,
+            "Dept": dept,
+            "Account No": account_no,
+            "Vendor": vendor,
+            "Sample Record Description": sample_description,
+            "$ in group": amount,
+            "Created At": created_at_iso_date,
+            "Engine Candidates": engine_candidates,
+        },
+        typecast=True,
+    )
+
+
+@dataclass(frozen=True)
+class Promotion:
+    """One Needs Tagging → Learned Mappings promotion that just happened."""
+    needs_tagging_record_id: str
+    group_key: str
+    campus: str
+    dept: str
+    account_no: str
+    vendor: str
+    contract_name: str
+
+
+def promote_filled_needs_tagging(
+    base,
+    *,
+    learned_at_iso_date: str,
+    valid_contract_names: frozenset[str] | None = None,
+) -> list[Promotion]:
+    """For every Needs Tagging row with a filled Assign Contract:
+
+    1. Validate Assign Contract matches an open Asana contract name (when
+       valid_contract_names is provided). A typo or stale rename skips the
+       promotion with a logged warning so the operator can correct it.
+    2. Upsert a Learned Mappings row (by Key) with the
+       (Campus, Dept, Account No, Vendor) → Contract Name mapping.
+    3. Delete the Needs Tagging row.
+
+    Idempotent against partial failures: if step 3 dies after step 2, the
+    next run re-enters here, the LM upsert is a no-op match, the delete
+    succeeds, and we converge.
+    """
+    nt_table = base.table(airtable_schema.table_spec("Needs Tagging")["name"])
+    lm_table = base.table(airtable_schema.table_spec("Learned Mappings")["name"])
+
+    # Canonical: "NOT empty". BLANK() and !='' are equivalent for text fields.
+    filled = nt_table.all(formula="NOT({Assign Contract}='')")
+
+    promotions: list[Promotion] = []
+    for record in filled:
+        fields = record.get("fields") or {}
+        campus = (fields.get("Campus") or "").strip()
+        dept = (fields.get("Dept") or "").strip()
+        account_no = (fields.get("Account No") or "").strip()
+        vendor = (fields.get("Vendor") or "").strip()
+        contract_name = (fields.get("Assign Contract") or "").strip()
+        if not all([campus, dept, account_no, vendor, contract_name]):
+            log.warning(
+                "Skipping Needs Tagging row %s with incomplete fields: %r",
+                record["id"], fields,
+            )
+            continue
+        if valid_contract_names is not None and contract_name not in valid_contract_names:
+            log.warning(
+                "Needs Tagging row %s has Assign Contract %r which does not "
+                "match any open Asana contract — possible typo or stale name. "
+                "Skipping promotion; please correct in Airtable.",
+                record["id"], contract_name,
+            )
+            continue
+        group_key = fields.get("Group Key") or f"{campus}|{dept}|{account_no}|{vendor}"
+
+        # Upsert Learned Mappings by Key.
+        existing_lm = lm_table.first(formula=f"{{Key}}={_formula_literal(group_key)}")
+        payload = {
+            "Key": group_key,
+            "Campus": campus,
+            "Dept": dept,
+            "Account No": account_no,
+            "Vendor": vendor,
+            "Contract Name": contract_name,
+            "Learned At": learned_at_iso_date,
+            "Notes": (
+                f"Promoted from Needs Tagging on {learned_at_iso_date}. "
+                f"Operator selected: {contract_name}."
+            ),
+        }
+        if existing_lm:
+            lm_table.update(existing_lm["id"], payload, typecast=True)
+        else:
+            lm_table.create(payload, typecast=True)
+
+        # Delete the Needs Tagging row. On a concurrent race, the other
+        # worker may have already deleted it (HTTP 404) — treat that as
+        # success rather than letting it break the whole loop.
+        try:
+            nt_table.delete(record["id"])
+        except Exception as exc:  # noqa: BLE001 — pyairtable / requests variants
+            log.info(
+                "Needs Tagging row %s delete returned %s — likely already "
+                "deleted by a concurrent run; continuing.",
+                record["id"], type(exc).__name__,
+            )
+
+        promotions.append(Promotion(
+            needs_tagging_record_id=record["id"],
+            group_key=group_key,
+            campus=campus, dept=dept, account_no=account_no, vendor=vendor,
+            contract_name=contract_name,
+        ))
+
+    if promotions:
+        log.info("promoted %d Needs Tagging → Learned Mappings", len(promotions))
+    return promotions
+
+
+def cleanup_stale_needs_tagging(base, *, live_group_keys: set[str]) -> int:
+    """Delete Needs Tagging rows whose Group Key is NOT in live_group_keys
+    AND whose Assign Contract is empty.
+
+    A group that was ambiguous on a prior run but is now auto-attributed
+    (operator added a Vendor Alias, etc.) leaves a stale "please tag me"
+    row behind. Without this cleanup the operator sees stale review work.
+
+    Filled rows (operator answers in flight) are NEVER deleted by this
+    path — they are the promotion queue's responsibility.
+
+    Returns the count of deleted rows."""
+    table = base.table(airtable_schema.table_spec("Needs Tagging")["name"])
+    candidates = table.all(formula="{Assign Contract}=''")
+    deleted = 0
+    for record in candidates:
+        fields = record.get("fields") or {}
+        gk = (fields.get("Group Key") or "").strip()
+        if gk and gk not in live_group_keys:
+            try:
+                table.delete(record["id"])
+                deleted += 1
+            except Exception as exc:  # noqa: BLE001
+                log.info(
+                    "stale Needs Tagging delete on %s returned %s; continuing.",
+                    record["id"], type(exc).__name__,
+                )
+    if deleted:
+        log.info("cleaned up %d stale Needs Tagging row(s)", deleted)
+    return deleted
+
+
 __all__ = [
     "SchemaPlan",
     "InboxRecord",
+    "Promotion",
     "get_api_and_base",
     "ensure_schema",
     "get_unprocessed_inbox",
@@ -341,4 +656,10 @@ __all__ = [
     "sha256_hex",
     "mark_inbox_processed",
     "append_run_log",
+    "load_vendor_aliases",
+    "load_campus_map_overrides",
+    "load_learned_mappings",
+    "upsert_needs_tagging_group",
+    "promote_filled_needs_tagging",
+    "cleanup_stale_needs_tagging",
 ]

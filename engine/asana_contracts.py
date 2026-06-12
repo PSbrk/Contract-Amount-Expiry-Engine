@@ -1,0 +1,149 @@
+"""Contract dataclass + loader.
+
+Pulls every open task from the Contractor Database project and turns each
+task's Asana custom-field payload into a Contract — a stable, typed
+representation the rest of the engine consumes. The Asana SDK leaks dict
+shapes everywhere; isolating that translation here means Step 3 / Step 4 /
+Step 5 logic never has to know about enum_value vs multi_enum_values vs
+date_value vs number_value.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import date
+from typing import Iterable
+
+from config import settings
+from engine import asana_client
+
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Contract:
+    """One open task in the Contractor Database project.
+
+    name is the engine's vendor identity (matched against Tableau `Vendor`).
+    campus_options is the Asana Campus multi_enum option names that are
+    SELECTED on this task — may include the literal "All Campuses" wildcard
+    that matches every Tableau campus.
+    section_name is whichever section in the Contractor Database project
+    this task belongs to (e.g. "Active - Compliant", "Pending Onboarding").
+    """
+    gid: str
+    name: str
+    campus_options: frozenset[str]
+    contract_amount: float | None
+    target_start: date | None
+    due_on: date | None
+    status: str | None
+    expire_countdown: str | None
+    pm_email: str | None
+    section_name: str | None
+
+
+def _parse_iso_date(s: str | None) -> date | None:
+    if not s:
+        return None
+    return date.fromisoformat(s[:10])
+
+
+def _custom_fields_by_gid(task: dict) -> dict[str, dict]:
+    return {cf["gid"]: cf for cf in (task.get("custom_fields") or [])}
+
+
+def _enum_name(cf: dict | None) -> str | None:
+    """Return the selected enum option's name, or None.
+
+    Intentionally does NOT filter by enabled — for the Contract Status and
+    Expire countdown fields specifically, the operator may temporarily
+    disable an option on the field while leaving it selected on a task; we
+    still want the signal. (This differs from _multi_enum_names which DOES
+    filter by enabled — multi_enum selections are operator-curated tags,
+    and a disabled tag is reasonably treated as retired. Document the
+    asymmetry; reconcile if it becomes a problem.)
+    """
+    if cf is None:
+        return None
+    ev = cf.get("enum_value")
+    return ev["name"] if ev else None
+
+
+def _multi_enum_names(cf: dict | None) -> frozenset[str]:
+    if cf is None:
+        return frozenset()
+    values = cf.get("multi_enum_values") or []
+    # enabled refers to whether the option is currently enabled on the field;
+    # selections of a now-disabled option still carry over in multi_enum_values
+    # but we ignore them — the operator clearly intended to retire that option.
+    return frozenset(o["name"] for o in values if o.get("enabled") and o.get("name"))
+
+
+def _section_name_for_project(task: dict, project_gid: str) -> str | None:
+    """A task can belong to multiple projects; return the section name of the
+    membership in OUR project."""
+    for m in (task.get("memberships") or []):
+        proj = m.get("project") or {}
+        if proj.get("gid") == project_gid:
+            section = m.get("section") or {}
+            return section.get("name")
+    return None
+
+
+def task_to_contract(task: dict, project_gid: str = settings.ASANA_PROJECT_GID) -> Contract:
+    """Convert one Asana task dict into a Contract."""
+    cf = _custom_fields_by_gid(task)
+
+    contract_amount: float | None = None
+    cam = cf.get(settings.ASANA_FIELD_CONTRACT_AMOUNT)
+    if cam is not None:
+        contract_amount = cam.get("number_value")
+
+    target_start = None
+    tsd = cf.get(settings.ASANA_FIELD_TARGET_START)
+    if tsd is not None:
+        dv = tsd.get("date_value")
+        if dv:
+            target_start = _parse_iso_date(dv.get("date"))
+
+    pm_email = None
+    pm = cf.get(settings.ASANA_FIELD_PM_EMAIL)
+    if pm is not None:
+        pm_email = pm.get("text_value") or None
+
+    return Contract(
+        gid=task["gid"],
+        name=task.get("name") or "",
+        campus_options=_multi_enum_names(cf.get(settings.ASANA_FIELD_CAMPUS)),
+        contract_amount=contract_amount,
+        target_start=target_start,
+        due_on=_parse_iso_date(task.get("due_on")),
+        status=_enum_name(cf.get(settings.ASANA_FIELD_CONTRACT_STATUS)),
+        expire_countdown=_enum_name(cf.get(settings.ASANA_FIELD_EXPIRE_COUNTDOWN)),
+        pm_email=pm_email,
+        section_name=_section_name_for_project(task, project_gid),
+    )
+
+
+def load_open_contracts(api_client) -> list[Contract]:
+    """Fetch every open task in the Contractor Database project as Contracts.
+
+    No section filter — Step 3 wants attribution to surface even Pending
+    Onboarding matches (operator review purposes). The live-gate filter
+    (Active - Compliant + start <= today) lives in Step 5's writer.
+    """
+    contracts: list[Contract] = []
+    for task in asana_client.iter_open_tasks(api_client):
+        contracts.append(task_to_contract(task))
+    log.info("loaded %d open contracts from Asana", len(contracts))
+    return contracts
+
+
+__all__ = [
+    "Contract",
+    "task_to_contract",
+    "load_open_contracts",
+]

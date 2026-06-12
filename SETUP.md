@@ -64,6 +64,49 @@ python -m engine.audit
 `.env` is gitignored. CI does not use it — secrets come straight from GitHub
 Actions environment variables.
 
+## 4b. How attribution works in --ingest
+
+Each `--ingest` run does these stages in order:
+
+1. **Promote** — any rows in the `Needs Tagging` table where you've filled
+   `Assign Contract` are moved into `Learned Mappings` (so the same grouping
+   is auto-attributed forever after), then deleted from Needs Tagging.
+2. **Parse + filter** — the Inbox attachment is parsed and filtered to the
+   in-scope accounts/depts (per `config/settings.py`).
+3. **Attribute** — for each `(Campus, Dept, Account No, Vendor)` grouping
+   in the in-scope rows, the engine tries to identify the right Asana
+   contract by:
+   - first consulting `Learned Mappings` (your prior answer wins);
+   - else fuzzy-matching the Tableau `Vendor` against Asana contract names
+     and the `Vendor Aliases` table (rapidfuzz WRatio, threshold 90);
+   - then narrowing to contracts whose Asana `Campus` set (after crosswalk)
+     covers the Tableau campus — `All Campuses` matches any, `INT` is dropped.
+4. **Needs Tagging upsert** — groups that are ambiguous (multiple contracts
+   match) or unmatched (no contract matches) become rows in the `Needs Tagging`
+   Airtable table. The engine fills in: Group Key, Campus, Dept, Account No,
+   Vendor, Sample Record Description, $ in group, engine's candidate matches
+   (in Notes). The `Assign Contract` field is left for you.
+
+To tag an ambiguous / unmatched row:
+1. Open the `Needs Tagging` view in your Airtable base.
+2. Read `Sample Record Description` + the candidate suggestions in
+   `Engine Candidates`. (The `Notes` column is yours — the engine never
+   writes there. Use it for your own annotations.)
+3. Type the right Asana contract task name into `Assign Contract`. (Match the
+   Asana name exactly — copy/paste from Asana is safest. The engine
+   validates against the open contracts list at promotion time, so a typo
+   is logged as a warning and the row stays put for you to correct.)
+4. Run `--ingest` again. The next run promotes your answer into
+   `Learned Mappings` automatically, **deletes the Needs Tagging row** (its
+   historical record now lives in Learned Mappings), and that grouping is
+   auto-attributed from then on. The engine also drains the promotion queue
+   when `--ingest` exits with no new data — you don't have to wait for a
+   fresh export.
+
+If the engine often picks the wrong vendor for a contract, add the Tableau
+vendor variant to the `Vendor Aliases` table (one row per contract; comma- or
+newline-separated `Aliases` field). The next `--ingest` picks it up.
+
 ## 5. Build the Airtable Interface (bar chart) — UI-only
 
 Spec §3 calls for a bar chart of `% Spent` per contract on the Dashboard table.

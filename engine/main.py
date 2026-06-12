@@ -1,12 +1,25 @@
 """Engine entry point.
 
-Step 2 wires four modes (all read-only against Asana — Asana writes land in
+CLI wires four modes (all read-only against Asana; Asana writes land in
 Step 5):
 
   --audit                  verify Asana project schema matches expectations
   --provision              create/verify the 8 Airtable tables (idempotent)
-  --ingest                 pull newest Inbox attachment, parse, filter, report
-  --ingest-file PATH       parse a local export file (no Airtable round-trip)
+  --ingest                 full pipeline: promote -> ingest -> attribute -> write
+                           Airtable Needs Tagging + Run Log
+  --ingest-file PATH       parse + filter a local export file; no attribution
+                           and no Airtable writes (parser smoke-test only)
+
+The --ingest pipeline (Steps 2 + 3 combined):
+  1. Promote any operator-filled Needs Tagging rows into Learned Mappings.
+  2. Pull the newest unprocessed Inbox attachment; dedup by SHA-256 content
+     hash against prior Processed rows.
+  3. Parse + filter (in-scope account/dept) + signed sums report.
+  4. Load Asana contracts + Airtable lookups; run attribution on the
+     in-scope DataFrame.
+  5. Upsert Needs Tagging rows for ambiguous / unmatched groupings.
+  6. Clean up stale Needs Tagging rows whose groups no longer need review.
+  7. Mark Inbox Processed; append Run Log row with the attribution summary.
 
 Pair --provision with --dry-run to see the schema plan without applying it.
 """
@@ -66,9 +79,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     mode.add_argument(
         "--ingest", action="store_true",
-        help="Pull the newest unprocessed Inbox attachment from Airtable, "
-             "parse it, apply scope filters, write a Run Log entry, and "
-             "mark the Inbox row Processed.",
+        help="Full pipeline: promote operator-filled Needs Tagging answers "
+             "into Learned Mappings, pull the newest unprocessed Inbox "
+             "attachment, parse + filter, load Asana contracts and run "
+             "attribution, upsert ambiguous/unmatched groupings into Needs "
+             "Tagging, clean up stale Needs Tagging rows, mark the Inbox "
+             "row Processed, and write a Run Log entry.",
     )
     mode.add_argument(
         "--ingest-file", metavar="PATH",
@@ -166,6 +182,38 @@ def _print_ingest_report(df, meta, kept, rejected) -> tuple[float, float]:
     return in_total, out_total
 
 
+def _run_promotion_only(base, *, today_iso: str) -> int:
+    """Drain the Needs Tagging promotion queue without doing ingestion.
+
+    Called on the no-new-data and duplicate-file early exits so an operator
+    who fills Assign Contract on Friday and runs --ingest with no new file
+    still sees their answers get promoted. Returns the number promoted.
+    """
+    from engine import asana_client, asana_contracts
+    from engine.airtable_client import promote_filled_needs_tagging
+
+    # Best-effort: load contract names for validation; if Asana auth fails,
+    # promote without validation (the operator will see the typo eventually).
+    valid_names: frozenset[str] | None = None
+    try:
+        api = asana_client.get_api_client()
+        contracts = asana_contracts.load_open_contracts(api)
+        valid_names = frozenset(c.name for c in contracts if c.name)
+    except Exception as exc:  # noqa: BLE001
+        log = logging.getLogger(__name__)
+        log.warning("Skipping contract-name validation during promotion: %s", exc)
+
+    promotions = promote_filled_needs_tagging(
+        base, learned_at_iso_date=today_iso,
+        valid_contract_names=valid_names,
+    )
+    if promotions:
+        print(f"Promoted {len(promotions)} Needs Tagging answer(s) to Learned Mappings:")
+        for p in promotions:
+            print(f"  {p.group_key}  ->  {p.contract_name}")
+    return len(promotions)
+
+
 def _run_ingest_airtable() -> int:
     import traceback
 
@@ -196,13 +244,18 @@ def _run_ingest_airtable() -> int:
         df, meta = source.get_latest_transactions()
     except NoNewTransactionsError as exc:
         print(f"no new data: {exc}")
+        # Still drain the promotion queue — operator answers shouldn't sit
+        # unpromoted just because no fresh file arrived.
+        promoted = _run_promotion_only(base, today_iso=today_iso)
         append_run_log(
             base, run_id=run_id, mode="ingest", outcome="no_new_data",
-            notes=str(exc),
+            notes=f"{exc}. Promoted {promoted} Needs Tagging answer(s).",
         )
         return 0
     except DuplicateTransactionsError as exc:
         print(f"duplicate file detected: {exc}")
+        # Still drain the promotion queue on duplicate-file early exit too.
+        promoted = _run_promotion_only(base, today_iso=today_iso)
         if exc.inbox_record_id:
             mark_inbox_processed(
                 base, exc.inbox_record_id,
@@ -218,7 +271,7 @@ def _run_ingest_airtable() -> int:
         append_run_log(
             base, run_id=run_id, mode="ingest", outcome="no_new_data",
             file_name=exc.filename, file_hash=exc.hash,
-            notes="duplicate hash — skipped",
+            notes=f"duplicate hash — skipped. Promoted {promoted} Needs Tagging answer(s).",
         )
         return 0
     except UnusableInboxRecordError as exc:
@@ -249,6 +302,13 @@ def _run_ingest_airtable() -> int:
         rejected = out_of_scope(df)
         in_total, out_total = _print_ingest_report(df, meta, kept, rejected)
 
+        # Step 3: attribution + Needs Tagging upsert. Runs read-only against
+        # Asana and writes only to the Airtable Needs Tagging table. No Asana
+        # writes anywhere.
+        attribution_summary = _run_attribution_and_needs_tagging(
+            base, kept, today_iso=today_iso,
+        )
+
         if meta.inbox_record_id:
             mark_inbox_processed(
                 base, meta.inbox_record_id,
@@ -256,13 +316,18 @@ def _run_ingest_airtable() -> int:
                 rows_in_scope=len(kept),
                 total_in_scope=in_total,
                 processed_at_iso_date=today_iso,
-                notes=f"parsed {len(df):,} rows; in-scope {len(kept):,}.",
+                notes=(
+                    f"parsed {len(df):,} rows; in-scope {len(kept):,}. "
+                    f"Attribution: {attribution_summary['summary_line']}"
+                ),
             )
         append_run_log(
             base, run_id=run_id, mode="ingest", outcome="ok",
             file_name=meta.name, file_hash=meta.hash,
             rows_in_scope=len(kept), rows_out_of_scope=len(rejected),
             total_in_scope=in_total, total_out_of_scope=out_total,
+            notes=attribution_summary["notes"],
+            review_flags=attribution_summary["review_flags"],
         )
         return 0
     except Exception as exc:
@@ -281,6 +346,120 @@ def _run_ingest_airtable() -> int:
             pass
         # Inbox record left Processed=false so a retry picks it up.
         return 1
+
+
+def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict:
+    """Run Step 3 attribution against an in-scope DataFrame and upsert any
+    needs-tagging groups into Airtable. Returns a small dict the caller uses
+    to enrich the Inbox + Run Log notes.
+
+    Promotion of operator-filled Needs Tagging → Learned Mappings happens
+    BEFORE the attribution pass, so the new Learned Mappings are visible to
+    the attribute() call within the same run.
+    """
+    from engine import asana_client, asana_contracts, attribution, campus_map
+    from engine.airtable_client import (
+        cleanup_stale_needs_tagging,
+        load_campus_map_overrides,
+        load_learned_mappings,
+        load_vendor_aliases,
+        promote_filled_needs_tagging,
+        upsert_needs_tagging_group,
+    )
+
+    # Load Asana contracts FIRST so we can pass valid contract names to the
+    # promotion validator AND so the Learned Mappings created by promotion
+    # are visible to the attribute() call below.
+    try:
+        asana_api = asana_client.get_api_client()
+    except RuntimeError as exc:
+        # Asana PAT missing is a setup error, not a transient one — surface
+        # loudly so the operator notices.
+        raise RuntimeError(f"attribution requires ASANA_PAT: {exc}") from exc
+    contracts = asana_contracts.load_open_contracts(asana_api)
+    valid_contract_names = frozenset(c.name for c in contracts if c.name)
+
+    # Operator-driven promotions first. With valid_contract_names plumbed in,
+    # a typo or stale rename in Assign Contract is caught at promotion time
+    # rather than baked into a permanent Learned Mappings row.
+    promotions = promote_filled_needs_tagging(
+        base, learned_at_iso_date=today_iso,
+        valid_contract_names=valid_contract_names,
+    )
+    if promotions:
+        print(f"Promoted {len(promotions)} Needs Tagging answer(s) to Learned Mappings:")
+        for p in promotions:
+            print(f"  {p.group_key}  ->  {p.contract_name}")
+
+    aliases = load_vendor_aliases(base)
+    forward_overrides, drop_override = load_campus_map_overrides(base)
+    crosswalk = campus_map.build(forward_overrides, drop_override)
+    learned = load_learned_mappings(base)
+
+    # Attribute.
+    run = attribution.attribute(kept_df, contracts, aliases, crosswalk, learned)
+
+    summary = run.summary_dict()
+    print()
+    print("Attribution")
+    print(f"  total groups:      {summary['total_groups']:>6}")
+    print(f"  auto-attributed:   {summary['auto']:>6}")
+    print(f"  learned (operator):{summary['learned']:>6}")
+    print(f"  ambiguous:         {summary['ambiguous']:>6}  (need review)")
+    print(f"  unmatched:         {summary['unmatched']:>6}  (need review)")
+    print(f"  dropped (INT etc): {summary['dropped']:>6}")
+
+    # Upsert Needs Tagging for ambiguous + unmatched groups.
+    needs_tag = run.needs_tagging_groups
+    upserted = 0
+    for group in needs_tag:
+        upsert_needs_tagging_group(
+            base,
+            group_key=group.group_key,
+            campus=group.campus,
+            dept=group.dept,
+            account_no=group.account_no,
+            vendor=group.vendor,
+            sample_description=group.sample_description,
+            amount=group.amount,
+            candidate_names=list(group.candidate_names),
+            created_at_iso_date=today_iso,
+        )
+        upserted += 1
+    if upserted:
+        print(f"  upserted {upserted} Needs Tagging row(s) for operator review.")
+
+    # Sweep stale Needs Tagging rows whose group is no longer in the review
+    # set — e.g. a group that was ambiguous last run but is now auto via a
+    # newly-added Vendor Alias. Filled (operator-answered) rows are NEVER
+    # touched; this only deletes rows the operator hasn't engaged with.
+    live_keys = {g.group_key for g in needs_tag}
+    stale_deleted = cleanup_stale_needs_tagging(base, live_group_keys=live_keys)
+    if stale_deleted:
+        print(f"  cleaned up {stale_deleted} stale Needs Tagging row(s).")
+
+    # Compose the audit-trail strings.
+    summary_line = (
+        f"auto {summary['auto']}, learned {summary['learned']}, "
+        f"ambiguous {summary['ambiguous']}, unmatched {summary['unmatched']}, "
+        f"dropped {summary['dropped']}"
+    )
+    notes_lines = [f"Attribution summary: {summary_line}.", f"Open contracts loaded: {len(contracts)}."]
+    if promotions:
+        notes_lines.append(f"Promoted {len(promotions)} prior Needs Tagging answers.")
+    if stale_deleted:
+        notes_lines.append(f"Cleaned up {stale_deleted} stale Needs Tagging rows.")
+    review_flags = []
+    if needs_tag:
+        review_flags.append(f"{len(needs_tag)} group(s) in Needs Tagging awaiting Assign Contract.")
+
+    return {
+        "summary_line": summary_line,
+        "notes": "\n".join(notes_lines),
+        "review_flags": "\n".join(review_flags),
+        "run": run,
+        "promotions": promotions,
+    }
 
 
 def _run_ingest_file(path: str) -> int:
