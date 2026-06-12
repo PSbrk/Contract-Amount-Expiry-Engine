@@ -19,6 +19,22 @@ def test_import_main():
     import engine.main  # noqa: F401
 
 
+def test_import_airtable_client():
+    import engine.airtable_client  # noqa: F401
+
+
+def test_import_ingest():
+    import engine.ingest  # noqa: F401
+
+
+def test_import_filters():
+    import engine.filters  # noqa: F401
+
+
+def test_import_airtable_schema():
+    from config import airtable_schema  # noqa: F401
+
+
 def test_engine_modules_re_export_apiexception():
     """audit catches ApiException via engine.asana_client — pin that surface."""
     from engine.asana_client import ApiException

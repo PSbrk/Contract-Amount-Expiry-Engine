@@ -188,6 +188,12 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError:
         pass
 
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
+
     _configure_logging()
 
     try:

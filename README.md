@@ -42,6 +42,23 @@ SETUP.md       One-time setup walkthrough (Airtable base + PAT, Asana PAT, GitHu
    python -m engine.audit
    ```
    Exits `0` on pass. Any `[FAIL]` line names the offending field, option, or section.
+5. Provision the eight Airtable tables (idempotent — safe to re-run):
+   ```
+   python -m engine.main --provision --dry-run    # preview the plan
+   python -m engine.main --provision              # apply
+   ```
+6. Drop a Tableau export into the Airtable **Inbox** table as an attachment, then:
+   ```
+   python -m engine.main --ingest
+   ```
+   The engine pulls the newest unprocessed attachment, hashes it for dedup, parses,
+   applies the account/dept filter, prints signed sums, writes a Run Log row,
+   and marks the Inbox record `Processed`.
+7. To sanity-check the parser against a file on disk without round-tripping
+   through Airtable:
+   ```
+   python -m engine.main --ingest-file C:\path\to\Transactions.csv
+   ```
 
 ## Build order
 

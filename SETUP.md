@@ -64,7 +64,36 @@ python -m engine.audit
 `.env` is gitignored. CI does not use it — secrets come straight from GitHub
 Actions environment variables.
 
-## 5. Your Asana automation rule (final step, deferred to build Step 5)
+## 5. Build the Airtable Interface (bar chart) — UI-only
+
+Spec §3 calls for a bar chart of `% Spent` per contract on the Dashboard table.
+Airtable Interfaces can only be built in the UI (not via API). Do this once
+the engine starts populating Dashboard (build Step 4); rebuilding from an
+empty table is harmless if you want it ready earlier.
+
+1. Open the base in Airtable → **Interfaces** (left sidebar) → **+ Start
+   building**.
+2. Pick **Dashboard** as the layout starting point → choose the **Record
+   review** or **Dashboard** template (either works).
+3. Delete any pre-filled elements you don't want. **+ Add element → Chart**.
+4. Configure the chart:
+   - **Source table**: `Dashboard`
+   - **Chart type**: `Bar`
+   - **X-axis (category)**: `Contract`
+   - **Y-axis (value)**: `% Spent`
+   - **Sort**: `% Spent` descending (so over-budget contracts top the chart)
+   - **Color**: optionally segment by `Alarms` (Clear vs ALARM) for a quick
+     red/green read of the portfolio
+5. Add a filter `Last Updated is within → today` if you only want the
+   freshly-computed contracts (otherwise stale rows appear).
+6. **Publish** the interface. The shareable URL is the dashboard the team
+   bookmarks. Permissions inherit from the base.
+
+You can iterate later — add a stacked bar for `Spent so far` vs
+`Contract Amount`, a count of contracts in each `Spending Rate Alarm` band,
+etc. The engine's contract is just to keep `Dashboard` current.
+
+## 6. Your Asana automation rule (final step, deferred to build Step 5)
 
 The engine sets `Alarms` to `ALARM` on a contract when any budget band
 (75% / 90% / 100% / Over) is reached **or** runaway pace trips (subject to the
@@ -97,4 +126,7 @@ current with the granular band detail.
 - [ ] `ASANA_PAT` rotated to a fresh token
 - [ ] All three secrets pasted into GitHub Actions
 - [ ] `python -m engine.audit` returns 0 once Step 1 is landed
+- [ ] `python -m engine.main --provision` creates the 8 tables (Step 2)
+- [ ] `python -m engine.main --ingest` processes an Inbox attachment (Step 2)
+- [ ] Airtable Interface bar chart built (after Dashboard starts populating in Step 4)
 - [ ] Asana `Alarms → ALARM` email rule built (deferred to build Step 5)
