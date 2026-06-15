@@ -65,13 +65,17 @@ def test_expected_read_fields_have_status_and_expire_options():
     assert ec["expected_options"] == {"EXPIRED!": settings.ASANA_OPTION_EXPIRE_EXPIRED}
 
 
-def test_airtable_table_constants():
+def test_engine_table_names_in_schema():
+    """The 8-table contract: Inbox, Dashboard, Needs Tagging, Vendor Aliases,
+    Campus Map, Learned Mappings, State, Run Log. Pinned in config.schema
+    so a rename or deletion fails CI rather than silently breaking the UI."""
+    from config import schema
     expected = {
         "Inbox", "Dashboard", "Needs Tagging", "Vendor Aliases",
         "Campus Map", "Learned Mappings", "State", "Run Log",
     }
-    assert set(settings.AIRTABLE_TABLES) == expected
-    assert len(settings.AIRTABLE_TABLES) == 8  # no duplicates
+    assert set(schema.TABLE_NAMES) == expected
+    assert len(schema.TABLE_NAMES) == 8  # no duplicates
 
 
 def test_write_gate_section_is_active_compliant():

@@ -1,8 +1,8 @@
 """Non-secret configuration. Single source of truth for IDs, filters, thresholds.
 
-Secrets (ASANA_PAT, AIRTABLE_PAT, AIRTABLE_BASE_ID) come from environment
-variables — see .env.example and SETUP.md. CI reads them from GitHub Actions
-secrets directly; local runs load a .env file via python-dotenv.
+Secrets (ASANA_PAT, optionally ONEDRIVE_BACKUP_PATH) come from environment
+variables -- see .env.example. The bundle prefers config/secrets.env over a
+default .env at CWD; engine.main._load_dotenv covers both.
 """
 
 from __future__ import annotations
@@ -109,33 +109,6 @@ ASANA_EXPECTED_WRITE_FIELDS: Final = {
         "expected_options": dict(ASANA_ALARMS_OPTIONS),
     },
 }
-
-
-# ---------------------------------------------------------------------------
-# Airtable
-# ---------------------------------------------------------------------------
-
-# Table names — the engine creates any that are missing, so these names are the
-# stable contract. Field-level schema lives in engine.airtable (Step 2).
-AIRTABLE_TABLE_INBOX: Final = "Inbox"
-AIRTABLE_TABLE_DASHBOARD: Final = "Dashboard"
-AIRTABLE_TABLE_NEEDS_TAGGING: Final = "Needs Tagging"
-AIRTABLE_TABLE_VENDOR_ALIASES: Final = "Vendor Aliases"
-AIRTABLE_TABLE_CAMPUS_MAP: Final = "Campus Map"
-AIRTABLE_TABLE_LEARNED_MAPPINGS: Final = "Learned Mappings"
-AIRTABLE_TABLE_STATE: Final = "State"
-AIRTABLE_TABLE_RUN_LOG: Final = "Run Log"
-
-AIRTABLE_TABLES: Final = (
-    AIRTABLE_TABLE_INBOX,
-    AIRTABLE_TABLE_DASHBOARD,
-    AIRTABLE_TABLE_NEEDS_TAGGING,
-    AIRTABLE_TABLE_VENDOR_ALIASES,
-    AIRTABLE_TABLE_CAMPUS_MAP,
-    AIRTABLE_TABLE_LEARNED_MAPPINGS,
-    AIRTABLE_TABLE_STATE,
-    AIRTABLE_TABLE_RUN_LOG,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -254,14 +227,12 @@ WRITE_TEST_CONTRACT: Final = os.environ.get("WRITE_TEST_CONTRACT", "").strip() o
 
 # Which TransactionSource the engine pulls from on --ingest.
 #
-# Phase 2 of the local-first migration: `local_inbox` is the default —
-# the engine scans data/inbox/ for files dropped there by the operator.
-# `airtable_inbox` still works for the transition period (engine pulls
-# the newest unprocessed attachment from the Airtable Inbox table) and
-# will be removed once the GitHub Actions cron is deleted in a later
-# phase. `tableau_rest` is a Step 7 stub for the eventual Tableau REST
-# pull (engine.ingest.TableauRestSource).
-_VALID_SOURCES: Final = frozenset({"local_inbox", "airtable_inbox", "tableau_rest"})
+# `local_inbox` is the default and the only production-ready path: the
+# engine scans data/inbox/ for files dropped there by the operator.
+# `tableau_rest` is a stub for the eventual Tableau REST pull (see
+# engine.ingest.TableauRestSource); selecting it today raises
+# NotImplementedError on first call.
+_VALID_SOURCES: Final = frozenset({"local_inbox", "tableau_rest"})
 
 _raw_source = os.environ.get("TRANSACTION_SOURCE", "").strip().lower()
 if _raw_source and _raw_source not in _VALID_SOURCES:

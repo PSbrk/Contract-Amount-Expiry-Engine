@@ -462,7 +462,6 @@ def test_settings_view_shows_grouped_constants_and_env_presence(client, monkeypa
     """Pin the settings page renders all groups + the env-state list.
     ASANA_PAT is forced set / unset to check both render paths."""
     monkeypatch.setenv("ASANA_PAT", "fake-pat-value")
-    monkeypatch.delenv("AIRTABLE_PAT", raising=False)
     body = client.get("/settings").get_data(as_text=True)
     assert "ASANA_WORKSPACE_GID" in body
     assert "ACCOUNTS_IN_SCOPE" in body

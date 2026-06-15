@@ -2,12 +2,12 @@
 
 Two pieces:
 
-1. parse_tableau_export(data) — turns the raw bytes of a Tableau export into
-   a DataFrame the rest of the engine can consume. Handles the documented
-   quirks of the export format:
+1. parse_tableau_export(data) -- turns the raw bytes of a Tableau export
+   into a DataFrame the rest of the engine can consume. Handles the
+   documented quirks of the export format:
      * UTF-16 LE with BOM, TAB-delimited (despite the .csv extension)
      * 13 columns, the last one (Amount) carries NO header label
-     * Headers may have trailing spaces (real cases: 'Vendor ', 'Program Name ')
+     * Headers may have trailing spaces ('Vendor ', 'Program Name ')
      * A 'Grand Total' summary row sits as the FIRST data row with
        Campus='Total' and must be dropped
      * Amount column carries '$' + thousands commas; negatives use accounting
@@ -16,13 +16,15 @@ Two pieces:
      * Date is M/D/YYYY with UNPADDED month/day
    .xlsx exports are also accepted via openpyxl as a fallback.
 
-2. TransactionSource protocol + two implementations:
-     * AirtableInboxSource — pulls the newest unprocessed Inbox attachment,
-       hashes it, checks for prior-processed dedup, returns (df, metadata)
-       or raises NoNewTransactionsError / DuplicateTransactionsError.
-     * LocalFileSource — reads a file off disk; used by --ingest-file for
-       dev smoke-testing without touching Airtable.
-   The protocol is what Step 7's TableauRestSource will satisfy when it lands.
+2. TransactionSource protocol + three implementations:
+     * LocalInboxSource  -- the production path. Scans data/inbox/ for the
+       next Tableau export, dedups by SHA-256 against the SQLite Inbox
+       table, returns (df, metadata) or raises NoNewTransactionsError /
+       DuplicateTransactionsError.
+     * LocalFileSource   -- reads a single file off disk; used by
+       --ingest-file for parser smoke-testing without dedup.
+     * TableauRestSource -- stub for an eventual Tableau Cloud REST
+       integration. Raises NotImplementedError today.
 """
 
 from __future__ import annotations
@@ -39,12 +41,7 @@ from typing import Protocol, runtime_checkable
 
 import pandas as pd
 
-from engine.airtable_client import (
-    download_attachment_bytes,
-    file_hash_already_processed,
-    get_newest_unprocessed_inbox,
-    sha256_hex,
-)
+from engine.sqlite_client import file_hash_already_processed, sha256_hex
 
 
 # ---------------------------------------------------------------------------
@@ -266,10 +263,7 @@ def parse_tableau_export(
 class SourceMetadata:
     """Provenance for one transaction batch.
 
-    inbox_record_id is set only when the source is AirtableInboxSource — local
-    files and (future) Tableau REST pulls have no Airtable backing row.
-
-    source_path is set only when the source is LocalInboxSource — it
+    source_path is set only when the source is LocalInboxSource -- it
     carries the path of the file that was just picked off data/inbox/,
     so main.py can move it to data/processed/ once the pipeline
     succeeds. Kept on the metadata rather than as a separate
@@ -279,7 +273,6 @@ class SourceMetadata:
     name: str            # filename or view ID
     hash: str            # SHA-256 hex of the source bytes
     received_iso: str    # ISO timestamp the source was received into the pipeline
-    inbox_record_id: str | None = None
     source_path: str | None = None
 
 
@@ -293,31 +286,17 @@ class NoNewTransactionsError(TransactionSourceError):
 
 
 class DuplicateTransactionsError(TransactionSourceError):
-    """Source data matches a previously processed file by hash. The Inbox
-    record (if any) should be flagged as a duplicate rather than reprocessed.
+    """Source data matches a previously processed file by hash. The file
+    should be moved aside (LocalInboxSource handles this internally)
+    rather than reprocessed.
     """
 
-    def __init__(self, *, hash: str, filename: str, inbox_record_id: str | None):
+    def __init__(self, *, hash: str, filename: str):
         self.hash = hash
         self.filename = filename
-        self.inbox_record_id = inbox_record_id
         super().__init__(
-            f"file {filename!r} (hash {hash[:12]}…) was already processed"
+            f"file {filename!r} (hash {hash[:12]}...) was already processed"
         )
-
-
-class UnusableInboxRecordError(TransactionSourceError):
-    """An Inbox record exists but cannot be processed (e.g. has no attachment).
-
-    Engine should mark the record Processed with a Notes explanation so it
-    doesn't loop on the same broken record run after run. Distinct from
-    NoNewTransactionsError (which means there's genuinely nothing to do).
-    """
-
-    def __init__(self, *, inbox_record_id: str, reason: str):
-        self.inbox_record_id = inbox_record_id
-        self.reason = reason
-        super().__init__(f"Inbox record {inbox_record_id!r}: {reason}")
 
 
 @runtime_checkable
@@ -330,52 +309,6 @@ class TransactionSource(Protocol):
         Raises DuplicateTransactionsError if the latest file is a known dup.
         """
         ...
-
-
-class AirtableInboxSource:
-    """Pulls the newest unprocessed attachment from the Airtable Inbox table.
-
-    The Airtable client (engine.airtable_client) wraps every Airtable
-    interaction; this class only orchestrates them.
-    """
-
-    def __init__(self, base) -> None:
-        self.base = base
-
-    def get_latest_transactions(self) -> tuple[pd.DataFrame, SourceMetadata]:
-        record = get_newest_unprocessed_inbox(self.base)
-        if record is None:
-            raise NoNewTransactionsError("no unprocessed Inbox records")
-        if not record.attachments:
-            # Distinct exception so main can mark the record Processed —
-            # otherwise it would be re-detected as "newest unprocessed" on
-            # every subsequent run and append duplicate Run Log noise
-            # forever.
-            raise UnusableInboxRecordError(
-                inbox_record_id=record.id,
-                reason=f"record {record.name!r} has no attachment",
-            )
-
-        att = record.attachments[0]
-        filename = att.get("filename") or record.name or "<unnamed>"
-        data = download_attachment_bytes(att)
-        h = sha256_hex(data)
-
-        if file_hash_already_processed(self.base, h):
-            raise DuplicateTransactionsError(
-                hash=h,
-                filename=filename,
-                inbox_record_id=record.id,
-            )
-
-        df = parse_tableau_export(data, filename=filename)
-        meta = SourceMetadata(
-            name=filename,
-            hash=h,
-            received_iso=record.created_time,
-            inbox_record_id=record.id,
-        )
-        return df, meta
 
 
 class LocalInboxSource:
@@ -469,9 +402,7 @@ class LocalInboxSource:
                 "LocalInboxSource: duplicate hash %s; moved %s -> %s",
                 h[:12], path.name, dest,
             )
-            raise DuplicateTransactionsError(
-                hash=h, filename=path.name, inbox_record_id=None,
-            )
+            raise DuplicateTransactionsError(hash=h, filename=path.name)
 
         df = parse_tableau_export(data, filename=path.name)
         meta = SourceMetadata(
@@ -480,7 +411,6 @@ class LocalInboxSource:
             received_iso=datetime.fromtimestamp(
                 path.stat().st_mtime, tz=timezone.utc,
             ).isoformat(timespec="seconds"),
-            inbox_record_id=None,
             source_path=str(path),
         )
         return df, meta
@@ -503,12 +433,11 @@ class LocalInboxSource:
 
 
 class LocalFileSource:
-    """Reads a file off disk. Used by --ingest-file for parsing the operator's
-    actual Tableau export without round-tripping through Airtable.
+    """Reads a file off disk. Used by --ingest-file for parsing the
+    operator's actual Tableau export without going through the
+    inbox/processed flow.
 
-    Does NOT check for dedup — local files are always fresh from the caller's
-    perspective. (Airtable dedup is the right place for that check; this
-    source is for dev smoke-testing only.)
+    Does NOT check for dedup -- callers explicitly want the file processed.
     """
 
     def __init__(self, path: str | os.PathLike) -> None:
@@ -523,7 +452,6 @@ class LocalFileSource:
             name=self.path.name,
             hash=h,
             received_iso=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            inbox_record_id=None,
         )
         return df, meta
 
@@ -590,12 +518,12 @@ class TableauRestSource:
 
     def get_latest_transactions(self) -> tuple[pd.DataFrame, SourceMetadata]:
         raise NotImplementedError(
-            "TableauRestSource is a Step 7 stub. The Tableau Cloud REST "
-            "'query view data' integration is planned for a follow-up step; "
-            "today the operator should keep settings.TRANSACTION_SOURCE on "
-            "'airtable_inbox' and continue uploading exports to the Airtable "
-            "Inbox. See engine.ingest.TableauRestSource docstring for the "
-            "planned endpoint shape."
+            "TableauRestSource is a stub. The Tableau Cloud REST "
+            "'query view data' integration is planned for a follow-up "
+            "step; today the operator drops exports into data/inbox/ "
+            "(TRANSACTION_SOURCE=local_inbox, the default). See "
+            "engine.ingest.TableauRestSource docstring for the planned "
+            "endpoint shape."
         )
 
 
@@ -606,8 +534,6 @@ __all__ = [
     "TransactionSourceError",
     "NoNewTransactionsError",
     "DuplicateTransactionsError",
-    "UnusableInboxRecordError",
-    "AirtableInboxSource",
     "LocalInboxSource",
     "LocalFileSource",
     "TableauRestSource",

@@ -82,26 +82,26 @@ class CampusCrosswalk:
 
 
 def build(
-    airtable_overrides: Mapping[str, frozenset[str]] | None = None,
-    airtable_drop_codes: frozenset[str] | None = None,
+    forward_overrides: Mapping[str, frozenset[str]] | None = None,
+    drop_override: frozenset[str] | None = None,
 ) -> CampusCrosswalk:
     """Construct a CampusCrosswalk by merging config defaults with optional
-    Airtable Campus Map overrides.
+    Campus Map overrides loaded from SQLite.
 
     Per-Tableau-code overrides REPLACE the config default for that code,
     EXCEPT that reverse-encoded ***NOR/***TUL specials are always merged
-    back in. Without that preservation, an operator who adds an Airtable
-    Campus Map row for OMH would silently wipe the "***NOR (contract is
-    for OMH)" reverse-encoding and break attribution for ***NOR contracts.
+    back in. Without that preservation, an operator who adds a Campus Map
+    row for OMH would silently wipe the "***NOR (contract is for OMH)"
+    reverse-encoding and break attribution for ***NOR contracts.
     """
-    # Start from explicit Tableau→Asana defaults (CEN, YVN).
+    # Start from explicit Tableau->Asana defaults (CEN, YVN).
     forward: dict[str, frozenset[str]] = {
         tc: frozenset(opts) for tc, opts in _defaults.TABLEAU_TO_ASANA.items()
     }
 
     # Reverse-encode Asana-side overrides INTO A SEPARATE DICT so they can
-    # always be unioned back in after Airtable overrides are applied. E.g.
-    # "***NOR (contract is for OMH)" → adds to the Asana-option set for OMH.
+    # always be unioned back in after overrides are applied. E.g.
+    # "***NOR (contract is for OMH)" -> adds to the Asana-option set for OMH.
     reverse_encoded: dict[str, frozenset[str]] = {}
     for asana_option, tableau_codes in _defaults.ASANA_OVERRIDE_TO_TABLEAU.items():
         for tc in tableau_codes:
@@ -114,20 +114,21 @@ def build(
     drop_codes = frozenset(_defaults.TABLEAU_DROP_CODES)
     wildcard = frozenset(_defaults.ASANA_WILDCARD_OPTIONS)
 
-    if airtable_overrides:
-        # Per-code REPLACE — Airtable wins for the explicit option set, but
-        # any reverse-encoded specials (***NOR, ***TUL) are still unioned in
-        # so the operator does not accidentally break attribution for those
-        # contracts by listing OMH/SBA without re-listing the starred name.
-        for tc, opts in airtable_overrides.items():
+    if forward_overrides:
+        # Per-code REPLACE -- operator-supplied options win for the explicit
+        # set, but any reverse-encoded specials (***NOR, ***TUL) are still
+        # unioned in so the operator does not accidentally break attribution
+        # for those contracts by listing OMH/SBA without re-listing the
+        # starred name.
+        for tc, opts in forward_overrides.items():
             preserved = reverse_encoded.get(tc, frozenset())
             forward[tc] = frozenset(opts) | preserved
 
-    if airtable_drop_codes is not None:
-        # Explicit Airtable drop set takes precedence in full. None means
+    if drop_override is not None:
+        # Explicit operator drop set takes precedence in full. None means
         # "use config defaults"; an empty frozenset means "operator
         # deliberately turned off all drops".
-        drop_codes = frozenset(airtable_drop_codes)
+        drop_codes = frozenset(drop_override)
 
     return CampusCrosswalk(
         tableau_to_asana=forward,

@@ -3,10 +3,6 @@
 # + per-resource API classes); v3-era tutorials do not apply.
 asana>=5.2,<6
 
-# Airtable — schema management (creates the 8 base tables) + record I/O + attachment
-# download. 3.x ships built-in 429 retry against the 5-req/sec/base limit.
-pyairtable==3.3.0
-
 # Data ingestion. The sample Tableau export is UTF-16 LE + tab-delimited
 # (despite the .csv extension), and Tableau occasionally produces .xlsx instead —
 # pandas + openpyxl covers both.

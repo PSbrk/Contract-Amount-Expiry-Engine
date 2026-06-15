@@ -283,7 +283,7 @@ def test_tableau_rest_source_raises_not_implemented_on_pull():
     erase a day's transactions. NotImplementedError is the loud crash that
     keeps the operator's data safe until the REST pull actually works."""
     src = _make_stub_source()
-    with pytest.raises(NotImplementedError, match="Step 7 stub"):
+    with pytest.raises(NotImplementedError, match="TableauRestSource is a stub"):
         src.get_latest_transactions()
 
 
@@ -314,10 +314,10 @@ def test_tableau_rest_source_holds_passed_params_verbatim():
 
 
 def test_tableau_rest_source_accepts_none_view_id_for_unconfigured_install():
-    """Operator running on `airtable_inbox` may never set TABLEAU_VIEW_ID;
-    settings will pass None. The stub must accept that without crashing in
-    its constructor (so audit/provision modes still run even when the env
-    is half-configured)."""
+    """The default install runs on `local_inbox` and may never set
+    TABLEAU_VIEW_ID; settings will pass None. The stub must accept that
+    without crashing in its constructor (so audit/provision modes still
+    run even when the env is half-configured)."""
     src = _make_stub_source(view_id=None, pat_name=None, pat_secret=None)
     assert src.view_id is None
     assert src.pat_name is None

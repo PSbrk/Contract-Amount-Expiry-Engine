@@ -56,7 +56,6 @@ hiddenimports += [
     "rapidfuzz.fuzz",
     "rapidfuzz.process",
     "pandas",
-    "pyairtable",  # legacy airtable_inbox transition path; removed in Phase 6
     "dotenv",
     "sqlite3",
 ]

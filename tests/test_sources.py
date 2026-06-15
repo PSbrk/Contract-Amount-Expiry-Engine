@@ -1,12 +1,9 @@
 """Tests for the TransactionSource Protocol implementations.
 
-LocalFileSource is exercised directly against the on-disk fixture. The
-AirtableInboxSource branches are tested by monkeypatching the airtable_client
-helpers it calls (get_newest_unprocessed_inbox, download_attachment_bytes,
-file_hash_already_processed) — no live Airtable needed.
+LocalFileSource is exercised directly against the on-disk fixture.
 
 LocalInboxSource is exercised against a tmp_path inbox directory and an
-in-memory SQLite connection — no real disk path other than tmp_path is
+in-memory SQLite connection -- no real disk path other than tmp_path is
 touched.
 """
 
@@ -21,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from engine import airtable_client, ingest
+from engine import ingest
 from engine.sqlite_client import ensure_schema, insert_inbox_processed
 
 
@@ -39,7 +36,7 @@ def test_local_file_source_returns_df_and_metadata():
     assert len(df) == 15  # 15 data rows in the fixture; Grand Total dropped
     assert list(df.columns) == list(ingest.EXPECTED_COLUMNS)
     assert meta.name == "transactions_sample.tsv"
-    assert meta.inbox_record_id is None
+    assert meta.source_path is None  # LocalFileSource does not carry one
 
 
 def test_local_file_source_hash_matches_file_bytes():
@@ -50,8 +47,6 @@ def test_local_file_source_hash_matches_file_bytes():
 
 
 def test_local_file_source_received_iso_is_real_timestamp():
-    """Regression for the Step 2 review finding that LocalFileSource set
-    received_iso='' — divergent from AirtableInboxSource's contract."""
     source = ingest.LocalFileSource(FIXTURE)
     _, meta = source.get_latest_transactions()
     assert meta.received_iso, "received_iso must not be empty"
@@ -59,91 +54,7 @@ def test_local_file_source_received_iso_is_real_timestamp():
 
 
 # ---------------------------------------------------------------------------
-# AirtableInboxSource — three branches via monkeypatched helpers
-# ---------------------------------------------------------------------------
-
-def test_airtable_source_raises_no_new_when_inbox_empty(monkeypatch):
-    monkeypatch.setattr(ingest, "get_newest_unprocessed_inbox", lambda base: None)
-
-    source = ingest.AirtableInboxSource(base=object())
-    with pytest.raises(ingest.NoNewTransactionsError, match="no unprocessed"):
-        source.get_latest_transactions()
-
-
-def test_airtable_source_raises_unusable_when_record_has_no_attachment(monkeypatch):
-    """Spec §3 says the operator drops the file as an attachment. A record
-    with no attachment is malformed and must be marked Processed by the
-    main handler to avoid an unbounded re-detect loop on every run."""
-    record = airtable_client.InboxRecord(
-        id="recX",
-        name="malformed.csv",
-        created_time="2026-06-12T10:00:00.000Z",
-        attachments=[],
-        file_hash="",
-        processed=False,
-    )
-    monkeypatch.setattr(ingest, "get_newest_unprocessed_inbox", lambda base: record)
-
-    source = ingest.AirtableInboxSource(base=object())
-    with pytest.raises(ingest.UnusableInboxRecordError) as exc_info:
-        source.get_latest_transactions()
-    assert exc_info.value.inbox_record_id == "recX"
-    assert "no attachment" in exc_info.value.reason
-
-
-def test_airtable_source_raises_duplicate_when_hash_already_processed(monkeypatch):
-    """A second Inbox record carrying identical file bytes must be flagged as
-    duplicate by content hash (not Airtable record id)."""
-    data = FIXTURE.read_bytes()
-    record = airtable_client.InboxRecord(
-        id="recDup",
-        name="resend.tsv",
-        created_time="2026-06-12T11:00:00.000Z",
-        attachments=[{"url": "https://example.invalid/signed", "filename": "resend.tsv"}],
-        file_hash="",
-        processed=False,
-    )
-    monkeypatch.setattr(ingest, "get_newest_unprocessed_inbox", lambda base: record)
-    monkeypatch.setattr(ingest, "download_attachment_bytes", lambda att: data)
-    monkeypatch.setattr(ingest, "file_hash_already_processed", lambda base, h: True)
-
-    source = ingest.AirtableInboxSource(base=object())
-    with pytest.raises(ingest.DuplicateTransactionsError) as exc_info:
-        source.get_latest_transactions()
-    assert exc_info.value.inbox_record_id == "recDup"
-    assert exc_info.value.filename == "resend.tsv"
-    # Hash carried verbatim so main can mark the Inbox row with a Notes
-    # referencing it.
-    assert exc_info.value.hash == hashlib.sha256(data).hexdigest()
-
-
-def test_airtable_source_succeeds_when_record_is_fresh(monkeypatch):
-    """Full happy path — record has attachment, hash is not a known dup."""
-    data = FIXTURE.read_bytes()
-    record = airtable_client.InboxRecord(
-        id="recFresh",
-        name="fresh.tsv",
-        created_time="2026-06-12T12:00:00.000Z",
-        attachments=[{"url": "https://example.invalid/signed", "filename": "fresh.tsv"}],
-        file_hash="",
-        processed=False,
-    )
-    monkeypatch.setattr(ingest, "get_newest_unprocessed_inbox", lambda base: record)
-    monkeypatch.setattr(ingest, "download_attachment_bytes", lambda att: data)
-    monkeypatch.setattr(ingest, "file_hash_already_processed", lambda base, h: False)
-
-    source = ingest.AirtableInboxSource(base=object())
-    df, meta = source.get_latest_transactions()
-
-    assert len(df) == 15
-    assert meta.inbox_record_id == "recFresh"
-    assert meta.name == "fresh.tsv"
-    assert meta.hash == hashlib.sha256(data).hexdigest()
-    assert meta.received_iso == "2026-06-12T12:00:00.000Z"
-
-
-# ---------------------------------------------------------------------------
-# LocalInboxSource — folder scan + dedup against SQLite
+# LocalInboxSource -- folder scan + dedup against SQLite
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -197,7 +108,6 @@ def test_local_inbox_source_returns_df_and_metadata_with_source_path(conn, inbox
     assert len(df) == 15  # same 15-row fixture
     assert meta.name == "Q2.csv"
     assert meta.source_path == str(target)
-    assert meta.inbox_record_id is None  # Airtable-only field; stays unset for local
     assert meta.hash == hashlib.sha256(target.read_bytes()).hexdigest()
 
 
@@ -307,12 +217,18 @@ def test_local_inbox_source_creates_dirs_if_missing(tmp_path, conn):
 # Protocol conformance
 # ---------------------------------------------------------------------------
 
-def test_both_sources_conform_to_transaction_source_protocol():
-    """runtime_checkable Protocol — isinstance check pins that all
-    source classes expose get_latest_transactions in the right shape."""
+def test_all_sources_conform_to_transaction_source_protocol():
+    """runtime_checkable Protocol -- isinstance check pins that every
+    source class exposes get_latest_transactions in the right shape."""
     local = ingest.LocalFileSource(FIXTURE)
-    airtable = ingest.AirtableInboxSource(base=object())
     local_inbox = ingest.LocalInboxSource(conn=object())
+    tableau = ingest.TableauRestSource(
+        server_url="https://x",
+        site_name="s",
+        view_id=None,
+        pat_name=None,
+        pat_secret=None,
+    )
     assert isinstance(local, ingest.TransactionSource)
-    assert isinstance(airtable, ingest.TransactionSource)
     assert isinstance(local_inbox, ingest.TransactionSource)
+    assert isinstance(tableau, ingest.TransactionSource)

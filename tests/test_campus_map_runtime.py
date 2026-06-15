@@ -78,11 +78,11 @@ def test_contract_matches_via_nor_override():
     assert not cw.contract_matches_tableau_campus(contract, "CEN")
 
 
-def test_airtable_overrides_replace_config_per_code():
-    """Operator overrides on a Tableau code in Airtable Campus Map replace
+def test_forward_overrides_replace_config_per_code():
+    """Operator overrides on a Tableau code in the Campus Map table replace
     the config default for that code; codes not present keep defaults."""
     cw = campus_map.build(
-        airtable_overrides={"CEN": frozenset({"CEN", "EDM_NEW"})},
+        forward_overrides={"CEN": frozenset({"CEN", "EDM_NEW"})},
     )
     assert cw.lookup("CEN") == frozenset({"CEN", "EDM_NEW"})
     # Codes not in overrides still get config defaults.
@@ -90,15 +90,15 @@ def test_airtable_overrides_replace_config_per_code():
     assert "***NOR (contract is for OMH)" in cw.lookup("OMH")  # default kept
 
 
-def test_airtable_override_preserves_reverse_encoded_starred_options():
+def test_forward_override_preserves_reverse_encoded_starred_options():
     """An operator override for OMH must NOT silently wipe the reverse-encoded
-    '***NOR (contract is for OMH)' option — that would break attribution for
+    '***NOR (contract is for OMH)' option -- that would break attribution for
     every contract still tagged with the starred name. Same for SBA/***TUL."""
     # Operator added OMH_NEW to the OMH option set but didn't list the
     # starred name. The crosswalk must still include the starred name so
     # contracts tagged with it continue to match OMH transactions.
     cw = campus_map.build(
-        airtable_overrides={"OMH": frozenset({"OMH", "OMH_NEW"})},
+        forward_overrides={"OMH": frozenset({"OMH", "OMH_NEW"})},
     )
     options = cw.lookup("OMH")
     assert "OMH" in options
@@ -107,25 +107,25 @@ def test_airtable_override_preserves_reverse_encoded_starred_options():
 
     # Same hazard for SBA / ***TUL.
     cw_sba = campus_map.build(
-        airtable_overrides={"SBA": frozenset({"SBA"})},
+        forward_overrides={"SBA": frozenset({"SBA"})},
     )
     assert "***TUL (contract is for SBA)" in cw_sba.lookup("SBA")
 
 
-def test_airtable_drop_codes_replace_config_drops_when_provided():
-    """When Airtable Campus Map has any Drop=true row, that set REPLACES the
+def test_drop_override_replaces_config_drops_when_provided():
+    """When the Campus Map table has any Drop=1 row, that set REPLACES the
     config drop set entirely. None means 'use config defaults'; empty set
     means 'operator deliberately turned off all drops'."""
-    # No Airtable drops provided → config default (INT) applies.
+    # No operator drops provided -> config default (INT) applies.
     default_cw = campus_map.build()
     assert default_cw.is_drop_code("INT")
 
-    # Airtable provides an explicit empty set → INT is no longer dropped.
-    cw_no_drops = campus_map.build(airtable_drop_codes=frozenset())
+    # Operator provides an explicit empty set -> INT is no longer dropped.
+    cw_no_drops = campus_map.build(drop_override=frozenset())
     assert not cw_no_drops.is_drop_code("INT")
 
-    # Airtable provides ZZZ as a drop → INT no longer dropped, ZZZ now is.
-    cw_new_drops = campus_map.build(airtable_drop_codes=frozenset({"ZZZ"}))
+    # Operator provides ZZZ as a drop -> INT no longer dropped, ZZZ now is.
+    cw_new_drops = campus_map.build(drop_override=frozenset({"ZZZ"}))
     assert cw_new_drops.is_drop_code("ZZZ")
     assert not cw_new_drops.is_drop_code("INT")
 

@@ -19,8 +19,8 @@ def test_import_main():
     import engine.main  # noqa: F401
 
 
-def test_import_airtable_client():
-    import engine.airtable_client  # noqa: F401
+def test_import_sqlite_client():
+    import engine.sqlite_client  # noqa: F401
 
 
 def test_import_ingest():
@@ -31,8 +31,12 @@ def test_import_filters():
     import engine.filters  # noqa: F401
 
 
-def test_import_airtable_schema():
-    from config import airtable_schema  # noqa: F401
+def test_import_schema():
+    from config import schema  # noqa: F401
+
+
+def test_import_ui():
+    from engine.ui import create_app  # noqa: F401
 
 
 def test_import_asana_contracts():

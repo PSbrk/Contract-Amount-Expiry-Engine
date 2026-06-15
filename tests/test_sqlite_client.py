@@ -766,15 +766,14 @@ def test_upsert_dashboard_clears_contract_amount_when_removed(conn):
 def test_dashboard_singleSelect_validators_match_settings_options():
     """Three sources of truth must stay in lock-step:
     1. settings.ASANA_SPENDING_RATE_ALARM_OPTIONS / ASANA_ALARMS_OPTIONS
-    2. config.airtable_schema._SPENDING_RATE_ALARM_CHOICES / _ALARMS_CHOICES
-       (still consumed by the schema declarations re-exported via config.schema)
+    2. config.schema field_spec choices for Dashboard / State select fields
     3. engine.sqlite_client._DASHBOARD_* / _STATE_* validators
 
     A divergence means the client validator could reject a valid Asana
     option (false negative) or accept a stale one (false positive). Pin
     them equal here so a future edit to one fails CI.
     """
-    from config import airtable_schema, settings
+    from config import schema, settings
     from engine.sqlite_client import (
         _DASHBOARD_ALARMS_VALUES,
         _DASHBOARD_SPENDING_RATE_ALARM_VALUES,
@@ -787,7 +786,7 @@ def test_dashboard_singleSelect_validators_match_settings_options():
 
     sra_schema_names = [
         c["name"]
-        for c in airtable_schema.field_spec(
+        for c in schema.field_spec(
             "Dashboard", "Spending Rate Alarm"
         )["options"]["choices"]
     ]
@@ -795,7 +794,7 @@ def test_dashboard_singleSelect_validators_match_settings_options():
 
     alarms_schema_names = [
         c["name"]
-        for c in airtable_schema.field_spec("Dashboard", "Alarms")["options"]["choices"]
+        for c in schema.field_spec("Dashboard", "Alarms")["options"]["choices"]
     ]
     assert set(alarms_schema_names) == set(settings.ASANA_ALARMS_OPTIONS)
 
