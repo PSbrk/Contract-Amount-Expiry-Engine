@@ -171,6 +171,25 @@ OneDrive backup not appearing in the cloud
     while you were logged out, the file is on disk but won't sync until
     your next login. This is fine -- the local DB stays authoritative.
 
+"SSLCertVerificationError: self-signed certificate in certificate chain"
+    Your corporate network probably has SSL inspection (a security
+    appliance that decrypts traffic on the way out and re-signs it with
+    its own CA). The engine cannot reach app.asana.com until your
+    machine trusts that CA.
+
+    Two paths to fix:
+
+    (a) Get IT to add the corporate CA to the Windows machine cert
+        store, AND tell Python's requests library to use it:
+            $env:REQUESTS_CA_BUNDLE = "C:\Path\To\corporate-ca-bundle.pem"
+            $env:SSL_CERT_FILE = "C:\Path\To\corporate-ca-bundle.pem"
+        Put both lines in config\secrets.env (no "$env:" prefix; just
+        REQUESTS_CA_BUNDLE=... etc.) so Task Scheduler picks them up.
+
+    (b) Run the engine from a machine NOT behind the SSL inspector
+        (e.g. a home laptop). The engine.db it produces is portable;
+        copy it to the production folder.
+
 
 --------------------------------------------------------------------------------
   Uninstalling
