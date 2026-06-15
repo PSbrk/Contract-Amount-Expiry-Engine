@@ -34,6 +34,21 @@ The --ingest pipeline:
 
 from __future__ import annotations
 
+# Inject the OS trust store into Python's SSL handling BEFORE any other import
+# can pre-create an SSLContext from certifi's CA bundle. Corporate networks
+# (life.church included) use TLS-inspecting appliances whose re-signing CA
+# lives in the Windows machine cert store, not certifi -- without this, every
+# https call to app.asana.com fails with
+# "self-signed certificate in certificate chain" and the engine cannot reach
+# Asana from any company laptop.
+# The try/except keeps the engine working in dev venvs where truststore is
+# not installed (it then falls back to certifi, which is fine off the corp net).
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 import argparse
 import logging
 import sys

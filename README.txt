@@ -172,23 +172,16 @@ OneDrive backup not appearing in the cloud
     your next login. This is fine -- the local DB stays authoritative.
 
 "SSLCertVerificationError: self-signed certificate in certificate chain"
-    Your corporate network probably has SSL inspection (a security
-    appliance that decrypts traffic on the way out and re-signs it with
-    its own CA). The engine cannot reach app.asana.com until your
-    machine trusts that CA.
+    Your corporate network has SSL inspection and the appliance's CA is
+    NOT in the Windows machine cert store. The engine reads from the
+    Windows store automatically (via the truststore library); when the
+    cert is missing there it falls back to Python's bundled certifi,
+    which won't know about the corp CA.
 
-    Two paths to fix:
-
-    (a) Get IT to add the corporate CA to the Windows machine cert
-        store, AND tell Python's requests library to use it:
-            $env:REQUESTS_CA_BUNDLE = "C:\Path\To\corporate-ca-bundle.pem"
-            $env:SSL_CERT_FILE = "C:\Path\To\corporate-ca-bundle.pem"
-        Put both lines in config\secrets.env (no "$env:" prefix; just
-        REQUESTS_CA_BUNDLE=... etc.) so Task Scheduler picks them up.
-
-    (b) Run the engine from a machine NOT behind the SSL inspector
-        (e.g. a home laptop). The engine.db it produces is portable;
-        copy it to the production folder.
+    Fix: ask IT to add the corporate inspection CA to the Windows
+    machine cert store (Local Computer > Trusted Root Certification
+    Authorities). Once it's there, no engine changes are needed --
+    the next run will pick it up automatically.
 
 
 --------------------------------------------------------------------------------

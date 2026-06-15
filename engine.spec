@@ -58,6 +58,9 @@ hiddenimports += [
     "pandas",
     "dotenv",
     "sqlite3",
+    # OS trust-store integration -- required on corporate networks with
+    # TLS inspection (life.church). See engine.main's top-of-file import.
+    "truststore",
 ]
 
 

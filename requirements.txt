@@ -12,8 +12,16 @@ openpyxl>=3.1
 # Fuzzy vendor matching (Asana task names vs Tableau Vendor formatting variants).
 rapidfuzz>=3.9
 
-# HTTP — used to GET signed Airtable attachment URLs (no auth header sent).
+# HTTP — used by the Asana SDK + ad-hoc requests calls.
 requests>=2.32
+
+# Use the OS trust store for TLS verification instead of certifi's bundle.
+# Critical on corporate networks (life.church has SSL inspection that re-signs
+# outbound traffic with a corp CA installed in the Windows machine cert store
+# but NOT in certifi). engine.main calls truststore.inject_into_ssl() at the
+# very top of the module; the try/except in that block keeps things working
+# in dev venvs where this dep is absent.
+truststore>=0.10
 
 # Local-run convenience: .env loaded automatically by engine.main when present.
 # CI does not use this — secrets come from GitHub Actions environment vars directly.
