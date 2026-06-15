@@ -1,0 +1,7 @@
+# Build-time only — kept out of requirements.txt so the runtime bundle
+# never tries to install PyInstaller on the operator's machine.
+#
+# Pinning to 6.x: 6.21.0 is the first release verified to bundle the
+# engine successfully under Python 3.14. Bumping major versions may
+# require revisiting hidden-import logic in engine.spec.
+pyinstaller>=6.21,<7
