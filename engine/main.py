@@ -225,9 +225,42 @@ def _run_promotion_only(base, *, today_iso: str) -> int:
     return len(promotions)
 
 
+def _build_transaction_source(base):
+    """Pick the TransactionSource implementation based on settings.
+
+    Step 7 introduces a config switch so the same --ingest pipeline can be
+    pointed at the (current) Airtable Inbox or the (future) Tableau REST
+    'query view data' endpoint without code changes. Today `tableau_rest`
+    will raise NotImplementedError on first call — the stub is wired so the
+    selector itself can be exercised in test/staging environments before the
+    REST integration lands.
+    """
+    from config import settings
+    from engine.ingest import AirtableInboxSource, TableauRestSource
+
+    choice = settings.TRANSACTION_SOURCE
+    if choice == "tableau_rest":
+        log.info(
+            "TRANSACTION_SOURCE=tableau_rest (stubbed). "
+            "Will raise NotImplementedError on get_latest_transactions; "
+            "see engine.ingest.TableauRestSource for the planned shape."
+        )
+        return TableauRestSource(
+            server_url=settings.TABLEAU_SERVER_URL,
+            site_name=settings.TABLEAU_SITE_NAME,
+            view_id=settings.TABLEAU_VIEW_ID,
+            pat_name=settings.TABLEAU_PAT_NAME,
+            pat_secret=settings.TABLEAU_PAT_SECRET,
+            api_version=settings.TABLEAU_API_VERSION,
+        )
+    # Default + every unrecognized value (already warned about in settings)
+    return AirtableInboxSource(base)
+
+
 def _run_ingest_airtable() -> int:
     import traceback
 
+    from config import settings
     from engine.airtable_client import (
         append_run_log,
         get_api_and_base,
@@ -235,7 +268,6 @@ def _run_ingest_airtable() -> int:
     )
     from engine.filters import in_scope, out_of_scope
     from engine.ingest import (
-        AirtableInboxSource,
         DuplicateTransactionsError,
         NoNewTransactionsError,
         UnusableInboxRecordError,
@@ -247,7 +279,7 @@ def _run_ingest_airtable() -> int:
         print(f"FATAL: {exc}", file=sys.stderr)
         return 2
 
-    source = AirtableInboxSource(base)
+    source = _build_transaction_source(base)
     run_id = datetime.now(timezone.utc).isoformat(timespec="seconds")
     today_iso = datetime.now(timezone.utc).date().isoformat()
 

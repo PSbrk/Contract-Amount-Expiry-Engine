@@ -244,6 +244,98 @@ def test_parse_amount_handles_pd_na():
     assert _parse_amount(math.nan) == 0.0
 
 
+# ---------------------------------------------------------------------------
+# Step 7: TableauRestSource stub
+# ---------------------------------------------------------------------------
+
+def _make_stub_source(**overrides):
+    """Construct a TableauRestSource with sensible test defaults; tests can
+    override individual params without re-spelling the whole kwargs block."""
+    from engine.ingest import TableauRestSource
+
+    params: dict = dict(
+        server_url="https://us-west-2b.online.tableau.com",
+        site_name="lifechurch",
+        view_id="view-abc-123",
+        pat_name="ci-token",
+        pat_secret="not-a-real-secret",
+        api_version="3.22",
+    )
+    params.update(overrides)
+    return TableauRestSource(**params)
+
+
+def test_tableau_rest_source_conforms_to_transaction_source_protocol():
+    """Stub must satisfy the runtime-checkable TransactionSource Protocol so
+    main.py can hold the same variable type regardless of which source is
+    selected. If the Protocol drifts (new methods added), this test breaks
+    loudly instead of silently exempting the stub."""
+    from engine.ingest import TransactionSource
+
+    src = _make_stub_source()
+    assert isinstance(src, TransactionSource)
+
+
+def test_tableau_rest_source_raises_not_implemented_on_pull():
+    """Calling the stub MUST raise NotImplementedError — if a future refactor
+    accidentally turns it into a no-op (returning an empty DataFrame, say),
+    the engine would silently mark Inbox rows Processed with 0 results and
+    erase a day's transactions. NotImplementedError is the loud crash that
+    keeps the operator's data safe until the REST pull actually works."""
+    src = _make_stub_source()
+    with pytest.raises(NotImplementedError, match="Step 7 stub"):
+        src.get_latest_transactions()
+
+
+def test_tableau_rest_source_strips_trailing_slash_on_server_url():
+    """Tiny ergonomics fix for the eventual REST joiner — accept both
+    'https://server.example.com' and 'https://server.example.com/' from the
+    operator's env config."""
+    src = _make_stub_source(server_url="https://us-west-2b.online.tableau.com/")
+    assert src.server_url == "https://us-west-2b.online.tableau.com"
+
+
+def test_tableau_rest_source_holds_passed_params_verbatim():
+    """The stub MUST round-trip every param it was given so the future
+    implementation can read them off `self.*` without re-plumbing the
+    constructor. If a param is silently dropped, the eventual REST signin
+    would fail mysteriously when the real code lands."""
+    src = _make_stub_source(
+        view_id="custom-view",
+        pat_name="custom-token-name",
+        pat_secret="custom-secret",
+        api_version="3.99",
+    )
+    assert src.view_id == "custom-view"
+    assert src.pat_name == "custom-token-name"
+    assert src.pat_secret == "custom-secret"
+    assert src.api_version == "3.99"
+    assert src.site_name == "lifechurch"
+
+
+def test_tableau_rest_source_accepts_none_view_id_for_unconfigured_install():
+    """Operator running on `airtable_inbox` may never set TABLEAU_VIEW_ID;
+    settings will pass None. The stub must accept that without crashing in
+    its constructor (so audit/provision modes still run even when the env
+    is half-configured)."""
+    src = _make_stub_source(view_id=None, pat_name=None, pat_secret=None)
+    assert src.view_id is None
+    assert src.pat_name is None
+    assert src.pat_secret is None
+
+
+# ---------------------------------------------------------------------------
+# Step 7: TRANSACTION_SOURCE config switch
+# ---------------------------------------------------------------------------
+
+def test_transaction_source_default_is_airtable_inbox():
+    """Operator with no TRANSACTION_SOURCE env set must continue on the
+    Airtable Inbox path — `tableau_rest` is opt-in until the REST pull is
+    implemented."""
+    from config import settings
+    assert settings.TRANSACTION_SOURCE == "airtable_inbox"
+
+
 def test_parse_warns_on_extra_columns(tmp_path, caplog):
     """A 14th column in a future export must surface as a WARNING — silent
     drop has bitten too many ingestion pipelines."""

@@ -231,3 +231,43 @@ def _env_bool(name: str, default: bool) -> bool:
 
 DRY_RUN_ASANA: Final = _env_bool("DRY_RUN_ASANA", True)  # safe default during build
 WRITE_TEST_CONTRACT: Final = os.environ.get("WRITE_TEST_CONTRACT", "").strip() or None
+
+
+# ---------------------------------------------------------------------------
+# Step 7: transaction source selector
+# ---------------------------------------------------------------------------
+
+# Which TransactionSource the engine pulls from on --ingest. Today only
+# `airtable_inbox` is functional; `tableau_rest` exists as a stub
+# (engine.ingest.TableauRestSource) that will be implemented in a follow-up
+# step. The switch lives here so the rollout is a one-line env change with
+# zero code edits on the day the REST integration goes live.
+_VALID_SOURCES: Final = frozenset({"airtable_inbox", "tableau_rest"})
+
+_raw_source = os.environ.get("TRANSACTION_SOURCE", "").strip().lower()
+if _raw_source and _raw_source not in _VALID_SOURCES:
+    log.warning(
+        "TRANSACTION_SOURCE=%r is not recognized (valid: %s). "
+        "Falling back to default='airtable_inbox'.",
+        _raw_source, sorted(_VALID_SOURCES),
+    )
+    _raw_source = ""
+TRANSACTION_SOURCE: Final = _raw_source or "airtable_inbox"
+
+# Tableau Cloud REST endpoint parameters — consumed by TableauRestSource once
+# it lands. Defaults come from operator notes: site `lifechurch` on
+# us-west-2b. View ID + PAT name/secret have no safe default and must be
+# supplied via env when the switch is flipped to `tableau_rest`.
+TABLEAU_SERVER_URL: Final = (
+    os.environ.get("TABLEAU_SERVER_URL", "").strip()
+    or "https://us-west-2b.online.tableau.com"
+)
+TABLEAU_SITE_NAME: Final = (
+    os.environ.get("TABLEAU_SITE_NAME", "").strip() or "lifechurch"
+)
+TABLEAU_API_VERSION: Final = (
+    os.environ.get("TABLEAU_API_VERSION", "").strip() or "3.22"
+)
+TABLEAU_VIEW_ID: Final = os.environ.get("TABLEAU_VIEW_ID", "").strip() or None
+TABLEAU_PAT_NAME: Final = os.environ.get("TABLEAU_PAT_NAME", "").strip() or None
+TABLEAU_PAT_SECRET: Final = os.environ.get("TABLEAU_PAT_SECRET", "").strip() or None

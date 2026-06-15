@@ -394,6 +394,77 @@ class LocalFileSource:
         return df, meta
 
 
+class TableauRestSource:
+    """Stubbed source for the eventual Tableau REST API ingestion path.
+
+    Today the operator clicks Tableau's "Download → Crosstab" button and drops
+    the file into the Airtable Inbox attachment field. The plan is to eliminate
+    that manual step by having the engine pull the same view directly via the
+    Tableau Cloud REST API on a schedule.
+
+    The shape of that pull (per Tableau Cloud REST API docs, the "query view
+    data" endpoint):
+
+      Server:   https://us-west-2b.online.tableau.com
+      Site:     "lifechurch" (contentUrl form used in REST paths)
+      Auth:     POST /api/{api-version}/auth/signin with a Personal Access
+                Token (PAT name + secret), which returns an X-Tableau-Auth
+                token + the resolved site-id.
+      Pull:     GET /api/{api-version}/sites/{site-id}/views/{view-id}/data
+                with header X-Tableau-Auth: {token}. Default response is CSV.
+      Sign-out: POST /api/{api-version}/auth/signout
+
+    Once implemented, get_latest_transactions() will:
+      1. Sign in with TABLEAU_PAT_NAME + TABLEAU_PAT_SECRET (from env).
+      2. Pull the view data, run parse_tableau_export on the response bytes
+         (the parser already handles UTF-16/UTF-8 BOM auto-detection, tab
+         and comma delimiters, accounting-parens, etc.).
+      3. Sign out (best effort — token expires on its own).
+      4. SHA-256-hash the response bytes and check file_hash_already_processed
+         against the Airtable history so re-pulls of an unchanged view don't
+         reprocess. Distinct from the Inbox dedup (different storage but the
+         same hash table) so a manual Inbox upload + a future REST pull of
+         the same exported file still dedupe correctly.
+
+    Why a stub today: the engine ships behind a config switch
+    (`settings.TRANSACTION_SOURCE`). Operator stays on `airtable_inbox` until
+    the PATs and view ID are configured; flipping the switch to `tableau_rest`
+    will then activate this path with zero downstream changes (the
+    TransactionSource Protocol is the only contract). Tests pin the
+    stub behavior so it can't silently no-op once wired.
+
+    Construction note: the stub accepts the params it WILL need so callers
+    can wire them up now via settings; it just doesn't make the HTTP calls.
+    """
+
+    def __init__(
+        self,
+        *,
+        server_url: str,
+        site_name: str,
+        view_id: str | None,
+        pat_name: str | None,
+        pat_secret: str | None,
+        api_version: str = "3.22",
+    ) -> None:
+        self.server_url = server_url.rstrip("/")
+        self.site_name = site_name
+        self.view_id = view_id
+        self.pat_name = pat_name
+        self.pat_secret = pat_secret
+        self.api_version = api_version
+
+    def get_latest_transactions(self) -> tuple[pd.DataFrame, SourceMetadata]:
+        raise NotImplementedError(
+            "TableauRestSource is a Step 7 stub. The Tableau Cloud REST "
+            "'query view data' integration is planned for a follow-up step; "
+            "today the operator should keep settings.TRANSACTION_SOURCE on "
+            "'airtable_inbox' and continue uploading exports to the Airtable "
+            "Inbox. See engine.ingest.TableauRestSource docstring for the "
+            "planned endpoint shape."
+        )
+
+
 __all__ = [
     "EXPECTED_COLUMNS",
     "SourceMetadata",
@@ -404,5 +475,6 @@ __all__ = [
     "UnusableInboxRecordError",
     "AirtableInboxSource",
     "LocalFileSource",
+    "TableauRestSource",
     "parse_tableau_export",
 ]
