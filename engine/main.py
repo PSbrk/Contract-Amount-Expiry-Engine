@@ -606,6 +606,8 @@ def _run_attribution_and_needs_tagging(
             amount=group.amount,
             candidate_names=list(group.candidate_names),
             created_at_iso_date=today_iso,
+            first_date=group.first_date,
+            last_date=group.last_date,
         )
         upserted += 1
     if upserted:

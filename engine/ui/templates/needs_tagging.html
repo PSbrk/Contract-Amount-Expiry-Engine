@@ -4,21 +4,36 @@
 <header>
   <h2>Needs Tagging</h2>
   <p>
-    <span class="pill">{{ rows|length }} group{{ '' if rows|length == 1 else 's' }}</span>
-    {% if unfilled %}
+    <span class="pill">{{ rows|length }} {{ 'dismissed row' if show == 'dismissed' else 'open group' }}{{ '' if rows|length == 1 else 's' }}</span>
+    {% if show != 'dismissed' and unfilled %}
       <span class="pill alarm-on">{{ unfilled }} awaiting answer</span>
+    {% endif %}
+    {% if dismissed_count and show != 'dismissed' %}
+      <span class="pill">{{ dismissed_count }} dismissed (hidden)</span>
     {% endif %}
   </p>
   <p>
     <small>
-      Fill <em>Assign Contract</em> on a row and save. The next
-      <code>--ingest</code> promotes confirmed rows into Learned Mappings,
-      so future runs auto-attribute the same (Campus, Dept, Account&nbsp;No, Vendor) tuple.
+      Fill <em>Assign Contract</em> on a row and save &mdash; the next
+      <code>--ingest</code> promotes confirmed rows into Learned Mappings.
+      Click <em>Dismiss</em> on a row whose spend is real but belongs to
+      a different department &mdash; the engine will leave it alone on
+      future runs.
       {% if not contract_names %}
-        <br>(Suggestions empty — run <code>--ingest</code> at least once to populate the Dashboard, which feeds this datalist.)
+        <br>(Suggestions empty &mdash; run <code>--ingest</code> at least once to populate the Dashboard, which feeds this datalist.)
       {% endif %}
     </small>
   </p>
+  <nav>
+    <ul>
+      <li><a href="{{ url_for('needs_tagging', show='open') }}"
+             {% if show == 'open' %}aria-current="page"{% endif %}>Open</a></li>
+      <li><a href="{{ url_for('needs_tagging', show='dismissed') }}"
+             {% if show == 'dismissed' %}aria-current="page"{% endif %}>Dismissed ({{ dismissed_count }})</a></li>
+      <li><a href="{{ url_for('needs_tagging', show='all') }}"
+             {% if show == 'all' %}aria-current="page"{% endif %}>All</a></li>
+    </ul>
+  </nav>
 </header>
 
 {% if rows %}
@@ -32,20 +47,36 @@
     <tr>
       <th>Group</th>
       <th class="num">$</th>
+      <th>Dates</th>
       <th>Sample description</th>
       <th>Engine candidates</th>
-      <th>Assign Contract</th>
+      <th style="min-width: 18rem;">Action</th>
     </tr>
   </thead>
   <tbody>
   {% for r in rows %}
     {% set filled = (r["Assign Contract"] or '').strip() %}
-    <tr class="{{ '' if filled else 'row-unfilled' }}">
+    {% set dismissed = (r["Dismissed"] or 0) == 1 %}
+    <tr class="{{ '' if (filled or dismissed) else 'row-unfilled' }}"
+        style="{{ 'opacity: 0.55;' if dismissed else '' }}">
       <td>
-        <strong>{{ r["Vendor"] or "" }}</strong><br>
-        <small>{{ r["Campus"] or "" }} · {{ r["Dept"] or "" }} · acct {{ r["Account No"] or "" }}</small>
+        <strong>{{ r["Vendor"] or "" }}</strong>
+        {% if dismissed %}<span class="pill">dismissed</span>{% endif %}
+        <br>
+        <small>{{ r["Campus"] or "" }} &middot; {{ r["Dept"] or "" }} &middot; acct {{ r["Account No"] or "" }}</small>
       </td>
       <td class="num">${{ "{:,.2f}".format(r["$ in group"] or 0) }}</td>
+      <td>
+        <small>
+          {% if r["First Date"] and r["Last Date"] and r["First Date"] != r["Last Date"] %}
+            {{ r["First Date"] }}<br>&hellip; {{ r["Last Date"] }}
+          {% elif r["First Date"] or r["Last Date"] %}
+            {{ r["First Date"] or r["Last Date"] }}
+          {% else %}
+            <span class="alarm-off">&mdash;</span>
+          {% endif %}
+        </small>
+      </td>
       <td><small>{{ (r["Sample Record Description"] or "")[:140] }}</small></td>
       <td>
         {% if r["Engine Candidates"] %}
@@ -56,15 +87,33 @@
         {% endif %}
       </td>
       <td>
-        <form method="post" action="{{ url_for('needs_tagging_save', record_id=r['id']) }}"
-              style="display:flex; gap:0.4rem; margin:0;">
-          <input type="text" name="assign_contract"
-                 value="{{ r['Assign Contract'] or '' }}"
-                 list="contract-names"
-                 placeholder="Contract name (Asana task)"
-                 style="margin:0; flex:1;">
-          <button type="submit" style="margin:0;">Save</button>
-        </form>
+        {% if dismissed %}
+          <form method="post"
+                action="{{ url_for('needs_tagging_undismiss', record_id=r['id']) }}"
+                style="margin: 0;">
+            <input type="hidden" name="show" value="{{ show }}">
+            <button type="submit" class="secondary" style="margin: 0;">Restore</button>
+          </form>
+        {% else %}
+          <form method="post"
+                action="{{ url_for('needs_tagging_save', record_id=r['id']) }}"
+                style="display:flex; gap:0.4rem; margin:0 0 0.4rem 0;">
+            <input type="text" name="assign_contract"
+                   value="{{ r['Assign Contract'] or '' }}"
+                   list="contract-names"
+                   placeholder="Contract name (Asana task)"
+                   style="margin:0; flex:1;">
+            <button type="submit" style="margin:0;">Save</button>
+          </form>
+          <form method="post"
+                action="{{ url_for('needs_tagging_dismiss', record_id=r['id']) }}"
+                style="margin: 0;">
+            <input type="hidden" name="show" value="{{ show }}">
+            <button type="submit" class="secondary outline" style="margin: 0; font-size: 0.85rem;">
+              Dismiss (irrelevant)
+            </button>
+          </form>
+        {% endif %}
       </td>
     </tr>
   {% endfor %}
@@ -72,6 +121,10 @@
 </table>
 </figure>
 {% else %}
-<p>No Needs Tagging rows. Either the engine attributed everything cleanly, or it hasn't run yet.</p>
+  {% if show == 'dismissed' %}
+    <p>No dismissed rows. Anything you mark as irrelevant will appear here.</p>
+  {% else %}
+    <p>No Needs Tagging rows. Either the engine attributed everything cleanly, or it hasn't run yet.</p>
+  {% endif %}
 {% endif %}
 {% endblock %}

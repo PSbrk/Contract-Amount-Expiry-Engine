@@ -152,13 +152,23 @@ def register_routes(app: Flask) -> None:
 
     @app.route("/needs-tagging")
     def needs_tagging():
+        # ?show=dismissed switches the view to show ONLY rows the operator
+        # has dismissed (irrelevant). Default view hides them.
+        show = request.args.get("show", "open").lower()
+        if show == "dismissed":
+            where = 'WHERE COALESCE("Dismissed", 0) = 1'
+        elif show == "all":
+            where = ''
+        else:
+            where = 'WHERE COALESCE("Dismissed", 0) = 0'
         rows = g.conn.execute(
-            '''SELECT * FROM "Needs Tagging"
-               ORDER BY CASE WHEN "Assign Contract" IS NULL
-                                  OR TRIM("Assign Contract") = ''
-                             THEN 0 ELSE 1 END,
-                        COALESCE("$ in group", 0) DESC,
-                        "Group Key"'''
+            f'''SELECT * FROM "Needs Tagging"
+                {where}
+                ORDER BY CASE WHEN "Assign Contract" IS NULL
+                                   OR TRIM("Assign Contract") = ''
+                              THEN 0 ELSE 1 END,
+                         COALESCE("$ in group", 0) DESC,
+                         "Group Key"'''
         ).fetchall()
         # The datalist of contract-name suggestions comes from the
         # Dashboard table — those are the contracts the most recent
@@ -176,12 +186,20 @@ def register_routes(app: Flask) -> None:
         unfilled = sum(
             1 for r in rows
             if not (r["Assign Contract"] or "").strip()
+            and not (r["Dismissed"] or 0)
         )
+        # Total dismissed count -- displayed as a chip in the header so the
+        # operator can see how many irrelevant rows have piled up.
+        dismissed_count = g.conn.execute(
+            'SELECT COUNT(*) FROM "Needs Tagging" WHERE COALESCE("Dismissed", 0) = 1'
+        ).fetchone()[0]
         return render_template(
             "needs_tagging.html",
             rows=rows,
             contract_names=contract_names,
             unfilled=unfilled,
+            dismissed_count=dismissed_count,
+            show=show,
         )
 
     @app.route("/needs-tagging/<int:record_id>", methods=["POST"])
@@ -205,6 +223,39 @@ def register_routes(app: Flask) -> None:
             "success",
         )
         return redirect(url_for("needs_tagging"))
+
+    @app.route("/needs-tagging/<int:record_id>/dismiss", methods=["POST"])
+    def needs_tagging_dismiss(record_id: int):
+        existing = g.conn.execute(
+            'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if existing is None:
+            abort(404)
+        sqlite_client.set_needs_tagging_dismissed(
+            g.conn, record_id=record_id, dismissed=True,
+        )
+        flash(
+            "Marked as irrelevant. Engine will leave this group alone "
+            "on future runs.",
+            "success",
+        )
+        # Stay on the view the operator was looking at (open / dismissed / all).
+        show = request.form.get("show", "open")
+        return redirect(url_for("needs_tagging", show=show))
+
+    @app.route("/needs-tagging/<int:record_id>/undismiss", methods=["POST"])
+    def needs_tagging_undismiss(record_id: int):
+        existing = g.conn.execute(
+            'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if existing is None:
+            abort(404)
+        sqlite_client.set_needs_tagging_dismissed(
+            g.conn, record_id=record_id, dismissed=False,
+        )
+        flash("Restored. Row is back on the open list.", "success")
+        show = request.form.get("show", "dismissed")
+        return redirect(url_for("needs_tagging", show=show))
 
     @app.route("/run-log")
     def run_log():

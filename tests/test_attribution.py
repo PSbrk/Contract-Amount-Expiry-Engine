@@ -36,7 +36,13 @@ def _contract(name: str, campus_options: frozenset[str], gid: str | None = None)
 
 
 def _df(*rows: dict) -> pd.DataFrame:
-    """Build a small in-scope-style DataFrame from kwarg dicts."""
+    """Build a small in-scope-style DataFrame from kwarg dicts.
+
+    Auto-injects a Date column when individual rows omit it; the attribution
+    layer's date-bounds aggregation requires it, but the older tests don't
+    care about dates so they just get a static default. Per-row Date keys
+    in the input dict still win (kwarg-override semantics)."""
+    rows = [{"Date": pd.Timestamp("2025-06-01"), **r} for r in rows]
     return pd.DataFrame(rows)
 
 
@@ -347,6 +353,7 @@ def test_attribute_handles_pd_na_in_string_columns():
         "Vendor": pd.array([pd.NA, "Acme"], dtype="string"),
         "Record Description": pd.array([pd.NA, "real desc"], dtype="string"),
         "Amount": [100.0, 200.0],
+        "Date": [pd.Timestamp("2025-06-01"), pd.Timestamp("2025-06-15")],
     })
     contracts = [_contract("Acme", frozenset({"CEN"}))]
     run = attribute(df, contracts, aliases={}, crosswalk=campus_map.build(),

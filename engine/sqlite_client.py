@@ -481,13 +481,21 @@ def upsert_needs_tagging_group(
     amount: float,
     candidate_names: list[str],
     created_at_iso_date: str,
+    first_date: str = "",
+    last_date: str = "",
 ) -> dict:
     """Idempotent upsert keyed by Group Key.
 
-    On UPDATE only the three engine-owned rolling fields are touched
-    (Sample Record Description, $ in group, Engine Candidates) — Notes
-    is operator-owned and stays untouched. On CREATE, Notes is left
-    NULL for the operator to fill in.
+    On UPDATE only the engine-owned rolling fields are touched (Sample
+    Record Description, $ in group, First Date, Last Date, Engine
+    Candidates) -- Notes, Assign Contract, and Dismissed are operator-owned
+    and stay untouched. On CREATE, Notes / Assign Contract are NULL and
+    Dismissed defaults to 0.
+
+    If the existing row is Dismissed=1, the upsert is a no-op: the
+    operator dismissed it as irrelevant and the engine must not keep
+    re-surfacing the same group's amount / sample / candidates as if it
+    still needs review. Returns the unchanged dismissed row.
     """
     candidate_lines: list[str] = []
     if candidate_names:
@@ -500,13 +508,23 @@ def upsert_needs_tagging_group(
 
     existing = _fetch_by_field(conn, "Needs Tagging", "Group Key", group_key)
     if existing:
+        # _fetch_by_field returns the legacy {"id": int, "fields": {...}}
+        # shape -- the actual column values live in existing["fields"].
+        if existing["fields"].get("Dismissed"):
+            # Dismissed by the operator; do not refresh. The row stays
+            # exactly as it was when dismissed so the operator's audit
+            # trail (sample / amount as of dismissal time) is preserved.
+            return existing
         conn.execute(
             '''UPDATE "Needs Tagging"
                SET "Sample Record Description" = ?,
                    "$ in group" = ?,
+                   "First Date" = ?,
+                   "Last Date" = ?,
                    "Engine Candidates" = ?
                WHERE id = ?''',
-            (sample_description, amount, engine_candidates, existing["id"]),
+            (sample_description, amount, first_date, last_date,
+             engine_candidates, existing["id"]),
         )
         conn.commit()
         return _fetch_by_id(conn, "Needs Tagging", existing["id"])
@@ -515,10 +533,12 @@ def upsert_needs_tagging_group(
         '''INSERT INTO "Needs Tagging"
              ("Group Key", "Campus", "Dept", "Account No", "Vendor",
               "Sample Record Description", "$ in group",
+              "First Date", "Last Date",
               "Created At", "Engine Candidates")
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
         (group_key, campus, dept, account_no, vendor,
-         sample_description, amount, created_at_iso_date, engine_candidates),
+         sample_description, amount, first_date, last_date,
+         created_at_iso_date, engine_candidates),
     )
     conn.commit()
     return _fetch_by_id(conn, "Needs Tagging", cur.lastrowid)
@@ -767,6 +787,25 @@ def delete_learned_mapping(conn: sqlite3.Connection, *, record_id: int) -> None:
     conn.commit()
 
 
+def set_needs_tagging_dismissed(
+    conn: sqlite3.Connection,
+    *,
+    record_id: int,
+    dismissed: bool,
+) -> None:
+    """Operator-driven UPDATE of the Dismissed flag on a single Needs
+    Tagging row. Idempotent. Dismissing does NOT touch Assign Contract --
+    those are independent concerns. If the operator later sets Assign
+    Contract on a dismissed row, promote_filled_needs_tagging will still
+    promote it (and the row will be deleted afterward, naturally
+    resolving any ambiguity)."""
+    conn.execute(
+        'UPDATE "Needs Tagging" SET "Dismissed" = ? WHERE id = ?',
+        (1 if dismissed else 0, record_id),
+    )
+    conn.commit()
+
+
 def set_needs_tagging_assign_contract(
     conn: sqlite3.Connection,
     *,
@@ -794,15 +833,17 @@ def cleanup_stale_needs_tagging(
     conn: sqlite3.Connection, *, live_group_keys: set[str]
 ) -> int:
     """Delete Needs Tagging rows whose Group Key is NOT in live_group_keys
-    AND whose Assign Contract is empty.
+    AND whose Assign Contract is empty AND that are NOT Dismissed.
 
     Filled rows (operator answers in flight) are NEVER deleted by this
-    path — they are the promotion queue's responsibility.
+    path -- they are the promotion queue's responsibility. Dismissed
+    rows are also kept indefinitely so the same group does not get
+    re-detected and re-surfaced after the operator marked it irrelevant.
     """
     rows = conn.execute(
         '''SELECT id, "Group Key" FROM "Needs Tagging"
-           WHERE "Assign Contract" IS NULL
-              OR TRIM("Assign Contract") = '' '''
+           WHERE ("Assign Contract" IS NULL OR TRIM("Assign Contract") = '')
+             AND COALESCE("Dismissed", 0) = 0'''
     ).fetchall()
     deleted = 0
     for r in rows:

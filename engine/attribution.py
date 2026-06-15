@@ -67,6 +67,11 @@ class AttributionResult:
     rows: int
     amount: float
     sample_description: str
+    # ISO date strings (YYYY-MM-DD) bounding the transaction set in this group.
+    # Empty string when the input had no parseable dates (defensive; shouldn't
+    # happen given parse_tableau_export enforces datetime parsing).
+    first_date: str = ""
+    last_date: str = ""
 
     @property
     def needs_tagging(self) -> bool:
@@ -160,8 +165,23 @@ def attribute(
             rows=("Record No", "count"),
             amount=("Amount", "sum"),
             sample_description=("Record Description", _first_non_empty),
+            # Bounds of the transaction set in this group -- shown in the
+            # Needs Tagging UI so the operator can locate the original
+            # transactions in the source system.
+            first_date=("Date", "min"),
+            last_date=("Date", "max"),
         )
     )
+
+    def _ts_to_iso_date(ts) -> str:
+        """pd.Timestamp -> 'YYYY-MM-DD'. Empty string on missing dates so the
+        downstream TEXT column survives the absence without a None-check
+        in every consumer."""
+        if ts is None or pd.isna(ts):
+            return ""
+        if hasattr(ts, "strftime"):
+            return ts.strftime("%Y-%m-%d")
+        return str(ts)[:10]
 
     def _safe_str(v: object) -> str:
         """Coerce a pandas cell to a clean str; pd.NA and NaN become ''."""
@@ -179,6 +199,8 @@ def attribute(
             rows=int(g["rows"]),
             amount=float(g["amount"]),
             sample_description=_safe_str(g["sample_description"]),
+            first_date=_ts_to_iso_date(g["first_date"]),
+            last_date=_ts_to_iso_date(g["last_date"]),
             searchable=searchable,
             crosswalk=crosswalk,
             learned_mappings=learned_mappings,
@@ -205,6 +227,8 @@ def _attribute_group(
     rows: int,
     amount: float,
     sample_description: str,
+    first_date: str = "",
+    last_date: str = "",
     searchable: list[tuple[str, Contract]],
     crosswalk: CampusCrosswalk,
     learned_mappings: Mapping[tuple[str, str, str, str], str],
@@ -220,6 +244,8 @@ def _attribute_group(
         campus=campus, dept=dept, account_no=account_no, vendor=vendor,
         rows=rows, amount=amount,
         sample_description=sample_description,
+        first_date=first_date,
+        last_date=last_date,
     )
 
     # 1. Drop-code short-circuit. The row is not a Needs Tagging concern —

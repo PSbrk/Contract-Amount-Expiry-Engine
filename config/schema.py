@@ -111,7 +111,9 @@ TABLES_SCHEMA: Final = [
         "description": (
             "Ambiguous / unmatched attribution groupings. Operator sets "
             "Assign Contract once in the web UI; engine promotes filled rows "
-            "into Learned Mappings on the next run."
+            "into Learned Mappings on the next run. Operator can also "
+            "Dismiss a row as Irrelevant -- engine then leaves it alone "
+            "on future runs (no re-detect loop, no clutter)."
         ),
         "fields": [
             {"name": "Group Key", "type": "singleLineText",
@@ -122,10 +124,20 @@ TABLES_SCHEMA: Final = [
             {"name": "Vendor", "type": "singleLineText"},
             {"name": "Sample Record Description", "type": "multilineText"},
             {"name": "$ in group", "type": "number", "options": {"precision": 2}},
+            {"name": "First Date", "type": "date",
+             "description": "Earliest transaction Date in the group -- helps the operator look up source rows."},
+            {"name": "Last Date", "type": "date",
+             "description": "Latest transaction Date in the group."},
             {"name": "Assign Contract", "type": "singleLineText",
              "description": (
                  "Contract name (Asana task name) the operator wants this "
                  "grouping attributed to. Leave blank if unmatched."
+             )},
+            {"name": "Dismissed", "type": "checkbox",
+             "description": (
+                 "Operator-set: 1 = irrelevant (other department's spend, "
+                 "etc.). Engine skips re-upserting dismissed rows and "
+                 "cleanup_stale never deletes them."
              )},
             {"name": "Created At", "type": "date"},
             {"name": "Engine Candidates", "type": "multilineText",
