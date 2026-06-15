@@ -760,11 +760,26 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
 
 
 def _run_ingest_file(path: str) -> int:
+    """Parse a local Tableau export and record the run in the SQLite
+    engine database.
+
+    Phase 1 of the local-first migration: this path exercises the new
+    engine.sqlite_client end-to-end against a real file. It does NOT
+    run attribution / compute (those require Asana and the full Inbox
+    plumbing that Phase 2 introduces via LocalInboxSource); it does
+    parse, hash, dedup-check, and write an Inbox + Run Log row so the
+    SQLite layer is provably populated by a real file.
+    """
+    from datetime import datetime, timezone
+
     from engine.filters import in_scope, out_of_scope
     from engine.ingest import LocalFileSource
+    from engine import sqlite_client
 
-    print("NOTE: --ingest-file bypasses Airtable — no dedup check, no "
-          "Run Log row, no Inbox mark. Use --ingest for a real run.")
+    print("NOTE: --ingest-file is the Phase-1 SQLite smoke path — it "
+          "populates data/engine.db with Inbox + Run Log rows but skips "
+          "attribution and compute (no Asana required). The full pipeline "
+          "moves here in Phase 2.")
     print()
 
     try:
@@ -779,8 +794,61 @@ def _run_ingest_file(path: str) -> int:
 
     kept = in_scope(df)
     rejected = out_of_scope(df)
-    _print_ingest_report(df, meta, kept, rejected)
-    return 0
+    in_total, out_total = _print_ingest_report(df, meta, kept, rejected)
+
+    conn = sqlite_client.get_db_connection()
+    try:
+        sqlite_client.ensure_schema(conn)
+
+        run_id = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+
+        # Dedup check — if the same file was processed before, surface
+        # that and record a no_new_data Run Log row rather than blowing
+        # up on the UNIQUE constraint at insert time.
+        if sqlite_client.file_hash_already_processed(conn, meta.hash):
+            print()
+            print(
+                f"DUPLICATE: this file's hash ({meta.hash[:12]}...) is "
+                f"already in the Inbox table. Recording a no_new_data "
+                f"Run Log row and skipping the Inbox insert."
+            )
+            sqlite_client.append_run_log(
+                conn, run_id=run_id, mode="ingest", outcome="no_new_data",
+                file_name=meta.name, file_hash=meta.hash,
+                notes="--ingest-file: duplicate hash, no Inbox insert.",
+            )
+            return 0
+
+        sqlite_client.insert_inbox_processed(
+            conn,
+            name=meta.name,
+            file_hash=meta.hash,
+            rows_in_scope=len(kept),
+            total_in_scope=in_total,
+            processed_at_iso_date=today_iso,
+            notes=(
+                f"--ingest-file parser smoke: parsed {len(df):,} rows; "
+                f"in-scope {len(kept):,}. Phase 1 does not run "
+                f"attribution / compute."
+            ),
+        )
+        sqlite_client.append_run_log(
+            conn, run_id=run_id, mode="ingest", outcome="ok",
+            file_name=meta.name, file_hash=meta.hash,
+            rows_in_scope=len(kept), rows_out_of_scope=len(rejected),
+            total_in_scope=in_total, total_out_of_scope=out_total,
+            notes=(
+                "--ingest-file Phase-1 smoke: parser + Inbox + Run Log only. "
+                "Attribution, Dashboard, Needs Tagging, and State writes "
+                "are Phase 2 work."
+            ),
+        )
+        print()
+        print(f"Wrote Inbox + Run Log rows to {sqlite_client.DEFAULT_DB_PATH}.")
+        return 0
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
