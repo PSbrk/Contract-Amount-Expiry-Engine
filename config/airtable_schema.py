@@ -185,7 +185,7 @@ TABLES_SCHEMA: Final = [
                  "Tableau code maps to. Empty when Drop is true."
              )},
             {"name": "Drop", "type": "checkbox",
-             "options": {"icon": "xCircle", "color": "redBright"},
+             "options": {"icon": "xCheckbox", "color": "redBright"},
              "description": "True drops all transactions with this Tableau code."},
             {"name": "Notes", "type": "multilineText"},
         ],
