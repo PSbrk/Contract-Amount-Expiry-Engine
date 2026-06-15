@@ -433,6 +433,7 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
     BEFORE the attribution pass, so the new Learned Mappings are visible to
     the attribute() call within the same run.
     """
+    from config import settings
     from engine import asana_client, asana_contracts, attribution, campus_map
     from engine.airtable_client import (
         cleanup_stale_needs_tagging,
