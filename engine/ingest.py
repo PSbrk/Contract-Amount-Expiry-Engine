@@ -31,7 +31,9 @@ import io
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -266,11 +268,19 @@ class SourceMetadata:
 
     inbox_record_id is set only when the source is AirtableInboxSource — local
     files and (future) Tableau REST pulls have no Airtable backing row.
+
+    source_path is set only when the source is LocalInboxSource — it
+    carries the path of the file that was just picked off data/inbox/,
+    so main.py can move it to data/processed/ once the pipeline
+    succeeds. Kept on the metadata rather than as a separate
+    LocalInboxSource method so the engine's main loop stays
+    storage-agnostic about how to "finalize" the read.
     """
     name: str            # filename or view ID
     hash: str            # SHA-256 hex of the source bytes
     received_iso: str    # ISO timestamp the source was received into the pipeline
     inbox_record_id: str | None = None
+    source_path: str | None = None
 
 
 class TransactionSourceError(Exception):
@@ -366,6 +376,130 @@ class AirtableInboxSource:
             inbox_record_id=record.id,
         )
         return df, meta
+
+
+class LocalInboxSource:
+    """Scans a local inbox folder for the next Tableau export to ingest.
+
+    The local-first replacement for AirtableInboxSource. The operator
+    drops .csv / .xlsx exports into data/inbox/, the engine picks the
+    OLDEST by mtime on each run (so a backlog drains FIFO), hashes the
+    bytes, checks the SQLite Inbox audit log for dedup, parses, and
+    hands back the (df, meta) the rest of the pipeline expects.
+
+    File lifecycle:
+      data/inbox/<filename>
+        ↓ (pick + parse + pipeline runs)
+        → data/processed/<hash[:12]>-<filename>  (success — caller moves via
+           move_to_processed)
+        → data/processed/_duplicate-<hash[:12]>-<filename>  (already in
+           Inbox table — moved here by get_latest_transactions before
+           raising DuplicateTransactionsError, so the file leaves the
+           queue without overwriting the original processed file)
+        → stays in data/inbox/  (parser error or pipeline failure — operator
+           retries on the next run)
+
+    The caller (main.py) is responsible for the SUCCESS move via
+    move_to_processed(). Done this way so a parser exception or pipeline
+    crash leaves the file in inbox/ for retry, rather than the source
+    moving it speculatively.
+    """
+
+    _ALLOWED_SUFFIXES: tuple[str, ...] = (".csv", ".xlsx")
+
+    def __init__(
+        self,
+        conn,
+        *,
+        inbox_dir: str | os.PathLike | None = None,
+        processed_dir: str | os.PathLike | None = None,
+    ) -> None:
+        self.conn = conn
+        # Defaults point at the canonical local-first layout. Callers
+        # can override in tests to point at a tmpdir.
+        self.inbox_dir = (
+            Path(inbox_dir) if inbox_dir is not None
+            else Path("data") / "inbox"
+        )
+        self.processed_dir = (
+            Path(processed_dir) if processed_dir is not None
+            else Path("data") / "processed"
+        )
+
+    def get_latest_transactions(self) -> tuple[pd.DataFrame, SourceMetadata]:
+        # Imported inside the method so a test module that imports
+        # engine.ingest doesn't pay for sqlite_client's import side
+        # effects unless the local-inbox path actually runs.
+        from engine.sqlite_client import (
+            file_hash_already_processed as _sqlite_hash_seen,
+            sha256_hex as _sqlite_sha256,
+        )
+
+        self.inbox_dir.mkdir(parents=True, exist_ok=True)
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+
+        candidates = sorted(
+            (
+                p for p in self.inbox_dir.iterdir()
+                if p.is_file()
+                and p.suffix.lower() in self._ALLOWED_SUFFIXES
+            ),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not candidates:
+            raise NoNewTransactionsError(
+                f"no unprocessed files in {self.inbox_dir}"
+            )
+        path = candidates[0]
+        data = path.read_bytes()
+        h = _sqlite_sha256(data)
+
+        if _sqlite_hash_seen(self.conn, h):
+            # The same content has already been processed. Move the
+            # duplicate OUT of inbox/ so subsequent runs don't re-detect
+            # it and busy-loop the warning. The `_duplicate-` prefix
+            # keeps it visually distinct from real processed files in
+            # data/processed/.
+            dest = (
+                self.processed_dir
+                / f"_duplicate-{h[:12]}-{path.name}"
+            )
+            shutil.move(str(path), str(dest))
+            log.info(
+                "LocalInboxSource: duplicate hash %s; moved %s -> %s",
+                h[:12], path.name, dest,
+            )
+            raise DuplicateTransactionsError(
+                hash=h, filename=path.name, inbox_record_id=None,
+            )
+
+        df = parse_tableau_export(data, filename=path.name)
+        meta = SourceMetadata(
+            name=path.name,
+            hash=h,
+            received_iso=datetime.fromtimestamp(
+                path.stat().st_mtime, tz=timezone.utc,
+            ).isoformat(timespec="seconds"),
+            inbox_record_id=None,
+            source_path=str(path),
+        )
+        return df, meta
+
+    def move_to_processed(self, source_path: str | os.PathLike, *, file_hash: str) -> Path:
+        """Move a successfully-ingested file to data/processed/.
+
+        Destination filename is `<hash[:12]>-<original-name>` so two
+        files with the same operator-chosen name (but different content,
+        ergo different hashes) don't collide. Called by main.py only
+        AFTER the full pipeline has written the SQLite Inbox row —
+        keeping the move OUT of get_latest_transactions means a parser
+        crash or pipeline error leaves the file in inbox/ for retry.
+        """
+        src = Path(source_path)
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.processed_dir / f"{file_hash[:12]}-{src.name}"
+        shutil.move(str(src), str(dest))
+        return dest
 
 
 class LocalFileSource:
@@ -474,6 +608,7 @@ __all__ = [
     "DuplicateTransactionsError",
     "UnusableInboxRecordError",
     "AirtableInboxSource",
+    "LocalInboxSource",
     "LocalFileSource",
     "TableauRestSource",
     "parse_tableau_export",

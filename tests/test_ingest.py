@@ -328,12 +328,12 @@ def test_tableau_rest_source_accepts_none_view_id_for_unconfigured_install():
 # Step 7: TRANSACTION_SOURCE config switch
 # ---------------------------------------------------------------------------
 
-def test_transaction_source_default_is_airtable_inbox():
-    """Operator with no TRANSACTION_SOURCE env set must continue on the
-    Airtable Inbox path — `tableau_rest` is opt-in until the REST pull is
-    implemented."""
+def test_transaction_source_default_is_local_inbox():
+    """Phase 2 of the local-first migration: with no TRANSACTION_SOURCE
+    env set, the engine scans data/inbox/ rather than calling Airtable.
+    `airtable_inbox` and `tableau_rest` remain available but are opt-in."""
     from config import settings
-    assert settings.TRANSACTION_SOURCE == "airtable_inbox"
+    assert settings.TRANSACTION_SOURCE == "local_inbox"
 
 
 def test_parse_warns_on_extra_columns(tmp_path, caplog):

@@ -92,17 +92,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     mode.add_argument(
         "--ingest", action="store_true",
-        help="Full pipeline: promote operator-filled Needs Tagging answers "
-             "into Learned Mappings, pull the newest unprocessed Inbox "
-             "attachment, parse + filter, load Asana contracts and run "
-             "attribution, upsert ambiguous/unmatched groupings into Needs "
-             "Tagging, clean up stale Needs Tagging rows, mark the Inbox "
-             "row Processed, and write a Run Log entry.",
+        help="Full local-first pipeline: pick the oldest unprocessed file "
+             "from data/inbox/ (or the configured TransactionSource), parse "
+             "+ filter, promote operator-filled Needs Tagging answers, load "
+             "Asana contracts and run attribution, upsert Needs Tagging / "
+             "Dashboard / State rows into data/engine.db, move the file to "
+             "data/processed/, and write a Run Log entry.",
     )
     mode.add_argument(
         "--ingest-file", metavar="PATH",
-        help="Parse a local Tableau export file and print the report. "
-             "Skips Airtable entirely — useful for dev smoke-testing.",
+        help="Parse a local Tableau export file, dedup its hash against "
+             "data/engine.db, and record an Inbox + Run Log row. Skips "
+             "attribution / compute — use --ingest for the full pipeline.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -123,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_provision(dry_run=args.dry_run)
 
     if args.ingest:
-        return _run_ingest_airtable()
+        return _run_ingest()
 
     if args.ingest_file:
         return _run_ingest_file(args.ingest_file)
@@ -194,7 +195,7 @@ def _print_ingest_report(df, meta, kept, rejected) -> tuple[float, float]:
     return in_total, out_total
 
 
-def _run_promotion_only(base, *, today_iso: str) -> int:
+def _run_promotion_only(conn, *, today_iso: str) -> int:
     """Drain the Needs Tagging promotion queue without doing ingestion.
 
     Called on the no-new-data and duplicate-file early exits so an operator
@@ -202,7 +203,7 @@ def _run_promotion_only(base, *, today_iso: str) -> int:
     still sees their answers get promoted. Returns the number promoted.
     """
     from engine import asana_client, asana_contracts
-    from engine.airtable_client import promote_filled_needs_tagging
+    from engine.sqlite_client import promote_filled_needs_tagging
 
     # Best-effort: load contract names for validation; if Asana auth fails,
     # promote without validation (the operator will see the typo eventually).
@@ -215,7 +216,7 @@ def _run_promotion_only(base, *, today_iso: str) -> int:
         log.warning("Skipping contract-name validation during promotion: %s", exc)
 
     promotions = promote_filled_needs_tagging(
-        base, learned_at_iso_date=today_iso,
+        conn, learned_at_iso_date=today_iso,
         valid_contract_names=valid_names,
     )
     if promotions:
@@ -225,25 +226,25 @@ def _run_promotion_only(base, *, today_iso: str) -> int:
     return len(promotions)
 
 
-def _prune_run_log_safely(base) -> None:
+def _prune_run_log_safely(conn) -> None:
     """Best-effort Run Log rolling-window prune. Called at the end of every
     --ingest outcome (success, no-new-data, duplicate) so the table doesn't
     grow unbounded.
 
     Failure here NEVER fails the run — the Run Log already captured the
     primary outcome on the calling line above; a stale-row cleanup glitch
-    is an Airtable / network problem that the operator will see on the
-    next run when it succeeds. Swallow + log so the exit code stays
-    truthful about the actual ingest result.
+    is a transient I/O problem that the operator will see on the next
+    run when it succeeds. Swallow + log so the exit code stays truthful
+    about the actual ingest result.
     """
     from datetime import datetime, timezone
 
     from config import settings
-    from engine.airtable_client import prune_run_log_older_than
+    from engine.sqlite_client import prune_run_log_older_than
 
     try:
         prune_run_log_older_than(
-            base,
+            conn,
             retention_days=settings.RUN_LOG_RETENTION_DAYS,
             today=datetime.now(timezone.utc).date(),
         )
@@ -254,18 +255,23 @@ def _prune_run_log_safely(base) -> None:
         )
 
 
-def _build_transaction_source(base):
+def _build_transaction_source(conn):
     """Pick the TransactionSource implementation based on settings.
 
-    Step 7 introduces a config switch so the same --ingest pipeline can be
-    pointed at the (current) Airtable Inbox or the (future) Tableau REST
-    'query view data' endpoint without code changes. Today `tableau_rest`
-    will raise NotImplementedError on first call — the stub is wired so the
-    selector itself can be exercised in test/staging environments before the
-    REST integration lands.
+    Phase 2 default: LocalInboxSource — scans data/inbox/ for the next
+    Tableau export, dedups via SQLite, moves to data/processed/ on
+    success. `airtable_inbox` is preserved as a legacy option (engine
+    opens an Airtable base internally to pull from the Inbox table) so
+    the GitHub Actions cron keeps working through the transition;
+    Phase 6 cleanup deletes it. `tableau_rest` is a Step 7 stub that
+    raises NotImplementedError on first pull.
     """
     from config import settings
-    from engine.ingest import AirtableInboxSource, TableauRestSource
+    from engine.ingest import (
+        AirtableInboxSource,
+        LocalInboxSource,
+        TableauRestSource,
+    )
 
     choice = settings.TRANSACTION_SOURCE
     if choice == "tableau_rest":
@@ -282,110 +288,149 @@ def _build_transaction_source(base):
             pat_secret=settings.TABLEAU_PAT_SECRET,
             api_version=settings.TABLEAU_API_VERSION,
         )
-    # Default + every unrecognized value (already warned about in settings)
-    return AirtableInboxSource(base)
+    if choice == "airtable_inbox":
+        # Legacy transition path: pull the inbox file from Airtable, but
+        # write engine state (Dashboard / State / Run Log / SQLite Inbox
+        # dedup) to SQLite. The Airtable Inbox row is also marked
+        # Processed via airtable_client so subsequent pulls don't keep
+        # selecting it.
+        log.info(
+            "TRANSACTION_SOURCE=airtable_inbox is a legacy path being "
+            "phased out; default is now `local_inbox` (data/inbox/)."
+        )
+        from engine.airtable_client import get_api_and_base
+        _, base = get_api_and_base()
+        return AirtableInboxSource(base)
+    # Default: local_inbox.
+    return LocalInboxSource(conn)
 
 
-def _run_ingest_airtable() -> int:
+def _run_ingest() -> int:
+    """Phase-2 local-first --ingest path.
+
+    Opens the SQLite engine database, ensures the schema, picks the
+    configured TransactionSource (default: LocalInboxSource scanning
+    data/inbox/), and runs the full pipeline against SQLite. All state
+    writes — Inbox dedup, Needs Tagging, Dashboard, State, Run Log —
+    land in data/engine.db. The Airtable era's mark_inbox_processed is
+    replaced by insert_inbox_processed (a new audit-log row) plus a
+    source-specific finalization (move file to data/processed/ for
+    LocalInboxSource; legacy mark Airtable record Processed for the
+    transition-period AirtableInboxSource).
+    """
     import traceback
 
     from config import settings
-    from engine.airtable_client import (
-        append_run_log,
-        get_api_and_base,
-        mark_inbox_processed,
-    )
+    from engine import sqlite_client
     from engine.filters import in_scope, out_of_scope
     from engine.ingest import (
+        AirtableInboxSource,
         DuplicateTransactionsError,
+        LocalInboxSource,
         NoNewTransactionsError,
         UnusableInboxRecordError,
     )
 
+    conn = sqlite_client.get_db_connection()
     try:
-        _, base = get_api_and_base()
-    except RuntimeError as exc:
-        print(f"FATAL: {exc}", file=sys.stderr)
-        return 2
+        # Idempotent — a fresh install gets the 8 tables created here,
+        # an existing install is a no-op.
+        sqlite_client.ensure_schema(conn)
 
-    source = _build_transaction_source(base)
-    run_id = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    today_iso = datetime.now(timezone.utc).date().isoformat()
+        try:
+            source = _build_transaction_source(conn)
+        except RuntimeError as exc:
+            # Misconfigured legacy airtable_inbox (missing AIRTABLE_PAT).
+            print(f"FATAL: {exc}", file=sys.stderr)
+            return 2
 
-    try:
-        df, meta = source.get_latest_transactions()
-    except NoNewTransactionsError as exc:
-        print(f"no new data: {exc}")
-        # Still drain the promotion queue — operator answers shouldn't sit
-        # unpromoted just because no fresh file arrived.
-        promoted = _run_promotion_only(base, today_iso=today_iso)
-        append_run_log(
-            base, run_id=run_id, mode="ingest", outcome="no_new_data",
-            notes=f"{exc}. Promoted {promoted} Needs Tagging answer(s).",
-        )
-        _prune_run_log_safely(base)
-        return 0
-    except DuplicateTransactionsError as exc:
-        print(f"duplicate file detected: {exc}")
-        # Still drain the promotion queue on duplicate-file early exit too.
-        promoted = _run_promotion_only(base, today_iso=today_iso)
-        if exc.inbox_record_id:
-            mark_inbox_processed(
-                base, exc.inbox_record_id,
-                file_hash=exc.hash,
-                rows_in_scope=0,
-                total_in_scope=0.0,
-                processed_at_iso_date=today_iso,
-                notes=(
-                    f"duplicate of a previously processed file (hash "
-                    f"{exc.hash[:12]}…); marked processed without re-parsing."
-                ),
+        run_id = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+
+        try:
+            df, meta = source.get_latest_transactions()
+        except NoNewTransactionsError as exc:
+            print(f"no new data: {exc}")
+            # Still drain the promotion queue — operator answers shouldn't
+            # sit unpromoted just because no fresh file arrived.
+            promoted = _run_promotion_only(conn, today_iso=today_iso)
+            sqlite_client.append_run_log(
+                conn, run_id=run_id, mode="ingest", outcome="no_new_data",
+                notes=f"{exc}. Promoted {promoted} Needs Tagging answer(s).",
             )
-        append_run_log(
-            base, run_id=run_id, mode="ingest", outcome="no_new_data",
-            file_name=exc.filename, file_hash=exc.hash,
-            notes=f"duplicate hash — skipped. Promoted {promoted} Needs Tagging answer(s).",
-        )
-        _prune_run_log_safely(base)
-        return 0
-    except UnusableInboxRecordError as exc:
-        # Distinct from NoNewTransactionsError: the record exists and is
-        # malformed. Mark it Processed so subsequent runs don't re-detect it
-        # as "newest unprocessed" forever.
-        print(f"unusable Inbox record: {exc}", file=sys.stderr)
-        mark_inbox_processed(
-            base, exc.inbox_record_id,
-            file_hash="",
-            rows_in_scope=0,
-            total_in_scope=0.0,
-            processed_at_iso_date=today_iso,
-            notes=f"could not process: {exc.reason}. Review and replace.",
-        )
-        append_run_log(
-            base, run_id=run_id, mode="ingest", outcome="error",
-            notes=f"unusable Inbox record: {exc.reason}",
-        )
-        return 1
+            _prune_run_log_safely(conn)
+            return 0
+        except DuplicateTransactionsError as exc:
+            print(f"duplicate file detected: {exc}")
+            # Drain the promotion queue on duplicate-file early exit too.
+            promoted = _run_promotion_only(conn, today_iso=today_iso)
+            # If the source has an Airtable record handle, mark it
+            # processed so we don't re-detect it on the next run.
+            # LocalInboxSource already handled its own move-out-of-inbox
+            # before raising — no follow-up needed here.
+            if isinstance(source, AirtableInboxSource) and exc.inbox_record_id:
+                from engine.airtable_client import mark_inbox_processed
+                mark_inbox_processed(
+                    source.base, exc.inbox_record_id,
+                    file_hash=exc.hash,
+                    rows_in_scope=0,
+                    total_in_scope=0.0,
+                    processed_at_iso_date=today_iso,
+                    notes=(
+                        f"duplicate of a previously processed file (hash "
+                        f"{exc.hash[:12]}…); marked processed without re-parsing."
+                    ),
+                )
+            sqlite_client.append_run_log(
+                conn, run_id=run_id, mode="ingest", outcome="no_new_data",
+                file_name=exc.filename, file_hash=exc.hash,
+                notes=f"duplicate hash — skipped. Promoted {promoted} Needs Tagging answer(s).",
+            )
+            _prune_run_log_safely(conn)
+            return 0
+        except UnusableInboxRecordError as exc:
+            # Distinct from NoNewTransactionsError: the record exists and is
+            # malformed. Only AirtableInboxSource raises this (a record
+            # with no attachment). Mark it Processed so subsequent runs
+            # don't re-detect it as "newest unprocessed" forever.
+            print(f"unusable Inbox record: {exc}", file=sys.stderr)
+            if isinstance(source, AirtableInboxSource):
+                from engine.airtable_client import mark_inbox_processed
+                mark_inbox_processed(
+                    source.base, exc.inbox_record_id,
+                    file_hash="",
+                    rows_in_scope=0,
+                    total_in_scope=0.0,
+                    processed_at_iso_date=today_iso,
+                    notes=f"could not process: {exc.reason}. Review and replace.",
+                )
+            sqlite_client.append_run_log(
+                conn, run_id=run_id, mode="ingest", outcome="error",
+                notes=f"unusable Inbox record: {exc.reason}",
+            )
+            return 1
 
-    # Broad try/except so an unexpected failure (parser ValueError, pandas
-    # error, Airtable 5xx on mark) still writes a Run Log row with outcome
-    # 'error' — the Run Log is the authoritative audit trail and missing
-    # rows are worse than verbose ones.
-    try:
-        kept = in_scope(df)
-        rejected = out_of_scope(df)
-        in_total, out_total = _print_ingest_report(df, meta, kept, rejected)
+        # Broad try/except so an unexpected failure (parser ValueError,
+        # pandas error, SQLite OperationalError on insert) still writes
+        # a Run Log row with outcome 'error' — the Run Log is the
+        # authoritative audit trail and missing rows are worse than
+        # verbose ones.
+        try:
+            kept = in_scope(df)
+            rejected = out_of_scope(df)
+            in_total, out_total = _print_ingest_report(df, meta, kept, rejected)
 
-        # Step 3: attribution + Needs Tagging upsert. Runs read-only against
-        # Asana and writes only to the Airtable Needs Tagging table. No Asana
-        # writes anywhere.
-        attribution_summary = _run_attribution_and_needs_tagging(
-            base, kept, today_iso=today_iso,
-        )
+            # Attribution + Needs Tagging + Dashboard + State + Asana
+            # writes — all storage-side state goes to SQLite.
+            attribution_summary = _run_attribution_and_needs_tagging(
+                conn, kept, meta=meta, today_iso=today_iso,
+            )
 
-        if meta.inbox_record_id:
-            mark_inbox_processed(
-                base, meta.inbox_record_id,
+            # SQLite Inbox audit-log row: one per successfully-processed
+            # file, keyed by File Hash (the dedup index).
+            sqlite_client.insert_inbox_processed(
+                conn,
+                name=meta.name,
                 file_hash=meta.hash,
                 rows_in_scope=len(kept),
                 total_in_scope=in_total,
@@ -396,46 +441,78 @@ def _run_ingest_airtable() -> int:
                     f"{attribution_summary['dashboard_line']}"
                 ),
             )
-        append_run_log(
-            base, run_id=run_id, mode="ingest", outcome="ok",
-            file_name=meta.name, file_hash=meta.hash,
-            rows_in_scope=len(kept), rows_out_of_scope=len(rejected),
-            total_in_scope=in_total, total_out_of_scope=out_total,
-            notes=attribution_summary["notes"],
-            review_flags=attribution_summary["review_flags"],
-        )
-        _prune_run_log_safely(base)
-        return 0
-    except Exception as exc:
-        tb = traceback.format_exc()
-        print(f"FATAL during ingest: {exc}", file=sys.stderr)
-        print(tb, file=sys.stderr)
-        # Best-effort Run Log row. Don't swallow the audit-write failure if it
-        # also fails — caller sees the original traceback above.
-        try:
-            append_run_log(
-                base, run_id=run_id, mode="ingest", outcome="error",
+
+            # Source-specific finalization. LocalInboxSource moves the
+            # file out of data/inbox/; AirtableInboxSource (legacy)
+            # marks the Airtable Inbox row Processed=true.
+            if isinstance(source, LocalInboxSource) and meta.source_path:
+                source.move_to_processed(meta.source_path, file_hash=meta.hash)
+            elif isinstance(source, AirtableInboxSource) and meta.inbox_record_id:
+                from engine.airtable_client import mark_inbox_processed
+                mark_inbox_processed(
+                    source.base, meta.inbox_record_id,
+                    file_hash=meta.hash,
+                    rows_in_scope=len(kept),
+                    total_in_scope=in_total,
+                    processed_at_iso_date=today_iso,
+                    notes=(
+                        f"parsed {len(df):,} rows; in-scope {len(kept):,}. "
+                        f"Attribution: {attribution_summary['summary_line']}. "
+                        f"{attribution_summary['dashboard_line']}"
+                    ),
+                )
+
+            sqlite_client.append_run_log(
+                conn, run_id=run_id, mode="ingest", outcome="ok",
                 file_name=meta.name, file_hash=meta.hash,
-                notes=f"{type(exc).__name__}: {exc}",
+                rows_in_scope=len(kept), rows_out_of_scope=len(rejected),
+                total_in_scope=in_total, total_out_of_scope=out_total,
+                notes=attribution_summary["notes"],
+                review_flags=attribution_summary["review_flags"],
             )
-        except Exception:  # noqa: BLE001 — secondary failure logged via tb above
-            pass
-        # Inbox record left Processed=false so a retry picks it up.
-        return 1
+            _prune_run_log_safely(conn)
+            return 0
+        except Exception as exc:
+            tb = traceback.format_exc()
+            print(f"FATAL during ingest: {exc}", file=sys.stderr)
+            print(tb, file=sys.stderr)
+            # Best-effort Run Log row. Don't swallow a secondary
+            # audit-write failure — caller sees the original traceback
+            # above.
+            try:
+                sqlite_client.append_run_log(
+                    conn, run_id=run_id, mode="ingest", outcome="error",
+                    file_name=meta.name, file_hash=meta.hash,
+                    notes=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:  # noqa: BLE001 — secondary failure logged via tb above
+                pass
+            # File stays in data/inbox/ (or Airtable record stays
+            # unmarked) so a retry picks it up.
+            return 1
+    finally:
+        conn.close()
 
 
-def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict:
-    """Run Step 3 attribution against an in-scope DataFrame and upsert any
-    needs-tagging groups into Airtable. Returns a small dict the caller uses
-    to enrich the Inbox + Run Log notes.
+def _run_attribution_and_needs_tagging(
+    conn, kept_df, *, meta, today_iso: str,
+) -> dict:
+    """Run attribution + Needs Tagging + Dashboard + State + Asana writes.
 
-    Promotion of operator-filled Needs Tagging → Learned Mappings happens
-    BEFORE the attribution pass, so the new Learned Mappings are visible to
-    the attribute() call within the same run.
+    Returns a small dict the caller uses to enrich the Inbox + Run Log
+    notes. All storage writes land in SQLite (engine.sqlite_client);
+    Asana is read- and write-target only.
+
+    Promotion of operator-filled Needs Tagging → Learned Mappings
+    happens BEFORE the attribution pass, so the new Learned Mappings
+    are visible to the attribute() call within the same run.
+
+    `meta` carries the file's hash (for State persistence's
+    last_processed_hash field).
     """
     from config import settings
     from engine import asana_client, asana_contracts, attribution, campus_map
-    from engine.airtable_client import (
+    from engine.sqlite_client import (
         cleanup_stale_needs_tagging,
         load_campus_map_overrides,
         load_learned_mappings,
@@ -460,7 +537,7 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
     # a typo or stale rename in Assign Contract is caught at promotion time
     # rather than baked into a permanent Learned Mappings row.
     promotions = promote_filled_needs_tagging(
-        base, learned_at_iso_date=today_iso,
+        conn, learned_at_iso_date=today_iso,
         valid_contract_names=valid_contract_names,
     )
     if promotions:
@@ -468,10 +545,10 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
         for p in promotions:
             print(f"  {p.group_key}  ->  {p.contract_name}")
 
-    aliases = load_vendor_aliases(base)
-    forward_overrides, drop_override = load_campus_map_overrides(base)
+    aliases = load_vendor_aliases(conn)
+    forward_overrides, drop_override = load_campus_map_overrides(conn)
     crosswalk = campus_map.build(forward_overrides, drop_override)
-    learned = load_learned_mappings(base)
+    learned = load_learned_mappings(conn)
 
     # Attribute.
     run = attribution.attribute(kept_df, contracts, aliases, crosswalk, learned)
@@ -491,7 +568,7 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
     upserted = 0
     for group in needs_tag:
         upsert_needs_tagging_group(
-            base,
+            conn,
             group_key=group.group_key,
             campus=group.campus,
             dept=group.dept,
@@ -511,13 +588,13 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
     # newly-added Vendor Alias. Filled (operator-answered) rows are NEVER
     # touched; this only deletes rows the operator hasn't engaged with.
     live_keys = {g.group_key for g in needs_tag}
-    stale_deleted = cleanup_stale_needs_tagging(base, live_group_keys=live_keys)
+    stale_deleted = cleanup_stale_needs_tagging(conn, live_group_keys=live_keys)
     if stale_deleted:
         print(f"  cleaned up {stale_deleted} stale Needs Tagging row(s).")
 
     # Step 4: compute per-contract Dashboard rows for live contracts.
     from engine import compute
-    from engine.airtable_client import upsert_dashboard_row
+    from engine.sqlite_client import upsert_dashboard_row
     today_date = datetime.now(timezone.utc).date()
     dashboard_rows, skip_counts = compute.compute_dashboard(
         kept_df, run, contracts, today_date,
@@ -540,13 +617,13 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
     # failure mid-pipeline leaves State un-advanced — next run's diff then
     # surfaces the lingering inconsistency rather than hiding it.
     from engine import state as state_mod
-    from engine.airtable_client import (
+    from engine.sqlite_client import (
         cleanup_stale_state,
         load_state_priors,
         upsert_state_for_contract,
     )
 
-    state_priors_by_gid = load_state_priors(base)
+    state_priors_by_gid = load_state_priors(conn)
     change_findings: list[state_mod.ChangeFinding] = []
     for dash_row in dashboard_rows:
         prior = state_priors_by_gid.get(dash_row.asana_task_gid)
@@ -573,7 +650,7 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
         print("Change detection: no diffs against prior State.")
 
     for dash_row in dashboard_rows:
-        upsert_dashboard_row(base, dash_row)
+        upsert_dashboard_row(conn, dash_row)
     if dashboard_rows:
         print(f"  upserted {len(dashboard_rows)} Dashboard row(s).")
 
@@ -615,7 +692,7 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
     for dash_row in dashboard_rows:
         try:
             upsert_state_for_contract(
-                base,
+                conn,
                 contract_name=dash_row.contract_name,
                 asana_task_gid=dash_row.asana_task_gid,
                 spent=dash_row.spent_so_far,
@@ -637,7 +714,7 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
     # Sweep stale State rows (contract archived in Asana, or removed from
     # the open list) so the table doesn't grow monotonically.
     live_gids = {r.asana_task_gid for r in dashboard_rows}
-    stale_state_deleted = cleanup_stale_state(base, live_asana_task_gids=live_gids)
+    stale_state_deleted = cleanup_stale_state(conn, live_asana_task_gids=live_gids)
     if stale_state_deleted:
         print(f"  cleaned up {stale_state_deleted} stale State row(s).")
     if state_persist_errors:

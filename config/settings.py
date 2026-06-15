@@ -252,22 +252,26 @@ WRITE_TEST_CONTRACT: Final = os.environ.get("WRITE_TEST_CONTRACT", "").strip() o
 # Step 7: transaction source selector
 # ---------------------------------------------------------------------------
 
-# Which TransactionSource the engine pulls from on --ingest. Today only
-# `airtable_inbox` is functional; `tableau_rest` exists as a stub
-# (engine.ingest.TableauRestSource) that will be implemented in a follow-up
-# step. The switch lives here so the rollout is a one-line env change with
-# zero code edits on the day the REST integration goes live.
-_VALID_SOURCES: Final = frozenset({"airtable_inbox", "tableau_rest"})
+# Which TransactionSource the engine pulls from on --ingest.
+#
+# Phase 2 of the local-first migration: `local_inbox` is the default —
+# the engine scans data/inbox/ for files dropped there by the operator.
+# `airtable_inbox` still works for the transition period (engine pulls
+# the newest unprocessed attachment from the Airtable Inbox table) and
+# will be removed once the GitHub Actions cron is deleted in a later
+# phase. `tableau_rest` is a Step 7 stub for the eventual Tableau REST
+# pull (engine.ingest.TableauRestSource).
+_VALID_SOURCES: Final = frozenset({"local_inbox", "airtable_inbox", "tableau_rest"})
 
 _raw_source = os.environ.get("TRANSACTION_SOURCE", "").strip().lower()
 if _raw_source and _raw_source not in _VALID_SOURCES:
     log.warning(
         "TRANSACTION_SOURCE=%r is not recognized (valid: %s). "
-        "Falling back to default='airtable_inbox'.",
+        "Falling back to default='local_inbox'.",
         _raw_source, sorted(_VALID_SOURCES),
     )
     _raw_source = ""
-TRANSACTION_SOURCE: Final = _raw_source or "airtable_inbox"
+TRANSACTION_SOURCE: Final = _raw_source or "local_inbox"
 
 # Tableau Cloud REST endpoint parameters — consumed by TableauRestSource once
 # it lands. Defaults come from operator notes: site `lifechurch` on
