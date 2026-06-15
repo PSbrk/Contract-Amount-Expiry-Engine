@@ -60,7 +60,7 @@ the one Asana Personal Access Token (PAT) you already have.
     Windows prompts about execution policy, answer A (Run once).
 
     This creates a task named "ContractEngineDailyIngest" that fires at
-    02:00 local time every day. Missed runs (laptop asleep, machine off)
+    08:30 local time every day. Missed runs (laptop asleep, machine off)
     catch up at the next available window.
 
 4.  Smoke test: drop a small Tableau export into data\inbox\ and run
@@ -84,7 +84,7 @@ the one Asana Personal Access Token (PAT) you already have.
 --------------------------------------------------------------------------------
 
 You don't have to do anything daily. The scheduled task picks up any new
-Tableau export from data\inbox\ at 02:00 and writes results to
+Tableau export from data\inbox\ at 08:30 and writes results to
 data\engine.db. The web UI shows the latest state whenever you open it.
 
 To do an ad-hoc run (e.g. after dropping a new file at noon):

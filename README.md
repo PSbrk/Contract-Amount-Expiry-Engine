@@ -21,7 +21,7 @@ no IT approval beyond the one Asana PAT.
 | **data/engine.db** | SQLite. Single source of truth for Inbox / Dashboard / Needs Tagging / Vendor Aliases / Campus Map / Learned Mappings / State / Run Log. |
 | **data/inbox/** | Drop Tableau exports here. The engine moves processed files to `data/processed/<hash>-<name>` on success. |
 | **engine/ui/ (Flask)** | Localhost-only web UI on `:8080`. Operator edits Needs Tagging answers and browses everything else. Pico.css, no JS framework. |
-| **Windows Task Scheduler** | Daily 02:00 cron registered by `scripts/install-scheduler.ps1`. Runs `scripts/run-ingest.bat`. |
+| **Windows Task Scheduler** | Daily 08:30 cron registered by `scripts/install-scheduler.ps1`. Runs `scripts/run-ingest.bat`. |
 | **OneDrive backup** | `shutil.copy2(data/engine.db, ONEDRIVE_BACKUP_PATH)` after every successful ingest. OneDrive sync handles the cloud upload; no Graph API auth needed. |
 | **Asana** | Source of contracts; destination of FIVE custom-field values. The operator builds an automation rule on `Alarms == ALARM` that emails. |
 

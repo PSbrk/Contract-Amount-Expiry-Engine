@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
   Registers a Windows Task Scheduler job that runs the engine's daily
-  ingest at 02:00 local time.
+  ingest at 08:30 local time.
 
 .DESCRIPTION
   Creates a task named "ContractEngineDailyIngest" that fires scripts\run-ingest.bat
   in the bundle this script lives inside. The task runs as the current user
   (S4U logon: no stored password, runs whether logged in or not). Missed
-  runs (laptop asleep, machine off) catch up on the next available window.
+  runs (machine off, no network) catch up on the next available window.
 
   Re-running this script overwrites any prior registration with the
   current bundle location -- safe to use after moving the bundle.
@@ -33,7 +33,7 @@ $TaskName    = "ContractEngineDailyIngest"
 $Description = "Contract Amount Expiry Engine: nightly Tableau ingest. Bundle at $BundleRoot."
 
 $Action    = New-ScheduledTaskAction -Execute $BatPath -WorkingDirectory $BundleRoot
-$Trigger   = New-ScheduledTaskTrigger -Daily -At 2am
+$Trigger   = New-ScheduledTaskTrigger -Daily -At "08:30"
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
 $Settings  = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
@@ -51,7 +51,7 @@ Register-ScheduledTask `
     -Settings $Settings `
     -Force
 
-Write-Host "Registered scheduled task '$TaskName' to run daily at 02:00."
+Write-Host "Registered scheduled task '$TaskName' to run daily at 08:30."
 Write-Host "Bundle root:  $BundleRoot"
 Write-Host "Logs land in: $BundleRoot\logs\ingest-YYYY-MM-DD.log"
 Write-Host ""
