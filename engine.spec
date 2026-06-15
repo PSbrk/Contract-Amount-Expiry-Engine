@@ -34,6 +34,9 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 datas = [
     ("engine/ui/templates", "engine/ui/templates"),
 ]
+# scripts/ and README.txt belong at the BUNDLE ROOT next to EngineApp.exe so
+# the operator can see them. PyInstaller 6.x routes every `datas` entry into
+# _internal/ unconditionally, so we hoist them up in a post-build copy below.
 
 # pandas hides some test/IO modules behind dynamic imports — let the hook
 # collect what it knows about and trust it. Same for asana (v5 uses
@@ -118,3 +121,23 @@ coll = COLLECT(
     upx_exclude=[],
     name="ContractEngine",
 )
+
+
+# ---------------------------------------------------------------------------
+# Post-build: hoist operator-facing artifacts to the bundle root.
+# PyInstaller 6.x routes every `datas` entry into _internal/; the operator
+# expects scripts/ and README.txt right next to EngineApp.exe. We do this
+# AFTER COLLECT so the bundle exists on disk and copytree/copy2 can target it.
+# ---------------------------------------------------------------------------
+
+import shutil
+from pathlib import Path
+
+_bundle_root = Path("dist") / "ContractEngine"
+if _bundle_root.is_dir():
+    _scripts_dst = _bundle_root / "scripts"
+    if _scripts_dst.exists():
+        shutil.rmtree(_scripts_dst)
+    shutil.copytree("scripts", _scripts_dst)
+
+    shutil.copy2("README.txt", _bundle_root / "README.txt")

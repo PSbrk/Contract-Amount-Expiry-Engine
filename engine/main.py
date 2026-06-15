@@ -70,11 +70,33 @@ def _force_utf8_stdio() -> None:
 
 
 def _load_dotenv() -> None:
+    """Load environment variables, preferring config/secrets.env (the
+    bundle convention) over the default .env at CWD (the dev convention).
+
+    In a PyInstaller bundle, sys.executable is EngineApp.exe, so
+    `<exe-dir>/config/secrets.env` is where the operator dropped their
+    ASANA_PAT and ONEDRIVE_BACKUP_PATH. In a `python -m engine.main` dev
+    run, that path resolves under CWD (the repo root) and is gitignored.
+    Either way, if no secrets.env is present we fall back to the default
+    dotenv search so a developer's existing .env keeps working.
+    """
     try:
         from dotenv import load_dotenv
-        load_dotenv()
     except ImportError:
-        pass
+        return
+
+    import sys
+    from pathlib import Path
+
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).parent / "config" / "secrets.env")
+    candidates.append(Path.cwd() / "config" / "secrets.env")
+    for cand in candidates:
+        if cand.is_file():
+            load_dotenv(dotenv_path=cand, override=False)
+            return
+    load_dotenv()
 
 
 def main(argv: list[str] | None = None) -> int:
