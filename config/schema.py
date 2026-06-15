@@ -145,7 +145,10 @@ TABLES_SCHEMA: Final = [
         ),
         "fields": [
             {"name": "Contract Name", "type": "singleLineText",
-             "description": "Asana task name. UNIQUE."},
+             "description": (
+                 "Asana task name. NOT unique: the operator may split a "
+                 "contract's alias list across multiple rows for readability."
+             )},
             {"name": "Aliases", "type": "multilineText",
              "description": "Tableau Vendor strings that should match this contract."},
             {"name": "Notes", "type": "multilineText"},
