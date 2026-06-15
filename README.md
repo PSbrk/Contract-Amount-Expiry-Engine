@@ -28,7 +28,7 @@ that field flips to `ALARM`.
 config/        Non-secret configuration (Asana + Airtable + filter + threshold constants)
 engine/        Compute and I/O modules
 tests/         Pytest suite
-.github/       GitHub Actions workflows — wired in Step 8
+.github/       GitHub Actions workflows — daily `ingest` cron + manual dispatch
 SETUP.md       One-time setup walkthrough (Airtable base + PAT, Asana PAT, GitHub secrets)
 ```
 

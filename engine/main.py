@@ -225,6 +225,35 @@ def _run_promotion_only(base, *, today_iso: str) -> int:
     return len(promotions)
 
 
+def _prune_run_log_safely(base) -> None:
+    """Best-effort Run Log rolling-window prune. Called at the end of every
+    --ingest outcome (success, no-new-data, duplicate) so the table doesn't
+    grow unbounded.
+
+    Failure here NEVER fails the run — the Run Log already captured the
+    primary outcome on the calling line above; a stale-row cleanup glitch
+    is an Airtable / network problem that the operator will see on the
+    next run when it succeeds. Swallow + log so the exit code stays
+    truthful about the actual ingest result.
+    """
+    from datetime import datetime, timezone
+
+    from config import settings
+    from engine.airtable_client import prune_run_log_older_than
+
+    try:
+        prune_run_log_older_than(
+            base,
+            retention_days=settings.RUN_LOG_RETENTION_DAYS,
+            today=datetime.now(timezone.utc).date(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.info(
+            "Run Log prune skipped this run (%s: %s). Will retry next run.",
+            type(exc).__name__, exc,
+        )
+
+
 def _build_transaction_source(base):
     """Pick the TransactionSource implementation based on settings.
 
@@ -294,6 +323,7 @@ def _run_ingest_airtable() -> int:
             base, run_id=run_id, mode="ingest", outcome="no_new_data",
             notes=f"{exc}. Promoted {promoted} Needs Tagging answer(s).",
         )
+        _prune_run_log_safely(base)
         return 0
     except DuplicateTransactionsError as exc:
         print(f"duplicate file detected: {exc}")
@@ -316,6 +346,7 @@ def _run_ingest_airtable() -> int:
             file_name=exc.filename, file_hash=exc.hash,
             notes=f"duplicate hash — skipped. Promoted {promoted} Needs Tagging answer(s).",
         )
+        _prune_run_log_safely(base)
         return 0
     except UnusableInboxRecordError as exc:
         # Distinct from NoNewTransactionsError: the record exists and is
@@ -373,6 +404,7 @@ def _run_ingest_airtable() -> int:
             notes=attribution_summary["notes"],
             review_flags=attribution_summary["review_flags"],
         )
+        _prune_run_log_safely(base)
         return 0
     except Exception as exc:
         tb = traceback.format_exc()

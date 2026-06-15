@@ -193,6 +193,21 @@ REVIEW_LARGE_DELTA_DOLLARS: Final = 10000.0
 
 
 # ---------------------------------------------------------------------------
+# Step 8 Run Log retention
+# ---------------------------------------------------------------------------
+
+# Run Log rows older than this many days are pruned at the end of each
+# --ingest run. Set to 0 to disable the prune (operator keeps Run Log
+# forever; manual cleanup in the Airtable UI is the fallback).
+#
+# 365 keeps a full year of run history visible by default — enough to
+# correlate seasonal anomalies — without unbounded growth. One row per
+# day for the daily cron + a handful of manual runs averages ~400 rows
+# at any time, well under Airtable's per-base limits.
+RUN_LOG_RETENTION_DAYS: Final = int(os.environ.get("RUN_LOG_RETENTION_DAYS", "365").strip() or "365")
+
+
+# ---------------------------------------------------------------------------
 # Run-mode overrides from env (so dry-run can be toggled in CI/locally without
 # code change)
 # ---------------------------------------------------------------------------

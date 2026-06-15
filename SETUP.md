@@ -193,12 +193,39 @@ DRY_RUN_ASANA=false
 every live contract. The write is **idempotent** — only fields that actually
 changed get touched, so re-running on the same data is a no-op.
 
-### 6d. Hand off to the scheduled cron (when Step 8 lands)
+### 6d. Hand off to the scheduled cron
 
-Once you trust the live writes, set `DRY_RUN_ASANA=false` in the GitHub
-Actions repository secrets and let the daily cron drive it.
+Once you trust the live writes, the daily GitHub Actions cron drives the
+engine end-to-end — see §7 below.
 
-## 7. Your Asana automation rule (final step)
+## 7. GitHub Actions cron (scheduled ingest)
+
+Workflow file: [.github/workflows/ingest.yml](.github/workflows/ingest.yml)
+
+- **Schedule:** daily at 07:00 UTC (02:00 CT). Tableau workbooks refresh
+  overnight; this fires a few hours after. Adjust the `cron` line if
+  Tableau's refresh window moves.
+- **Manual trigger:** Repo → **Actions → ingest → Run workflow**. Inputs:
+  - `dry_run_asana` — `true` (default, safe) or `false` (live writes).
+  - `write_test_contract` — single Asana task GID to scope writes to one
+    contract for verification. Empty = all live contracts.
+- **Secrets used:** `ASANA_PAT`, `AIRTABLE_PAT`, `AIRTABLE_BASE_ID`.
+- **Default DRY_RUN_ASANA on cron:** `true`. To let the scheduled cron
+  write to Asana for real, you have two options:
+  1. **Per-run** (cautious): use **Run workflow** with
+     `dry_run_asana=false` instead of the cron.
+  2. **Permanently**: edit `.github/workflows/ingest.yml` and change the
+     line `DRY_RUN_ASANA: ${{ github.event.inputs.dry_run_asana || 'true' }}`
+     to `|| 'false'`.
+
+### Run Log retention
+
+The engine prunes Run Log rows older than `RUN_LOG_RETENTION_DAYS` (default
+**365** days) at the end of every `--ingest` outcome. Set the env var to
+`0` to disable the prune entirely; rows are manually trimmable in the
+Airtable UI if you do.
+
+## 8. Your Asana automation rule (final step)
 
 The engine sets `Alarms` to `ALARM` on a contract when any budget band
 (75% / 90% / 100% / Over) is reached **or** runaway pace trips (subject to the
@@ -236,4 +263,6 @@ current with the granular band detail.
 - [ ] Airtable Interface bar chart built (after Dashboard starts populating in Step 4)
 - [ ] Dry-run `--ingest` output reviewed; one test contract written and verified (§6a + 6b)
 - [ ] `DRY_RUN_ASANA=false` + `WRITE_TEST_CONTRACT=` (empty) in `.env`; all live contracts writing (§6c)
+- [ ] GitHub Actions cron `ingest` workflow visible in **Actions** tab (§7)
+- [ ] First manual `Run workflow` dispatch (`dry_run_asana=true`) green
 - [ ] Asana `Alarms → ALARM` email rule built

@@ -23,7 +23,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Iterable
 
 import requests
@@ -921,6 +921,75 @@ def cleanup_stale_needs_tagging(base, *, live_group_keys: set[str]) -> int:
     return deleted
 
 
+def prune_run_log_older_than(
+    base,
+    *,
+    retention_days: int,
+    today: date,
+) -> int:
+    """Delete Run Log rows whose Run ID timestamp is older than the retention
+    window. Returns the count of rows deleted.
+
+    The Run Log accumulates one row per engine run (daily ingest + every
+    manual + every audit), which on a 1-year horizon means ~400-500 rows.
+    Airtable's free tier caps records per base, so the prune runs at the
+    end of every --ingest as a quiet rolling-window cleanup.
+
+    Run ID is the ISO timestamp of run start (singleLineText, primary
+    field). Pre-parse `today` is taken as a parameter so tests can pin a
+    boundary without freezing the wall clock. retention_days <= 0 is a
+    no-op (operator can disable prune by setting RUN_LOG_RETENTION_DAYS=0).
+
+    Malformed Run IDs (operator hand-edit, very old rows from before the
+    primary-field convention solidified, etc.) are LEFT ALONE — we never
+    delete a row we can't read the timestamp from. Safer to leave a few
+    untyped rows than to nuke evidence on parse failure.
+    """
+    if retention_days <= 0:
+        return 0
+
+    cutoff = today - timedelta(days=retention_days)
+    table = base.table(airtable_schema.table_spec("Run Log")["name"])
+    rows = table.all()
+    deleted = 0
+    unparseable = 0
+    for record in rows:
+        fields = record.get("fields") or {}
+        run_id = (fields.get("Run ID") or "").strip()
+        if not run_id:
+            unparseable += 1
+            continue
+        # Run IDs are written as 'YYYY-MM-DDTHH:MM:SS+00:00' from
+        # datetime.isoformat(timespec='seconds'). Slice the date portion;
+        # avoids timezone-parse pitfalls for an ages-old comparison.
+        date_part = run_id.split("T", 1)[0]
+        try:
+            row_date = date.fromisoformat(date_part)
+        except ValueError:
+            unparseable += 1
+            continue
+        if row_date < cutoff:
+            try:
+                table.delete(record["id"])
+                deleted += 1
+            except Exception as exc:  # noqa: BLE001
+                log.info(
+                    "Run Log prune delete on %s returned %s; continuing.",
+                    record["id"], type(exc).__name__,
+                )
+    if deleted:
+        log.info(
+            "pruned %d Run Log row(s) older than %s (retention=%d days)",
+            deleted, cutoff.isoformat(), retention_days,
+        )
+    if unparseable:
+        log.info(
+            "%d Run Log row(s) had an unparseable Run ID and were left in "
+            "place (manual cleanup if needed).", unparseable,
+        )
+    return deleted
+
+
 __all__ = [
     "SchemaPlan",
     "InboxRecord",
@@ -934,6 +1003,7 @@ __all__ = [
     "sha256_hex",
     "mark_inbox_processed",
     "append_run_log",
+    "prune_run_log_older_than",
     "load_vendor_aliases",
     "load_campus_map_overrides",
     "load_learned_mappings",

@@ -1171,3 +1171,124 @@ def test_upsert_dashboard_writes_all_fourteen_fields_on_create():
         assert key in fields, f"Dashboard create payload missing key {key!r}"
     # And the absent one stays absent.
     assert "Spending Rate Alarm" not in fields
+
+
+# ---------------------------------------------------------------------------
+# Step 8: prune_run_log_older_than
+# ---------------------------------------------------------------------------
+
+def _seed_run_log(base, rows: list[dict]) -> None:
+    """Seed Run Log records with explicit Run IDs and stable Airtable IDs.
+
+    `rows` is a list of dicts at minimum {'run_id': '<ISO>', 'tag': '<label>'}.
+    The fake assigns rec0001, rec0002, ... by insertion order, so tests can
+    reference deletions by tag for clarity."""
+    table = base.table("Run Log")
+    for r in rows:
+        table.create({"Run ID": r["run_id"], "Notes": r.get("tag", "")})
+
+
+def test_prune_run_log_disabled_when_retention_zero():
+    """RUN_LOG_RETENTION_DAYS=0 must be a true no-op — operator who pins
+    retention to 0 wants the engine to leave the table alone."""
+    from engine.airtable_client import prune_run_log_older_than
+    base = _RecordsBase()
+    _seed_run_log(base, [
+        {"run_id": "2020-01-01T00:00:00+00:00", "tag": "ancient"},
+        {"run_id": "2026-06-15T00:00:00+00:00", "tag": "today"},
+    ])
+    deleted = prune_run_log_older_than(base, retention_days=0,
+                                        today=date(2026, 6, 15))
+    assert deleted == 0
+    assert len(base._tables["Run Log"]) == 2
+
+
+def test_prune_run_log_deletes_rows_older_than_cutoff():
+    """A 30-day retention against today=2026-06-15 means everything strictly
+    before 2026-05-16 is gone. The 2026-05-16 boundary row STAYS (the cutoff
+    is exclusive at the boundary)."""
+    from engine.airtable_client import prune_run_log_older_than
+    base = _RecordsBase()
+    _seed_run_log(base, [
+        {"run_id": "2020-01-01T12:34:56+00:00", "tag": "ancient"},
+        {"run_id": "2026-05-15T23:59:59+00:00", "tag": "just-too-old"},
+        {"run_id": "2026-05-16T00:00:01+00:00", "tag": "boundary-keep"},
+        {"run_id": "2026-06-14T23:00:00+00:00", "tag": "yesterday"},
+        {"run_id": "2026-06-15T08:00:00+00:00", "tag": "today"},
+    ])
+    deleted = prune_run_log_older_than(base, retention_days=30,
+                                        today=date(2026, 6, 15))
+    assert deleted == 2
+    remaining_tags = {r["fields"]["Notes"] for r in base._tables["Run Log"]}
+    assert remaining_tags == {"boundary-keep", "yesterday", "today"}
+
+
+def test_prune_run_log_leaves_malformed_run_ids_in_place():
+    """A row whose Run ID isn't a parseable ISO date must NOT be deleted —
+    safer to surface it as 'manual cleanup needed' than to nuke an operator
+    annotation we couldn't read."""
+    from engine.airtable_client import prune_run_log_older_than
+    base = _RecordsBase()
+    _seed_run_log(base, [
+        {"run_id": "not-an-iso-timestamp", "tag": "hand-edit"},
+        {"run_id": "", "tag": "blank"},
+        {"run_id": "2020-01-01T00:00:00+00:00", "tag": "ancient-but-parseable"},
+    ])
+    deleted = prune_run_log_older_than(base, retention_days=30,
+                                        today=date(2026, 6, 15))
+    assert deleted == 1
+    remaining_tags = {r["fields"]["Notes"] for r in base._tables["Run Log"]}
+    assert remaining_tags == {"hand-edit", "blank"}
+
+
+def test_prune_run_log_keeps_everything_when_window_far_exceeds_history():
+    """365-day retention against a week-old base must delete nothing."""
+    from engine.airtable_client import prune_run_log_older_than
+    base = _RecordsBase()
+    _seed_run_log(base, [
+        {"run_id": "2026-06-10T00:00:00+00:00", "tag": "a"},
+        {"run_id": "2026-06-11T00:00:00+00:00", "tag": "b"},
+        {"run_id": "2026-06-12T00:00:00+00:00", "tag": "c"},
+    ])
+    deleted = prune_run_log_older_than(base, retention_days=365,
+                                        today=date(2026, 6, 15))
+    assert deleted == 0
+    assert len(base._tables["Run Log"]) == 3
+
+
+def test_prune_run_log_swallows_individual_delete_errors():
+    """A 5xx mid-batch on one delete must NOT abort the prune for the
+    remaining rows. Each delete is independently best-effort."""
+    from engine.airtable_client import prune_run_log_older_than
+    base = _RecordsBase()
+    _seed_run_log(base, [
+        {"run_id": "2020-01-01T00:00:00+00:00", "tag": "first-old"},
+        {"run_id": "2020-01-02T00:00:00+00:00", "tag": "fails-on-delete"},
+        {"run_id": "2020-01-03T00:00:00+00:00", "tag": "third-old"},
+    ])
+    # Wrap _RecordsBase.table()->delete on the second-old record so it
+    # throws once. Subsequent deletes proceed.
+    original_table = base.table
+    failing_ids: set[str] = set()
+    for r in base._tables["Run Log"]:
+        if r["fields"].get("Notes") == "fails-on-delete":
+            failing_ids.add(r["id"])
+
+    def _wrapper(name):
+        t = original_table(name)
+        original_delete = t.delete
+        def _delete(rec_id):
+            if rec_id in failing_ids:
+                raise RuntimeError("simulated Airtable 5xx")
+            return original_delete(rec_id)
+        t.delete = _delete
+        return t
+    base.table = _wrapper
+
+    deleted = prune_run_log_older_than(base, retention_days=30,
+                                        today=date(2026, 6, 15))
+    # Two succeed; one failed but didn't abort the loop.
+    assert deleted == 2
+    # The failing row is still present.
+    remaining_tags = {r["fields"]["Notes"] for r in base._tables["Run Log"]}
+    assert "fails-on-delete" in remaining_tags
