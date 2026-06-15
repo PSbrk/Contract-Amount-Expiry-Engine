@@ -290,3 +290,17 @@ TABLEAU_API_VERSION: Final = (
 TABLEAU_VIEW_ID: Final = os.environ.get("TABLEAU_VIEW_ID", "").strip() or None
 TABLEAU_PAT_NAME: Final = os.environ.get("TABLEAU_PAT_NAME", "").strip() or None
 TABLEAU_PAT_SECRET: Final = os.environ.get("TABLEAU_PAT_SECRET", "").strip() or None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — OneDrive backup
+# ---------------------------------------------------------------------------
+
+# Destination path the engine copies data/engine.db to after every successful
+# --ingest run. Intended for a OneDrive-synced folder so the cloud sync client
+# handles the upload — no Microsoft Graph auth needed. Pointing at a plain
+# local path also works (it just becomes a second on-disk copy).
+#
+# Unset → backup is skipped. Backup failures NEVER fail the ingest run; the
+# local data/engine.db remains the source of truth.
+ONEDRIVE_BACKUP_PATH: Final = os.environ.get("ONEDRIVE_BACKUP_PATH", "").strip() or None

@@ -274,6 +274,39 @@ def _prune_run_log_safely(conn) -> None:
         )
 
 
+def _backup_database_safely(db_path, backup_path: str | None) -> None:
+    """Best-effort copy of data/engine.db to ONEDRIVE_BACKUP_PATH after a
+    successful --ingest. OneDrive's sync client uploads from there, so the
+    engine doesn't need any cloud auth.
+
+    Skipped when ONEDRIVE_BACKUP_PATH is unset. Failure NEVER fails the
+    run — backup is a convenience, not a correctness boundary; the local
+    data/engine.db remains the source of truth, and the next successful
+    run will retry.
+
+    Called on every return-0 path (ok, no_new_data, duplicate) because all
+    three can mutate SQLite — promotions drain on no_new_data and duplicate
+    too — so skipping them would let OneDrive drift behind operator answers.
+    """
+    if not backup_path:
+        return
+    import shutil
+    from pathlib import Path
+
+    try:
+        src = Path(db_path)
+        dest = Path(backup_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        log.info("Backed up engine.db to %s", dest)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "engine.db backup to %s failed (%s: %s). Continuing — the "
+            "local DB remains the source of truth; will retry next run.",
+            backup_path, type(exc).__name__, exc,
+        )
+
+
 def _build_transaction_source(conn):
     """Pick the TransactionSource implementation based on settings.
 
@@ -378,6 +411,9 @@ def _run_ingest() -> int:
                 notes=f"{exc}. Promoted {promoted} Needs Tagging answer(s).",
             )
             _prune_run_log_safely(conn)
+            _backup_database_safely(
+                sqlite_client.DEFAULT_DB_PATH, settings.ONEDRIVE_BACKUP_PATH,
+            )
             return 0
         except DuplicateTransactionsError as exc:
             print(f"duplicate file detected: {exc}")
@@ -406,6 +442,9 @@ def _run_ingest() -> int:
                 notes=f"duplicate hash — skipped. Promoted {promoted} Needs Tagging answer(s).",
             )
             _prune_run_log_safely(conn)
+            _backup_database_safely(
+                sqlite_client.DEFAULT_DB_PATH, settings.ONEDRIVE_BACKUP_PATH,
+            )
             return 0
         except UnusableInboxRecordError as exc:
             # Distinct from NoNewTransactionsError: the record exists and is
@@ -490,6 +529,9 @@ def _run_ingest() -> int:
                 review_flags=attribution_summary["review_flags"],
             )
             _prune_run_log_safely(conn)
+            _backup_database_safely(
+                sqlite_client.DEFAULT_DB_PATH, settings.ONEDRIVE_BACKUP_PATH,
+            )
             return 0
         except Exception as exc:
             tb = traceback.format_exc()
