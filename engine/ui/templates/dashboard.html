@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>Dashboard</h2>
+  <p>
+    <span class="pill">{{ rows|length }} live contract{{ '' if rows|length == 1 else 's' }}</span>
+    {% if alarm_count %}
+      <span class="pill alarm-on">{{ alarm_count }} ALARM</span>
+    {% endif %}
+    {% if over_count %}
+      <span class="pill band-Over">{{ over_count }} Over</span>
+    {% endif %}
+  </p>
+</header>
+
+{% if rows %}
+<figure>
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Contract</th>
+      <th>Campus</th>
+      <th class="num">Amount</th>
+      <th class="num">Spent</th>
+      <th class="num">% Spent</th>
+      <th class="num">Rate</th>
+      <th>Band</th>
+      <th>Alarms</th>
+      <th>Due</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td>{{ r["Contract"] }}</td>
+      <td>{{ r["Campus Set"] or "" }}</td>
+      <td class="num">{% if r["Contract Amount"] is not none %}${{ "{:,.2f}".format(r["Contract Amount"]) }}{% endif %}</td>
+      <td class="num">${{ "{:,.2f}".format(r["Spent so far"] or 0) }}</td>
+      <td class="num">{% if r["% Spent"] is not none %}{{ "%.1f"|format(r["% Spent"]) }}%{% endif %}</td>
+      <td class="num">{% if r["Spending Rate"] is not none %}{{ "%.2f"|format(r["Spending Rate"]) }}{% endif %}</td>
+      <td>
+        {% if r["Spending Rate Alarm"] %}
+          <span class="band-{{ r['Spending Rate Alarm'] }}">{{ r["Spending Rate Alarm"] }}</span>
+        {% endif %}
+      </td>
+      <td class="{{ 'alarm-on' if r['Alarms'] == 'ALARM' else 'alarm-off' }}">
+        {{ r["Alarms"] }}
+      </td>
+      <td>{{ r["Due"] or "" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% else %}
+<p>No Dashboard rows yet. Run <code>python -m engine.main --ingest</code> after dropping a Tableau export into <code>data/inbox/</code> to populate the table.</p>
+{% endif %}
+{% endblock %}

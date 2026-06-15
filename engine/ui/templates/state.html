@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}State — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>State</h2>
+  <p><small>
+    Per-contract snapshot the engine wrote on its last successful run.
+    The change-detection diff (Run Log review_flags) is computed against this.
+  </small></p>
+  <p><span class="pill">{{ rows|length }} contract{{ '' if rows|length == 1 else 's' }} tracked</span></p>
+</header>
+
+{% if rows %}
+<figure>
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Contract</th>
+      <th class="num">Prior Spent</th>
+      <th class="num">Prior %</th>
+      <th class="num">Prior Rate</th>
+      <th>Prior Band</th>
+      <th>Prior Alarms</th>
+      <th>Last Hash</th>
+      <th>Last Updated</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td>{{ r["Contract Name"] }}</td>
+      <td class="num">{% if r["Prior Spent"] is not none %}${{ "{:,.2f}".format(r["Prior Spent"]) }}{% endif %}</td>
+      <td class="num">{% if r["Prior % Spent"] is not none %}{{ "%.1f"|format(r["Prior % Spent"]) }}%{% endif %}</td>
+      <td class="num">{% if r["Prior Spending Rate"] is not none %}{{ "%.2f"|format(r["Prior Spending Rate"]) }}{% endif %}</td>
+      <td>{{ r["Prior Spending Rate Alarm"] or "" }}</td>
+      <td class="{{ 'alarm-on' if r['Prior Alarms'] == 'ALARM' else '' }}">{{ r["Prior Alarms"] or "" }}</td>
+      <td><small><code>{{ (r["Last Processed Hash"] or "")[:12] }}</code></small></td>
+      <td>{{ r["Last Updated At"] or "" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% else %}
+<p>No State rows yet. <code>--ingest</code> populates these after the first successful run.</p>
+{% endif %}
+{% endblock %}

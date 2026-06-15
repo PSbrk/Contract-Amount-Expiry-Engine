@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}{{ row["Contract"] }} — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>{{ row["Contract"] }}</h2>
+  <p>
+    <a href="{{ url_for('dashboard') }}">← back to Dashboard</a>
+    &nbsp;·&nbsp;
+    <small><code>{{ row["Asana Task GID"] }}</code></small>
+  </p>
+</header>
+
+<article>
+  <header><h3>Live values</h3></header>
+  <table role="grid">
+    <tbody>
+      <tr><th>Campus Set</th><td>{{ row["Campus Set"] or "" }}</td></tr>
+      <tr><th>Status</th><td>{{ row["Status"] or "" }}</td></tr>
+      <tr><th>PM Email</th><td>{{ row["PM Email"] or "" }}</td></tr>
+      <tr><th>Start</th><td>{{ row["Start"] or "" }}</td></tr>
+      <tr><th>Due</th><td>{{ row["Due"] or "" }}</td></tr>
+      <tr><th>Contract Amount</th>
+          <td class="num">{% if row["Contract Amount"] is not none %}${{ "{:,.2f}".format(row["Contract Amount"]) }}{% endif %}</td></tr>
+      <tr><th>Spent so far</th>
+          <td class="num">${{ "{:,.2f}".format(row["Spent so far"] or 0) }}</td></tr>
+      <tr><th>% Spent</th>
+          <td class="num">{% if row["% Spent"] is not none %}{{ "%.1f"|format(row["% Spent"]) }}%{% endif %}</td></tr>
+      <tr><th>Spending Rate</th>
+          <td class="num">{% if row["Spending Rate"] is not none %}{{ "%.2f"|format(row["Spending Rate"]) }}{% endif %}</td></tr>
+      <tr><th>Spending Rate Alarm</th>
+          <td>{% if row["Spending Rate Alarm"] %}<span class="band-{{ row['Spending Rate Alarm'] }}">{{ row["Spending Rate Alarm"] }}</span>{% endif %}</td></tr>
+      <tr><th>Alarms</th>
+          <td class="{{ 'alarm-on' if row['Alarms'] == 'ALARM' else 'alarm-off' }}">{{ row["Alarms"] }}</td></tr>
+      <tr><th>Last Updated</th><td>{{ row["Last Updated"] or "" }}</td></tr>
+    </tbody>
+  </table>
+</article>
+
+<article>
+  <header>
+    <h3>State prior <small>(snapshot from the most recent run)</small></h3>
+  </header>
+  {% if state_prior %}
+  <table role="grid">
+    <tbody>
+      <tr><th>Prior Spent</th>
+          <td class="num">{% if state_prior["Prior Spent"] is not none %}${{ "{:,.2f}".format(state_prior["Prior Spent"]) }}{% endif %}</td></tr>
+      <tr><th>Prior % Spent</th>
+          <td class="num">{% if state_prior["Prior % Spent"] is not none %}{{ "%.1f"|format(state_prior["Prior % Spent"]) }}%{% endif %}</td></tr>
+      <tr><th>Prior Spending Rate</th>
+          <td class="num">{% if state_prior["Prior Spending Rate"] is not none %}{{ "%.2f"|format(state_prior["Prior Spending Rate"]) }}{% endif %}</td></tr>
+      <tr><th>Prior Band</th>
+          <td>{{ state_prior["Prior Spending Rate Alarm"] or "" }}</td></tr>
+      <tr><th>Prior Alarms</th><td>{{ state_prior["Prior Alarms"] or "" }}</td></tr>
+      <tr><th>Last Processed Hash</th><td><code>{{ state_prior["Last Processed Hash"] or "" }}</code></td></tr>
+      <tr><th>Last Updated At</th><td>{{ state_prior["Last Updated At"] or "" }}</td></tr>
+    </tbody>
+  </table>
+  {% else %}
+  <p><small>No State row for this contract yet — it hasn't been computed in a prior run.</small></p>
+  {% endif %}
+</article>
+
+<article>
+  <header>
+    <h3>Learned Mappings attributing here</h3>
+  </header>
+  {% if learned %}
+  <table role="grid">
+    <thead>
+      <tr><th>Key</th><th>Campus</th><th>Dept</th><th>Account No</th><th>Vendor</th><th>Learned At</th></tr>
+    </thead>
+    <tbody>
+    {% for lm in learned %}
+      <tr>
+        <td><small><code>{{ lm["Key"] }}</code></small></td>
+        <td>{{ lm["Campus"] }}</td>
+        <td>{{ lm["Dept"] }}</td>
+        <td>{{ lm["Account No"] }}</td>
+        <td>{{ lm["Vendor"] }}</td>
+        <td>{{ lm["Learned At"] or "" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p><small>No Learned Mappings point at this contract yet.</small></p>
+  {% endif %}
+</article>
+
+<article>
+  <header>
+    <h3>Vendor Aliases</h3>
+  </header>
+  {% if aliases %}
+  <table role="grid">
+    <thead><tr><th>Aliases</th><th>Notes</th></tr></thead>
+    <tbody>
+    {% for a in aliases %}
+      <tr>
+        <td><small>{{ a["Aliases"] or "" }}</small></td>
+        <td><small>{{ a["Notes"] or "" }}</small></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p><small>No Vendor Aliases defined for this contract.</small></p>
+  {% endif %}
+</article>
+{% endblock %}

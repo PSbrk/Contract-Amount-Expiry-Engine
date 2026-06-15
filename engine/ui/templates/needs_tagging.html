@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}Needs Tagging — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>Needs Tagging</h2>
+  <p>
+    <span class="pill">{{ rows|length }} group{{ '' if rows|length == 1 else 's' }}</span>
+    {% if unfilled %}
+      <span class="pill alarm-on">{{ unfilled }} awaiting answer</span>
+    {% endif %}
+  </p>
+  <p>
+    <small>
+      Fill <em>Assign Contract</em> on a row and save. The next
+      <code>--ingest</code> promotes confirmed rows into Learned Mappings,
+      so future runs auto-attribute the same (Campus, Dept, Account&nbsp;No, Vendor) tuple.
+      {% if not contract_names %}
+        <br>(Suggestions empty — run <code>--ingest</code> at least once to populate the Dashboard, which feeds this datalist.)
+      {% endif %}
+    </small>
+  </p>
+</header>
+
+{% if rows %}
+<datalist id="contract-names">
+  {% for n in contract_names %}<option value="{{ n }}">{% endfor %}
+</datalist>
+
+<figure>
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Group</th>
+      <th class="num">$</th>
+      <th>Sample description</th>
+      <th>Engine candidates</th>
+      <th>Assign Contract</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    {% set filled = (r["Assign Contract"] or '').strip() %}
+    <tr class="{{ '' if filled else 'row-unfilled' }}">
+      <td>
+        <strong>{{ r["Vendor"] or "" }}</strong><br>
+        <small>{{ r["Campus"] or "" }} · {{ r["Dept"] or "" }} · acct {{ r["Account No"] or "" }}</small>
+      </td>
+      <td class="num">${{ "{:,.2f}".format(r["$ in group"] or 0) }}</td>
+      <td><small>{{ (r["Sample Record Description"] or "")[:140] }}</small></td>
+      <td>
+        {% if r["Engine Candidates"] %}
+          <details>
+            <summary><small>view</small></summary>
+            <pre style="white-space: pre-wrap; font-size: 0.8rem;">{{ r["Engine Candidates"] }}</pre>
+          </details>
+        {% endif %}
+      </td>
+      <td>
+        <form method="post" action="{{ url_for('needs_tagging_save', record_id=r['id']) }}"
+              style="display:flex; gap:0.4rem; margin:0;">
+          <input type="text" name="assign_contract"
+                 value="{{ r['Assign Contract'] or '' }}"
+                 list="contract-names"
+                 placeholder="Contract name (Asana task)"
+                 style="margin:0; flex:1;">
+          <button type="submit" style="margin:0;">Save</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% else %}
+<p>No Needs Tagging rows. Either the engine attributed everything cleanly, or it hasn't run yet.</p>
+{% endif %}
+{% endblock %}

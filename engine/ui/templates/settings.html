@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Settings — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>Settings</h2>
+  <p><small>
+    Read-only view of <code>config/settings.py</code> and the env-var presence
+    detected on this run. Edit <code>config/settings.py</code> directly to change
+    a value; restart the UI to see the new value here.
+  </small></p>
+</header>
+
+{% for group_name, items in groups %}
+<article>
+  <header><h3>{{ group_name }}</h3></header>
+  <table role="grid">
+    <tbody>
+    {% for name, value in items %}
+      <tr>
+        <th style="width:18rem;">{{ name }}</th>
+        <td><code>{{ value }}</code></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</article>
+{% endfor %}
+
+<article>
+  <header><h3>Environment variables</h3>
+    <small>Presence only — values not displayed (some are secrets).</small>
+  </header>
+  <table role="grid">
+    <tbody>
+    {% for name, present in env_state %}
+      <tr>
+        <th style="width:18rem;">{{ name }}</th>
+        <td>
+          {% if present %}
+            <span style="color: var(--pico-color-green-600);">set</span>
+          {% else %}
+            <span class="alarm-off">not set</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</article>
+{% endblock %}

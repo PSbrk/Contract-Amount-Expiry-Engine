@@ -622,6 +622,174 @@ def promote_filled_needs_tagging(
     return promotions
 
 
+# ---------------------------------------------------------------------------
+# Admin-table CRUD — used only by the web UI's editable list pages.
+#
+# Vendor Aliases / Campus Map / Learned Mappings are operator-curated tables;
+# the ingest pipeline only READS them. These helpers exist so the UI can also
+# WRITE without each route reaching directly into raw SQL. Each helper commits
+# eagerly so the operator's edit lands before the response is rendered.
+# ---------------------------------------------------------------------------
+
+def insert_vendor_alias(
+    conn: sqlite3.Connection,
+    *,
+    contract_name: str,
+    aliases: str = "",
+    notes: str = "",
+) -> dict:
+    cur = conn.execute(
+        'INSERT INTO "Vendor Aliases" ("Contract Name", "Aliases", "Notes") '
+        'VALUES (?, ?, ?)',
+        (contract_name, aliases, notes),
+    )
+    conn.commit()
+    return _fetch_by_id(conn, "Vendor Aliases", cur.lastrowid)
+
+
+def update_vendor_alias(
+    conn: sqlite3.Connection,
+    *,
+    record_id: int,
+    contract_name: str,
+    aliases: str = "",
+    notes: str = "",
+) -> None:
+    conn.execute(
+        'UPDATE "Vendor Aliases" SET "Contract Name" = ?, "Aliases" = ?, '
+        '"Notes" = ? WHERE id = ?',
+        (contract_name, aliases, notes, record_id),
+    )
+    conn.commit()
+
+
+def delete_vendor_alias(conn: sqlite3.Connection, *, record_id: int) -> None:
+    conn.execute('DELETE FROM "Vendor Aliases" WHERE id = ?', (record_id,))
+    conn.commit()
+
+
+def insert_campus_map(
+    conn: sqlite3.Connection,
+    *,
+    tableau_code: str,
+    asana_option_names: str = "",
+    drop: bool = False,
+    notes: str = "",
+) -> dict:
+    """Insert one Campus Map row. UNIQUE on Tableau Code — caller must
+    catch sqlite3.IntegrityError on duplicate insert (the web UI flashes
+    the conflict instead of 500-ing)."""
+    cur = conn.execute(
+        'INSERT INTO "Campus Map" ("Tableau Code", "Asana Option Names", '
+        '"Drop", "Notes") VALUES (?, ?, ?, ?)',
+        (tableau_code, asana_option_names, 1 if drop else 0, notes),
+    )
+    conn.commit()
+    return _fetch_by_id(conn, "Campus Map", cur.lastrowid)
+
+
+def update_campus_map(
+    conn: sqlite3.Connection,
+    *,
+    record_id: int,
+    tableau_code: str,
+    asana_option_names: str = "",
+    drop: bool = False,
+    notes: str = "",
+) -> None:
+    conn.execute(
+        'UPDATE "Campus Map" SET "Tableau Code" = ?, "Asana Option Names" = ?, '
+        '"Drop" = ?, "Notes" = ? WHERE id = ?',
+        (tableau_code, asana_option_names, 1 if drop else 0, notes, record_id),
+    )
+    conn.commit()
+
+
+def delete_campus_map(conn: sqlite3.Connection, *, record_id: int) -> None:
+    conn.execute('DELETE FROM "Campus Map" WHERE id = ?', (record_id,))
+    conn.commit()
+
+
+def insert_learned_mapping(
+    conn: sqlite3.Connection,
+    *,
+    key: str,
+    campus: str,
+    dept: str,
+    account_no: str,
+    vendor: str,
+    contract_name: str,
+    learned_at: str = "",
+    notes: str = "",
+) -> dict:
+    """Insert one Learned Mappings row. UNIQUE on Key. Routine usage
+    creates these via promote_filled_needs_tagging; this manual helper
+    is for the rare case where the operator wants to hand-author a
+    mapping (e.g. to backfill historical attribution)."""
+    cur = conn.execute(
+        'INSERT INTO "Learned Mappings" '
+        '("Key", "Campus", "Dept", "Account No", "Vendor", '
+        ' "Contract Name", "Learned At", "Notes") '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        (key, campus, dept, account_no, vendor, contract_name,
+         learned_at, notes),
+    )
+    conn.commit()
+    return _fetch_by_id(conn, "Learned Mappings", cur.lastrowid)
+
+
+def update_learned_mapping(
+    conn: sqlite3.Connection,
+    *,
+    record_id: int,
+    key: str,
+    campus: str,
+    dept: str,
+    account_no: str,
+    vendor: str,
+    contract_name: str,
+    learned_at: str = "",
+    notes: str = "",
+) -> None:
+    conn.execute(
+        'UPDATE "Learned Mappings" '
+        'SET "Key" = ?, "Campus" = ?, "Dept" = ?, "Account No" = ?, '
+        '    "Vendor" = ?, "Contract Name" = ?, "Learned At" = ?, "Notes" = ? '
+        'WHERE id = ?',
+        (key, campus, dept, account_no, vendor, contract_name,
+         learned_at, notes, record_id),
+    )
+    conn.commit()
+
+
+def delete_learned_mapping(conn: sqlite3.Connection, *, record_id: int) -> None:
+    conn.execute('DELETE FROM "Learned Mappings" WHERE id = ?', (record_id,))
+    conn.commit()
+
+
+def set_needs_tagging_assign_contract(
+    conn: sqlite3.Connection,
+    *,
+    record_id: int,
+    contract_name: str,
+) -> None:
+    """Operator-driven UPDATE of the Assign Contract column on a single
+    Needs Tagging row. Called from the web UI when the operator saves a
+    row inline.
+
+    Stored as TEXT verbatim; an empty string is allowed (clears a prior
+    answer). Validation against open Asana contract names is deferred
+    to promote_filled_needs_tagging — typos that don't match a real
+    contract block promotion with a logged warning and the row stays
+    for the operator to correct, rather than failing here on save.
+    """
+    conn.execute(
+        'UPDATE "Needs Tagging" SET "Assign Contract" = ? WHERE id = ?',
+        (contract_name, record_id),
+    )
+    conn.commit()
+
+
 def cleanup_stale_needs_tagging(
     conn: sqlite3.Connection, *, live_group_keys: set[str]
 ) -> int:
@@ -901,8 +1069,18 @@ __all__ = [
     "load_campus_map_overrides",
     "load_learned_mappings",
     "upsert_needs_tagging_group",
+    "set_needs_tagging_assign_contract",
     "promote_filled_needs_tagging",
     "cleanup_stale_needs_tagging",
+    "insert_vendor_alias",
+    "update_vendor_alias",
+    "delete_vendor_alias",
+    "insert_campus_map",
+    "update_campus_map",
+    "delete_campus_map",
+    "insert_learned_mapping",
+    "update_learned_mapping",
+    "delete_learned_mapping",
     "upsert_dashboard_row",
     "load_state_priors",
     "upsert_state_for_contract",

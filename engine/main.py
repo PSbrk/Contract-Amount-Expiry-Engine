@@ -105,6 +105,22 @@ def main(argv: list[str] | None = None) -> int:
              "data/engine.db, and record an Inbox + Run Log row. Skips "
              "attribution / compute — use --ingest for the full pipeline.",
     )
+    mode.add_argument(
+        "--ui", action="store_true",
+        help="Start the local Flask web UI on http://localhost:8080 and "
+             "open it in the default browser. Lets the operator edit "
+             "Needs Tagging answers, browse the Dashboard, and inspect "
+             "the Run Log. Ctrl-C in the console to stop.",
+    )
+    parser.add_argument(
+        "--ui-port", type=int, default=8080,
+        help="Port for --ui (default: 8080).",
+    )
+    parser.add_argument(
+        "--no-browser", action="store_true",
+        help="With --ui: don't auto-open the browser (useful for CI or "
+             "when running the UI on a headless machine).",
+    )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="With --provision: print the schema plan but make no API writes. "
@@ -129,8 +145,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.ingest_file:
         return _run_ingest_file(args.ingest_file)
 
+    if args.ui:
+        return _run_ui(port=args.ui_port, open_browser=not args.no_browser)
+
     log.info("no mode selected. Try `python -m engine.main --audit` or "
-             "`--provision` or `--ingest` or `--ingest-file PATH`.")
+             "`--provision` or `--ingest` or `--ingest-file PATH` or `--ui`.")
     return 0
 
 
@@ -926,6 +945,61 @@ def _run_ingest_file(path: str) -> int:
         return 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+def _run_ui(*, port: int, open_browser: bool) -> int:
+    """Start the local Flask web UI on http://localhost:<port>.
+
+    Ensures the SQLite schema first (so a fresh install can open the
+    browser even before any --ingest run has populated data), then
+    creates the Flask app and starts the dev server bound to 127.0.0.1.
+
+    Bound to localhost only — there is no auth (single-user
+    single-machine context); binding to 0.0.0.0 would let anything on
+    the LAN edit Needs Tagging.
+    """
+    import webbrowser
+
+    from engine import sqlite_client
+    from engine.ui import create_app
+
+    # ensure_schema once at startup so the per-request connections in
+    # create_app see a ready database (otherwise the first request
+    # would error with 'no such table').
+    bootstrap = sqlite_client.get_db_connection()
+    try:
+        sqlite_client.ensure_schema(bootstrap)
+    finally:
+        bootstrap.close()
+
+    app = create_app(db_path=sqlite_client.DEFAULT_DB_PATH)
+    url = f"http://127.0.0.1:{port}"
+    print(f"Contract Engine UI starting on {url}")
+    print("Ctrl-C to stop.")
+    if open_browser:
+        # Defer slightly so the dev server is listening before the
+        # browser hits it. Flask's run() blocks, so we open the URL
+        # in a daemon thread that fires after a short delay.
+        import threading
+
+        def _open():
+            import time
+            time.sleep(0.6)
+            try:
+                webbrowser.open(url)
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
+        threading.Thread(target=_open, daemon=True).start()
+
+    # use_reloader=False so the engine doesn't double-launch under
+    # Werkzeug's autoreload (would spawn a second SQLite connection
+    # and confuse the operator).
+    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+    return 0
 
 
 if __name__ == "__main__":

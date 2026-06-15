@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Contract Engine{% endblock %}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+<style>
+  /* Table-heavy app — tighter padding than Pico's default. */
+  main.container { padding-top: 1rem; padding-bottom: 1rem; max-width: none; }
+  table { font-size: 0.92rem; }
+  th, td { padding: 0.4rem 0.6rem; }
+  th { white-space: nowrap; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .alarm-on { color: var(--pico-color-red-500); font-weight: 600; }
+  .alarm-off { color: var(--pico-muted-color); }
+  .band-Over { color: var(--pico-color-red-500); font-weight: 600; }
+  .band-100\% { color: var(--pico-color-amber-500); font-weight: 600; }
+  .band-90\%  { color: var(--pico-color-amber-400); }
+  .band-75\%  { color: var(--pico-color-amber-300); }
+  .row-unfilled td { background: var(--pico-mark-background-color); }
+  details summary { cursor: pointer; }
+  .pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 1rem;
+          background: var(--pico-muted-background-color); font-size: 0.8rem; }
+  .flash-success { color: var(--pico-color-green-600); }
+  .flash-error   { color: var(--pico-color-red-500); }
+</style>
+</head>
+<body>
+<nav class="container">
+  <ul>
+    <li><strong>Contract Engine</strong></li>
+  </ul>
+  <ul>
+    <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
+    <li><a href="{{ url_for('needs_tagging') }}">Needs Tagging</a></li>
+    <li>
+      <details role="list" dir="rtl">
+        <summary aria-haspopup="listbox" role="link">Admin</summary>
+        <ul role="listbox">
+          <li><a href="{{ url_for('vendor_aliases_list') }}">Vendor Aliases</a></li>
+          <li><a href="{{ url_for('campus_map_list') }}">Campus Map</a></li>
+          <li><a href="{{ url_for('learned_mappings_list') }}">Learned Mappings</a></li>
+        </ul>
+      </details>
+    </li>
+    <li><a href="{{ url_for('state_view') }}">State</a></li>
+    <li><a href="{{ url_for('run_log') }}">Run Log</a></li>
+    <li><a href="{{ url_for('settings_view') }}">Settings</a></li>
+  </ul>
+</nav>
+<main class="container">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, msg in messages %}
+      <p class="flash-{{ category }}">{{ msg }}</p>
+    {% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

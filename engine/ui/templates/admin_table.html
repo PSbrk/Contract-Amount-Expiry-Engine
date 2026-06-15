@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}{{ spec.title }} — Contract Engine{% endblock %}
+
+{% macro render_input(col, value, autocomplete='off') %}
+  {%- if col.type == "checkbox" -%}
+    <input type="checkbox" name="{{ col.form }}" {% if value %}checked{% endif %}>
+  {%- elif col.type == "textarea" -%}
+    <textarea name="{{ col.form }}" rows="1" style="margin:0; min-height:2.4rem;"
+              autocomplete="{{ autocomplete }}">{{ value or '' }}</textarea>
+  {%- else -%}
+    <input type="text" name="{{ col.form }}" value="{{ value or '' }}"
+           autocomplete="{{ autocomplete }}"
+           {% if col.required %}required{% endif %}
+           style="margin:0;">
+  {%- endif -%}
+{% endmacro %}
+
+{% block content %}
+<header>
+  <h2>{{ spec.title }}</h2>
+  <p><small>{{ spec.intro }}</small></p>
+  <p><span class="pill">{{ rows|length }} row{{ '' if rows|length == 1 else 's' }}</span></p>
+</header>
+
+<figure>
+<table role="grid">
+  <thead>
+    <tr>
+      {% for col in spec.columns %}<th>{{ col.name }}</th>{% endfor %}
+      <th style="width:12rem;">Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <form method="post" action="{{ url_for(spec.save_endpoint, record_id=r['id']) }}" style="display:contents;">
+        {% for col in spec.columns %}
+          <td>{{ render_input(col, r[col.name]) }}</td>
+        {% endfor %}
+        <td style="white-space:nowrap;">
+          <button type="submit" style="margin:0;">Save</button>
+        </td>
+      </form>
+      <td style="display:none;"></td>{# spacer so the inline delete form below isn't pulled into the prev <form> #}
+    </tr>
+    <tr style="border-top:none;">
+      <td colspan="{{ spec.columns|length }}"></td>
+      <td>
+        <form method="post" action="{{ url_for(spec.delete_endpoint, record_id=r['id']) }}"
+              onsubmit="return confirm('Delete row {{ r['id'] }}?');"
+              style="margin:0;">
+          <button type="submit" class="secondary outline" style="margin:0;">Delete</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+    <tr>
+      <form method="post" action="{{ url_for(spec.add_endpoint) }}" style="display:contents;">
+        {% for col in spec.columns %}
+          <td>{{ render_input(col, '', autocomplete='off') }}</td>
+        {% endfor %}
+        <td>
+          <button type="submit" class="contrast" style="margin:0;">Add</button>
+        </td>
+      </form>
+    </tr>
+  </tbody>
+</table>
+</figure>
+{% endblock %}

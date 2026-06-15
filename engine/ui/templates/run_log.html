@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Run Log — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>Run Log</h2>
+  <p>
+    <span class="pill">{{ total }} total</span>
+    {% if total > per_page %}
+      <small>showing {{ offset + 1 }}–{{ [offset + per_page, total]|min }}</small>
+    {% endif %}
+  </p>
+</header>
+
+{% if rows %}
+<figure>
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Run ID</th>
+      <th>Mode</th>
+      <th>Outcome</th>
+      <th>File</th>
+      <th>Notes / Review</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td><code>{{ r["Run ID"] }}</code></td>
+      <td>{{ r["Mode"] }}</td>
+      <td>
+        {% if r["Outcome"] == "ok" %}
+          <span style="color: var(--pico-color-green-600);">ok</span>
+        {% elif r["Outcome"] == "error" %}
+          <span class="alarm-on">error</span>
+        {% else %}
+          {{ r["Outcome"] }}
+        {% endif %}
+      </td>
+      <td><small>{{ r["File Name"] or "" }}</small></td>
+      <td>
+        {% if r["Notes"] %}<small>{{ r["Notes"] }}</small>{% endif %}
+        {% if r["Review Flags"] %}
+          <details>
+            <summary><small>review flags</small></summary>
+            <pre style="white-space: pre-wrap; font-size: 0.8rem;">{{ r["Review Flags"] }}</pre>
+          </details>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</figure>
+
+<nav>
+  <ul>
+    {% if offset > 0 %}
+      <li><a href="{{ url_for('run_log', offset=[offset - per_page, 0]|max) }}">← Newer</a></li>
+    {% endif %}
+  </ul>
+  <ul>
+    {% if offset + per_page < total %}
+      <li><a href="{{ url_for('run_log', offset=offset + per_page) }}">Older →</a></li>
+    {% endif %}
+  </ul>
+</nav>
+{% else %}
+<p>No Run Log rows yet. Each <code>--ingest</code> run appends one.</p>
+{% endif %}
+{% endblock %}
