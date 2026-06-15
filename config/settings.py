@@ -180,6 +180,19 @@ MIN_SPEND_FLOOR: Final = 1000.0
 
 
 # ---------------------------------------------------------------------------
+# Step 6 change detection thresholds (spec §10)
+# ---------------------------------------------------------------------------
+
+# A swing in Spent so far at or above this dollar amount flags the contract
+# into Run Log review_flags. Decreases always flag regardless of magnitude
+# (spec §10: "especially a decrease or large swing") because in a net-signed
+# sum, a fall in spent indicates a correction the operator should eyeball.
+# 10k is a reasonable starting point on the engine's scale (contracts run
+# $5k to $1M+ per term); adjust if it becomes noisy.
+REVIEW_LARGE_DELTA_DOLLARS: Final = 10000.0
+
+
+# ---------------------------------------------------------------------------
 # Run-mode overrides from env (so dry-run can be toggled in CI/locally without
 # code change)
 # ---------------------------------------------------------------------------

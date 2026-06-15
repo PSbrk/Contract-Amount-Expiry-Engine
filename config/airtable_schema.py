@@ -214,11 +214,15 @@ TABLES_SCHEMA: Final = [
         "description": (
             "Per-contract prior totals and prior alarm state, for change "
             "detection on each run. Populated by the compute step (Step 4); "
-            "empty at Step 2."
+            "empty at Step 2. Keyed by Asana Task GID (NOT Contract Name) "
+            "so a contract rename in Asana self-corrects rather than "
+            "orphaning the prior State row."
         ),
         "fields": [
             {"name": "Contract Name", "type": "singleLineText",
-             "description": "Asana task name. Primary field."},
+             "description": "Human label — primary field for at-a-glance scan."},
+            {"name": "Asana Task GID", "type": "singleLineText",
+             "description": "Stable identity. Engine looks up State rows by this field."},
             {"name": "Prior Spent", "type": "number", "options": {"precision": 2}},
             {"name": "Prior % Spent", "type": "number", "options": {"precision": 2}},
             {"name": "Prior Spending Rate", "type": "number", "options": {"precision": 2}},

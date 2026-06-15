@@ -23,6 +23,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Iterable
 
 import requests
@@ -722,6 +723,172 @@ def upsert_dashboard_row(base, row) -> dict:
     return table.create(payload, typecast=True)
 
 
+# ---------------------------------------------------------------------------
+# State table I/O — Step 6 change detection
+# ---------------------------------------------------------------------------
+#
+# Keyed by Asana Task GID (NOT Contract Name) so a rename in Asana
+# self-corrects rather than orphaning the prior State row.
+
+
+def _find_state_by_gid(base, asana_task_gid: str) -> dict | None:
+    table = base.table(airtable_schema.table_spec("State")["name"])
+    return table.first(
+        formula=f"{{Asana Task GID}}={_formula_literal(asana_task_gid)}"
+    )
+
+
+def load_state_priors(base) -> dict[str, Any]:
+    """Return {asana_task_gid: StatePrior} from the State table.
+
+    Empty State (first-run base) returns an empty dict — every contract
+    surfaces as `first_run` in the diff. Rows missing an Asana Task GID
+    are skipped with a logged warning (likely manually-typed rows or
+    rows from before the GID column was added).
+    """
+    # Imported lazily to avoid an import cycle (engine.state imports from
+    # engine.compute, and main → state → airtable_client → state would
+    # otherwise loop).
+    from engine.state import StatePrior
+
+    table = base.table(airtable_schema.table_spec("State")["name"])
+    out: dict[str, Any] = {}
+    for record in table.all():
+        fields = record.get("fields") or {}
+        gid = (fields.get("Asana Task GID") or "").strip()
+        if not gid:
+            # Could be legacy data from before GID was added — skip with a
+            # log so the operator can see the orphan and clean it manually.
+            name = (fields.get("Contract Name") or "").strip() or "<unnamed>"
+            log.warning(
+                "State row for %r has no Asana Task GID; skipping. Delete "
+                "or backfill the row to clean up.", name,
+            )
+            continue
+        name = (fields.get("Contract Name") or "").strip()
+        last_updated_raw = fields.get("Last Updated At")
+        last_updated_parsed: date | None = None
+        if last_updated_raw:
+            try:
+                last_updated_parsed = date.fromisoformat(str(last_updated_raw)[:10])
+            except ValueError:
+                log.warning(
+                    "State row %r has malformed Last Updated At %r; treating "
+                    "as missing.", name or gid, last_updated_raw,
+                )
+        out[gid] = StatePrior(
+            contract_name=name,
+            asana_task_gid=gid,
+            prior_spent=fields.get("Prior Spent"),
+            prior_pct_spent=fields.get("Prior % Spent"),
+            prior_spending_rate=fields.get("Prior Spending Rate"),
+            # `or None` coerces an empty-string singleSelect (rare;
+            # Airtable usually omits the key entirely for cleared cells)
+            # so the StatePrior dataclass stays clean for downstream None
+            # checks.
+            prior_spending_rate_alarm=(fields.get("Prior Spending Rate Alarm") or None),
+            prior_alarms=(fields.get("Prior Alarms") or None),
+            last_processed_hash=(fields.get("Last Processed Hash") or "") or None,
+            last_updated_at=last_updated_parsed,
+        )
+    return out
+
+
+_STATE_SPENDING_RATE_ALARM_VALUES: frozenset[str] = frozenset(
+    settings.ASANA_SPENDING_RATE_ALARM_OPTIONS
+)
+_STATE_ALARMS_VALUES: frozenset[str] = frozenset(settings.ASANA_ALARMS_OPTIONS)
+
+
+def upsert_state_for_contract(
+    base,
+    *,
+    contract_name: str,
+    asana_task_gid: str,
+    spent: float,
+    pct_spent: float | None,
+    spending_rate: float | None,
+    spending_rate_alarm: str | None,
+    alarms: str,
+    last_processed_hash: str,
+    last_updated_iso_date: str,
+) -> dict:
+    """Idempotent upsert of one State row, keyed by Asana Task GID.
+
+    Same client-side singleSelect validation + PATCH-merge nullable
+    handling as Dashboard upsert: on UPDATE we explicitly send None to
+    clear cells (so a Prior Spending Rate Alarm that drops from "75%"
+    to blank doesn't stay stale).
+    """
+    if (spending_rate_alarm is not None
+            and spending_rate_alarm not in _STATE_SPENDING_RATE_ALARM_VALUES):
+        raise ValueError(
+            f"State Prior Spending Rate Alarm {spending_rate_alarm!r} is not "
+            f"one of {sorted(_STATE_SPENDING_RATE_ALARM_VALUES)}."
+        )
+    if alarms not in _STATE_ALARMS_VALUES:
+        raise ValueError(
+            f"State Prior Alarms {alarms!r} is not one of "
+            f"{sorted(_STATE_ALARMS_VALUES)}."
+        )
+
+    payload: dict[str, Any] = {
+        "Contract Name": contract_name,
+        "Asana Task GID": asana_task_gid,
+        "Prior Spent": round(spent, 2),
+        "Prior Alarms": alarms,
+        "Last Processed Hash": last_processed_hash,
+        "Last Updated At": last_updated_iso_date,
+    }
+    nullable_values: dict[str, Any] = {
+        "Prior % Spent": round(pct_spent, 2) if pct_spent is not None else None,
+        "Prior Spending Rate":
+            round(spending_rate, 2) if spending_rate is not None else None,
+        "Prior Spending Rate Alarm": spending_rate_alarm,
+    }
+
+    table = base.table(airtable_schema.table_spec("State")["name"])
+    existing = _find_state_by_gid(base, asana_task_gid)
+
+    if existing:
+        # UPDATE — explicit None to clear, matching the Dashboard pattern.
+        payload.update(nullable_values)
+        return table.update(existing["id"], payload, typecast=True)
+
+    # CREATE — omit None to avoid initializing cells as null.
+    for k, v in nullable_values.items():
+        if v is not None:
+            payload[k] = v
+    return table.create(payload, typecast=True)
+
+
+def cleanup_stale_state(base, *, live_asana_task_gids: set[str]) -> int:
+    """Delete State rows whose Asana Task GID is no longer in the live set
+    (contract archived in Asana, or operator removed the task).
+
+    Mirrors cleanup_stale_needs_tagging — engine-owned table, operator
+    doesn't hand-edit State, so unconditional cleanup is safe. Returns the
+    count of deleted rows.
+    """
+    table = base.table(airtable_schema.table_spec("State")["name"])
+    deleted = 0
+    for record in table.all():
+        fields = record.get("fields") or {}
+        gid = (fields.get("Asana Task GID") or "").strip()
+        if gid and gid not in live_asana_task_gids:
+            try:
+                table.delete(record["id"])
+                deleted += 1
+            except Exception as exc:  # noqa: BLE001
+                log.info(
+                    "stale State delete on %s returned %s; continuing.",
+                    record["id"], type(exc).__name__,
+                )
+    if deleted:
+        log.info("cleaned up %d stale State row(s)", deleted)
+    return deleted
+
+
 def cleanup_stale_needs_tagging(base, *, live_group_keys: set[str]) -> int:
     """Delete Needs Tagging rows whose Group Key is NOT in live_group_keys
     AND whose Assign Contract is empty.
@@ -774,4 +941,7 @@ __all__ = [
     "promote_filled_needs_tagging",
     "cleanup_stale_needs_tagging",
     "upsert_dashboard_row",
+    "load_state_priors",
+    "upsert_state_for_contract",
+    "cleanup_stale_state",
 ]

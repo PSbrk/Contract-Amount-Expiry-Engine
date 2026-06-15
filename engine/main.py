@@ -469,6 +469,44 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
     print(f"  skipped future-start:   {skip_counts['future_start']:>6}")
     print(f"  skipped past-due:       {skip_counts['past_due']:>6}")
     print(f"  skipped no-start-data:  {skip_counts['no_start_data']:>6}")
+    # Step 6: change detection. Load prior State (BEFORE Dashboard upsert so
+    # the diff is against the truly-prior snapshot, not what we're about to
+    # write). State PERSIST happens after the Asana write loop so a hard
+    # failure mid-pipeline leaves State un-advanced — next run's diff then
+    # surfaces the lingering inconsistency rather than hiding it.
+    from engine import state as state_mod
+    from engine.airtable_client import (
+        cleanup_stale_state,
+        load_state_priors,
+        upsert_state_for_contract,
+    )
+
+    state_priors_by_gid = load_state_priors(base)
+    change_findings: list[state_mod.ChangeFinding] = []
+    for dash_row in dashboard_rows:
+        prior = state_priors_by_gid.get(dash_row.asana_task_gid)
+        change_findings.extend(state_mod.diff_against_prior(dash_row, prior))
+    change_counts = state_mod.summarize_findings(change_findings)
+    review_block = state_mod.build_review_flags(change_findings)
+
+    if any(v for k, v in change_counts.items() if k != "first_run"):
+        print()
+        print("Change detection (vs prior State)")
+        print(f"  decreases:           {change_counts['decrease']:>6}")
+        print(f"  alarm transitions:   {change_counts['alarm_transition']:>6}")
+        print(f"  crossed 100%:        {change_counts['crossed_100']:>6}")
+        print(f"  large swings:        {change_counts['large_swing']:>6}")
+        print(f"  band transitions:    {change_counts['band_transition']:>6}")
+        if change_counts["first_run"]:
+            print(f"  first-run contracts: {change_counts['first_run']:>6}")
+    elif change_counts["first_run"]:
+        print()
+        print(f"Change detection: {change_counts['first_run']} first-run contract(s); "
+              f"no diffs against prior State.")
+    else:
+        print()
+        print("Change detection: no diffs against prior State.")
+
     for dash_row in dashboard_rows:
         upsert_dashboard_row(base, dash_row)
     if dashboard_rows:
@@ -501,6 +539,45 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
             test_contract_gid=test_gid,
         )
         write_results.append(res)
+
+    # State PERSIST — runs AFTER Dashboard upsert AND AFTER Asana writes so
+    # State becomes the "high-water mark of a fully-successful run". If
+    # Asana writes failed for some contracts, those contracts' State stays
+    # un-advanced and the next run's diff re-surfaces the inconsistency.
+    # Per-contract try/except so one bad Airtable PATCH doesn't leave a
+    # half-written State (the rest of the loop still advances).
+    state_persist_errors: list[tuple[str, str]] = []  # (contract_name, error)
+    for dash_row in dashboard_rows:
+        try:
+            upsert_state_for_contract(
+                base,
+                contract_name=dash_row.contract_name,
+                asana_task_gid=dash_row.asana_task_gid,
+                spent=dash_row.spent_so_far,
+                pct_spent=dash_row.pct_spent,
+                spending_rate=dash_row.spending_rate,
+                spending_rate_alarm=dash_row.spending_rate_alarm,
+                alarms=dash_row.alarms,
+                last_processed_hash=meta.hash,
+                last_updated_iso_date=today_iso,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "State upsert failed for %s (%s): %s",
+                dash_row.contract_name, dash_row.asana_task_gid, exc,
+            )
+            state_persist_errors.append(
+                (dash_row.contract_name, f"{type(exc).__name__}: {exc}")
+            )
+    # Sweep stale State rows (contract archived in Asana, or removed from
+    # the open list) so the table doesn't grow monotonically.
+    live_gids = {r.asana_task_gid for r in dashboard_rows}
+    stale_state_deleted = cleanup_stale_state(base, live_asana_task_gids=live_gids)
+    if stale_state_deleted:
+        print(f"  cleaned up {stale_state_deleted} stale State row(s).")
+    if state_persist_errors:
+        print(f"  WARN: {len(state_persist_errors)} State persist error(s) "
+              f"(see Run Log review_flags for details)")
 
     write_summary = asana_writer.summarize(write_results, dry_run=settings.DRY_RUN_ASANA)
     mode_label = "DRY RUN" if settings.DRY_RUN_ASANA else "LIVE"
@@ -578,6 +655,34 @@ def _run_attribution_and_needs_tagging(base, kept_df, *, today_iso: str) -> dict
         review_flags.append(f"{alarms_count} contract(s) tripping ALARM.")
     if write_summary.contracts_errored:
         review_flags.append(f"{write_summary.contracts_errored} Asana write(s) errored.")
+    if state_persist_errors:
+        review_flags.append(
+            f"{len(state_persist_errors)} State persist error(s):\n"
+            + "\n".join(f"  - {name}: {err}" for name, err in state_persist_errors)
+        )
+    # Change-detection findings (spec §10). Empty review_block means no
+    # noteworthy diffs; we don't add a line in that case.
+    if review_block:
+        # One-line summary up top, then the detail block.
+        cd_summary = (
+            f"Change detection: "
+            f"{change_counts['decrease']} decrease(s), "
+            f"{change_counts['alarm_transition']} alarm transition(s), "
+            f"{change_counts['crossed_100']} crossed-100%, "
+            f"{change_counts['large_swing']} large swing(s), "
+            f"{change_counts['band_transition']} band change(s)."
+        )
+        review_flags.append(cd_summary)
+        review_flags.append(review_block)
+    notes_lines.append(
+        f"Change detection: "
+        f"decreases={change_counts['decrease']}, "
+        f"alarm_transitions={change_counts['alarm_transition']}, "
+        f"crossed_100={change_counts['crossed_100']}, "
+        f"large_swings={change_counts['large_swing']}, "
+        f"band_changes={change_counts['band_transition']}, "
+        f"first_run={change_counts['first_run']}."
+    )
 
     return {
         "summary_line": summary_line,

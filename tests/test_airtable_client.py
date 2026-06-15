@@ -970,6 +970,171 @@ def test_dashboard_singleSelect_validators_match_settings_options():
     assert set(alarms_schema_names) == set(settings.ASANA_ALARMS_OPTIONS)
 
 
+# ---------------------------------------------------------------------------
+# State table I/O — Step 6
+# ---------------------------------------------------------------------------
+
+def test_load_state_priors_parses_state_rows():
+    """The State table is keyed by Asana Task GID. load_state_priors
+    returns a {gid: StatePrior} dict. Rows missing the GID are skipped
+    with a logged warning (legacy / hand-edited rows)."""
+    from engine.airtable_client import load_state_priors
+    base = _RecordsBase()
+    base.seed("State", [
+        {"fields": {
+            "Contract Name": "Acme SaaS",
+            "Asana Task GID": "gid-acme",
+            "Prior Spent": 1234.56,
+            "Prior % Spent": 12.35,
+            "Prior Spending Rate": 1.5,
+            "Prior Spending Rate Alarm": "75%",
+            "Prior Alarms": "ALARM",
+            "Last Processed Hash": "abc123",
+            "Last Updated At": "2026-06-11",
+        }},
+        {"fields": {  # legacy row without Asana Task GID — skipped with warn
+            "Contract Name": "Legacy",
+            "Prior Spent": 100.0,
+        }},
+    ])
+    priors = load_state_priors(base)
+    assert set(priors) == {"gid-acme"}
+    p = priors["gid-acme"]
+    assert p.contract_name == "Acme SaaS"
+    assert p.asana_task_gid == "gid-acme"
+    assert p.prior_spent == pytest.approx(1234.56)
+    assert p.prior_pct_spent == pytest.approx(12.35)
+    assert p.prior_spending_rate_alarm == "75%"
+    assert p.prior_alarms == "ALARM"
+    assert p.last_processed_hash == "abc123"
+    assert p.last_updated_at == date(2026, 6, 11)
+
+
+def test_cleanup_stale_state_deletes_rows_not_in_live_set():
+    """A contract archived in Asana between runs leaves its State row
+    orphaned. cleanup_stale_state sweeps these — engine-owned table,
+    operator doesn't hand-edit."""
+    from engine.airtable_client import cleanup_stale_state
+    base = _RecordsBase()
+    base.seed("State", [
+        {"fields": {"Contract Name": "Live", "Asana Task GID": "gid-live"}},
+        {"fields": {"Contract Name": "Stale", "Asana Task GID": "gid-stale"}},
+        {"fields": {"Contract Name": "Other Stale", "Asana Task GID": "gid-other"}},
+    ])
+    deleted = cleanup_stale_state(base, live_asana_task_gids={"gid-live"})
+    assert deleted == 2
+    remaining = base._tables["State"]
+    assert len(remaining) == 1
+    assert remaining[0]["fields"]["Asana Task GID"] == "gid-live"
+
+
+def test_load_state_priors_returns_empty_dict_on_empty_table():
+    """First-run: every contract surfaces as `first_run` in the diff."""
+    from engine.airtable_client import load_state_priors
+    base = _RecordsBase()
+    base.seed("State", [])
+    assert load_state_priors(base) == {}
+
+
+def test_upsert_state_creates_new_row_for_first_seen_contract():
+    from engine.airtable_client import upsert_state_for_contract
+    base = _RecordsBase()
+    upsert_state_for_contract(
+        base,
+        contract_name="Acme", asana_task_gid="gid-acme",
+        spent=1234.56, pct_spent=12.35, spending_rate=1.5,
+        spending_rate_alarm="75%", alarms="ALARM",
+        last_processed_hash="hash-1",
+        last_updated_iso_date="2026-06-12",
+    )
+    rows = base._tables["State"]
+    assert len(rows) == 1
+    fields = rows[0]["fields"]
+    assert fields["Contract Name"] == "Acme"
+    assert fields["Asana Task GID"] == "gid-acme"
+    assert fields["Prior Spent"] == 1234.56
+    assert fields["Prior Spending Rate Alarm"] == "75%"
+    assert fields["Prior Alarms"] == "ALARM"
+    assert fields["Last Processed Hash"] == "hash-1"
+
+
+def test_upsert_state_updates_existing_by_asana_task_gid():
+    """Idempotency by Asana Task GID — the stable identity. A rename
+    on the Contract Name side still updates the same State row."""
+    from engine.airtable_client import upsert_state_for_contract
+    base = _RecordsBase()
+    upsert_state_for_contract(
+        base, contract_name="Acme", asana_task_gid="gid-acme",
+        spent=1000.0, pct_spent=10.0, spending_rate=0.5,
+        spending_rate_alarm=None, alarms="Clear",
+        last_processed_hash="hash-1", last_updated_iso_date="2026-06-11",
+    )
+    # Same GID, RENAMED Contract Name — should update, not create duplicate.
+    upsert_state_for_contract(
+        base, contract_name="Acme Inc.", asana_task_gid="gid-acme",
+        spent=2000.0, pct_spent=20.0, spending_rate=1.0,
+        spending_rate_alarm=None, alarms="Clear",
+        last_processed_hash="hash-2", last_updated_iso_date="2026-06-12",
+    )
+    rows = base._tables["State"]
+    assert len(rows) == 1, "Rename created a duplicate State row — GID keying broken"
+    assert rows[0]["fields"]["Contract Name"] == "Acme Inc."  # renamed
+    assert rows[0]["fields"]["Prior Spent"] == 2000.0
+    assert rows[0]["fields"]["Last Processed Hash"] == "hash-2"
+
+
+def test_upsert_state_clears_nullable_cells_on_update():
+    """Same PATCH-merge nullable gotcha as Dashboard: a Prior Spending
+    Rate Alarm transitioning from '75%' back to blank must be EXPLICITLY
+    cleared on update."""
+    from engine.airtable_client import upsert_state_for_contract
+    base = _RecordsBase()
+    upsert_state_for_contract(
+        base, contract_name="Acme", asana_task_gid="gid-acme",
+        spent=8000.0, pct_spent=80.0, spending_rate=1.5,
+        spending_rate_alarm="75%", alarms="ALARM",
+        last_processed_hash="h1", last_updated_iso_date="2026-06-11",
+    )
+    upsert_state_for_contract(
+        base, contract_name="Acme", asana_task_gid="gid-acme",
+        spent=3000.0, pct_spent=30.0, spending_rate=None,  # pace guard kicked
+        spending_rate_alarm=None,                          # band dropped
+        alarms="Clear",
+        last_processed_hash="h2", last_updated_iso_date="2026-06-12",
+    )
+    rec = base._tables["State"][0]
+    assert rec["fields"].get("Prior Spending Rate Alarm") is None
+    assert rec["fields"].get("Prior Spending Rate") is None
+    assert rec["fields"]["Prior Alarms"] == "Clear"
+
+
+def test_upsert_state_rejects_unknown_alarms_option():
+    """Client-side singleSelect validation — a typo would otherwise spawn
+    a new dropdown option in Airtable."""
+    from engine.airtable_client import upsert_state_for_contract
+    base = _RecordsBase()
+    with pytest.raises(ValueError, match="Prior Alarms"):
+        upsert_state_for_contract(
+            base, contract_name="Acme", asana_task_gid="gid-acme",
+            spent=0.0, pct_spent=None, spending_rate=None,
+            spending_rate_alarm=None, alarms="WRONG",
+            last_processed_hash="x", last_updated_iso_date="2026-06-12",
+        )
+
+
+def test_upsert_state_rejects_unknown_band_option():
+    from engine.airtable_client import upsert_state_for_contract
+    base = _RecordsBase()
+    with pytest.raises(ValueError, match="Prior Spending Rate Alarm"):
+        upsert_state_for_contract(
+            base, contract_name="Acme", asana_task_gid="gid-acme",
+            spent=0.0, pct_spent=None, spending_rate=None,
+            spending_rate_alarm="ALMOST",  # not in {75%,90%,100%,Over}
+            alarms="Clear",
+            last_processed_hash="x", last_updated_iso_date="2026-06-12",
+        )
+
+
 def test_upsert_dashboard_writes_all_fourteen_fields_on_create():
     """Defensive: when a DashboardRow has every optional field set, the
     create payload should contain all 14 keys mapping to Airtable's
