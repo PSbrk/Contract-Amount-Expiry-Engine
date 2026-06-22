@@ -116,3 +116,113 @@ def test_backup_accepts_path_object_for_db_path(tmp_path):
     # Pass src as a Path, not a string.
     _backup_database_safely(Path(src), str(dest))
     assert dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase 12: _restore_database_safely — pull from OneDrive on startup
+# ---------------------------------------------------------------------------
+
+from engine.main import _restore_database_safely
+
+
+def _touch_mtime(p: Path, offset_seconds: float) -> None:
+    """Shift a file's mtime by offset_seconds (negative = older)."""
+    import os
+    new = p.stat().st_mtime + offset_seconds
+    os.utime(p, (new, new))
+
+
+def test_restore_no_backup_path_is_no_op(tmp_path):
+    local = _make_fake_db(tmp_path)
+    result = _restore_database_safely(local, None)
+    assert result["action"] == "no_backup_path"
+    # Local untouched.
+    assert local.read_bytes() == b"SQLite-format-3-fake-bytes"
+
+
+def test_restore_cloud_missing_logs_and_keeps_local(tmp_path):
+    local = _make_fake_db(tmp_path)
+    cloud = tmp_path / "onedrive" / "engine.db"  # doesn't exist
+    result = _restore_database_safely(local, str(cloud))
+    assert result["action"] == "cloud_missing"
+    assert local.read_bytes() == b"SQLite-format-3-fake-bytes"
+
+
+def test_restore_pulls_when_local_missing(tmp_path):
+    onedrive = tmp_path / "onedrive"
+    onedrive.mkdir()
+    cloud = onedrive / "engine.db"
+    cloud.write_bytes(b"cloud-content")
+    local = tmp_path / "data" / "engine.db"
+    assert not local.exists()
+    result = _restore_database_safely(local, str(cloud))
+    assert result["action"] == "local_missing_pulled"
+    assert local.exists()
+    assert local.read_bytes() == b"cloud-content"
+
+
+def test_restore_pulls_when_cloud_is_newer(tmp_path):
+    local = tmp_path / "data" / "engine.db"
+    local.parent.mkdir(parents=True)
+    local.write_bytes(b"local-stale")
+    cloud = tmp_path / "onedrive" / "engine.db"
+    cloud.parent.mkdir(parents=True)
+    cloud.write_bytes(b"cloud-fresh")
+    # Make cloud 30 seconds newer than local (well outside grace).
+    _touch_mtime(local, -30)
+    result = _restore_database_safely(local, str(cloud))
+    assert result["action"] == "restored"
+    assert local.read_bytes() == b"cloud-fresh"
+
+
+def test_restore_does_not_overwrite_when_local_newer(tmp_path):
+    local = tmp_path / "data" / "engine.db"
+    local.parent.mkdir(parents=True)
+    local.write_bytes(b"local-fresh")
+    cloud = tmp_path / "onedrive" / "engine.db"
+    cloud.parent.mkdir(parents=True)
+    cloud.write_bytes(b"cloud-stale")
+    # Backdate cloud by 30 seconds.
+    _touch_mtime(cloud, -30)
+    result = _restore_database_safely(local, str(cloud))
+    assert result["action"] == "local_newer"
+    # Local untouched.
+    assert local.read_bytes() == b"local-fresh"
+
+
+def test_restore_no_op_when_in_sync(tmp_path):
+    local = tmp_path / "data" / "engine.db"
+    local.parent.mkdir(parents=True)
+    local.write_bytes(b"identical-content")
+    cloud = tmp_path / "onedrive" / "engine.db"
+    cloud.parent.mkdir(parents=True)
+    cloud.write_bytes(b"identical-content")
+    # Align mtimes exactly.
+    import os
+    t = local.stat().st_mtime
+    os.utime(cloud, (t, t))
+    result = _restore_database_safely(local, str(cloud))
+    assert result["action"] == "in_sync"
+    assert local.read_bytes() == b"identical-content"
+
+
+def test_restore_failure_does_not_raise(tmp_path, monkeypatch, caplog):
+    """A broken copy must NEVER crash the engine — local DB is source of truth."""
+    onedrive = tmp_path / "onedrive"
+    onedrive.mkdir()
+    cloud = onedrive / "engine.db"
+    cloud.write_bytes(b"cloud-content")
+    local = tmp_path / "data" / "engine.db"  # missing → would trigger pull
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("simulated disk full on restore")
+
+    monkeypatch.setattr(shutil, "copy2", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        result = _restore_database_safely(local, str(cloud))
+    assert result["action"] == "failed"
+    # And a clear warning logged.
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) >= 1
+    assert "restore" in warnings[0].getMessage().lower()

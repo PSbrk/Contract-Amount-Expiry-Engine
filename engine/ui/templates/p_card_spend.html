@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}P-Card Spend — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>P-Card Spend</h2>
+  <p>
+    <span class="pill">{{ rows|length }} row{{ '' if rows|length == 1 else 's' }} on this tab</span>
+    <span class="pill">${{ "{:,.2f}".format(visible_total) }} visible $</span>
+  </p>
+  <p>
+    <small>
+      Read-only audit of purchasing-card / journal transactions that don't
+      carry a Vendor field in Tableau. These are typically employee
+      corporate-card supply purchases (Lowes, Amazon, Grainger, etc.) and
+      one-off journal entries &mdash; <em>not contracted spend</em>, so
+      there's no Asana task to attribute them to. They live here instead of
+      Needs Tagging so the contract-review queue stays clean.
+      Use <em>Ignore once</em> to clear a row you've eyeballed off the active
+      list (restorable from the Ignored tab).
+    </small>
+  </p>
+  <nav>
+    <ul>
+      <li><a href="{{ url_for('p_card_spend', show='open') }}"
+             {% if show == 'open' %}aria-current="page"{% endif %}>Open ({{ open_count }})</a></li>
+      <li><a href="{{ url_for('p_card_spend', show='ignored') }}"
+             {% if show == 'ignored' %}aria-current="page"{% endif %}>Ignored ({{ ignored_count }})</a></li>
+      <li><a href="{{ url_for('p_card_spend', show='all') }}"
+             {% if show == 'all' %}aria-current="page"{% endif %}>All</a></li>
+    </ul>
+  </nav>
+</header>
+
+{% if rows %}
+<figure>
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Group</th>
+      <th class="num">$</th>
+      <th>Dates</th>
+      <th>Sample description</th>
+      <th style="min-width: 12rem;">Action</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    {% set ignored = (r["P-Card Ignored"] or 0) == 1 %}
+    <tr style="{{ 'opacity: 0.55;' if ignored else '' }}">
+      <td>
+        <strong>{{ r["Campus"] or "" }}</strong> &middot;
+        {{ r["Dept"] or "" }} &middot; acct {{ r["Account No"] or "" }}
+        {% if ignored %}<span class="pill">ignored</span>{% endif %}
+      </td>
+      <td class="num">${{ "{:,.2f}".format(r["$ in group"] or 0) }}</td>
+      <td>
+        <small>
+          {% if r["First Date"] and r["Last Date"] and r["First Date"] != r["Last Date"] %}
+            {{ r["First Date"] }}<br>&hellip; {{ r["Last Date"] }}
+          {% elif r["First Date"] or r["Last Date"] %}
+            {{ r["First Date"] or r["Last Date"] }}
+          {% else %}
+            <span class="alarm-off">&mdash;</span>
+          {% endif %}
+        </small>
+      </td>
+      <td><small>{{ (r["Sample Record Description"] or "")[:160] }}</small></td>
+      <td>
+        {% if ignored %}
+          <form method="post"
+                action="{{ url_for('p_card_spend_restore', record_id=r['id']) }}"
+                style="margin: 0;">
+            <button type="submit" class="secondary" style="margin: 0;">Restore</button>
+          </form>
+        {% else %}
+          <form method="post"
+                action="{{ url_for('p_card_spend_ignore_once', record_id=r['id']) }}"
+                style="margin: 0;">
+            <button type="submit" class="secondary outline" style="margin: 0; font-size: 0.85rem;">
+              Ignore once
+            </button>
+          </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% else %}
+  {% if show == 'ignored' %}
+    <p>No ignored rows. Anything you ignore from the Open tab will appear here.</p>
+  {% else %}
+    <p>No P-Card rows on this tab. Blank-vendor non-Bill rows from the next ingest will show up here.</p>
+  {% endif %}
+{% endif %}
+{% endblock %}

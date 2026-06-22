@@ -82,6 +82,10 @@ class DashboardRow:
     status: str | None
     pm_email: str | None
     last_updated: date
+    # Operator-authored description of what the contract covers. Carried
+    # through from Asana so the Vendor Conflicts UI can show it alongside
+    # the Tableau Record Description for operator comparison.
+    contract_reason_text: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -164,29 +168,43 @@ def annotate_with_contract(
     in_scope_df: pd.DataFrame,
     run: AttributionRun,
 ) -> pd.DataFrame:
-    """Return a copy of in_scope_df with a "_contract_name" column joined
-    in from the attribution run. Rows in groups that are ambiguous /
-    unmatched / dropped get _contract_name = None.
+    """Return a copy of in_scope_df with a "_contract_gid" column taken
+    POSITIONALLY from the attribution run's per-row gid tuple. Rows whose
+    group couldn't be attributed cleanly (ambiguous / unmatched / dropped)
+    get _contract_gid = None.
+
+    run.row_gids is aligned by POSITION to the SAME in_scope df the engine
+    passed to attribution.attribute() — not joined by Record No, which is
+    NOT unique in the Tableau export (multi-line invoices, charge+reversal
+    pairs). A positional take is exact and can't collapse duplicate rows or
+    drop blank-Record-No rows.
+
+    GID is used (not contract name) because multiple open Asana tasks can
+    share a contract name — when they do, the engine attributes by specific
+    task and compute_spent_in_term filters by that specific task's GID.
 
     Empty input is handled cleanly — a contract list with zero in-scope
     rows is a real production case (brand-new contract before any
     transactions land).
     """
-    group_to_contract: dict[tuple[str, str, str, str], str] = {}
-    for r in run.results:
-        if r.status in ("auto", "learned") and r.contract_name:
-            group_to_contract[(r.campus, r.dept, r.account_no, r.vendor)] = r.contract_name
-
     df = in_scope_df.copy()
     if len(df) == 0:
-        df["_contract_name"] = pd.Series([], dtype="object")
+        df["_contract_gid"] = pd.Series([], dtype="object")
         return df
-    df["_contract_name"] = [
-        group_to_contract.get((c, d, a, v))
-        for c, d, a, v in zip(
-            df["Campus"], df["Dept"], df["Account No"], df["Vendor"]
+    gids = list(run.row_gids)
+    if len(gids) != len(df):
+        # Defensive: a length mismatch means the df handed to compute is not
+        # the one attribution ran against. Misaligning gids would silently
+        # misattribute money, so fall back to "no attribution" and log loudly
+        # rather than guess.
+        log.warning(
+            "annotate_with_contract: row_gids length %d != df length %d; "
+            "leaving _contract_gid unset to avoid misattribution.",
+            len(gids), len(df),
         )
-    ]
+        df["_contract_gid"] = pd.Series([None] * len(df), dtype="object", index=df.index)
+        return df
+    df["_contract_gid"] = pd.Series(gids, dtype="object", index=df.index)
     return df
 
 
@@ -196,19 +214,22 @@ def annotate_with_contract(
 
 def compute_spent_in_term(
     annotated_df: pd.DataFrame,
-    contract_name: str,
+    contract_gid: str,
     start: date,
     end: date,
 ) -> float:
-    """Signed sum of attributed rows for `contract_name` whose Date is in
+    """Signed sum of attributed rows for `contract_gid` whose Date is in
     [start, end] inclusive. end should be min(today, due_on).
+
+    Filters by Asana task GID, not contract name — so two open Asana tasks
+    sharing a vendor name each get only their own attributed spend.
 
     Empty DataFrame returns 0.0 — a contract with no attributed rows is a
     real production case."""
     if len(annotated_df) == 0:
         return 0.0
     mask = (
-        (annotated_df["_contract_name"] == contract_name)
+        (annotated_df["_contract_gid"] == contract_gid)
         & (annotated_df["Date"] >= pd.Timestamp(start))
         & (annotated_df["Date"] <= pd.Timestamp(end))
     )
@@ -340,7 +361,7 @@ def compute_dashboard(
         term_days = compute_term_days(start, c.due_on)
         end = c.due_on if c.due_on is not None and c.due_on < today else today
 
-        spent = compute_spent_in_term(annotated, c.name, start, end)
+        spent = compute_spent_in_term(annotated, c.gid, start, end)
         pct_spent = compute_pct_spent(spent, c.contract_amount)
         spending_rate = compute_spending_rate(pct_spent, start, today, term_days)
         band = compute_alarm_band(pct_spent)
@@ -361,6 +382,7 @@ def compute_dashboard(
             status=c.status,
             pm_email=c.pm_email,
             last_updated=today,
+            contract_reason_text=c.contract_reason_text,
         ))
 
     log.info(

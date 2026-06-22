@@ -32,6 +32,12 @@ ASANA_FIELD_EXPIRE_COUNTDOWN: Final = "1213492973877653"  # enum
 ASANA_OPTION_EXPIRE_EXPIRED: Final = "1213492973877658"
 ASANA_FIELD_PM_EMAIL: Final = "1213557820320006"         # text — used by the user's Asana
                                                           # automation rule for per-PM recipients
+# text — operator-authored description of what the contract covers. Used as
+# a tie-breaker when same-vendor multi-task ambiguity survives campus + date
+# + earliest-start narrowing (e.g. one vendor's landscaping vs snow-removal
+# contracts). Compared against Tableau's Record Description via token-set
+# fuzzy match; the candidate with the clearly-best score wins.
+ASANA_FIELD_CONTRACT_REASON_TEXT: Final = "1213527792866809"
 ASANA_FIELD_CREATED_DATE: Final = "1213417707609925"     # date (fallback only; see spec §7)
 
 # Writable custom fields — ONLY these five may have their VALUES written.
@@ -91,6 +97,7 @@ ASANA_EXPECTED_READ_FIELDS: Final = {
         "expected_options": {"EXPIRED!": ASANA_OPTION_EXPIRE_EXPIRED},
     },
     "PM Email": {"gid": ASANA_FIELD_PM_EMAIL, "type": "text"},
+    "Contract Reason Text": {"gid": ASANA_FIELD_CONTRACT_REASON_TEXT, "type": "text"},
     "Created Date": {"gid": ASANA_FIELD_CREATED_DATE, "type": "date"},
 }
 
@@ -117,7 +124,12 @@ ASANA_EXPECTED_WRITE_FIELDS: Final = {
 
 # Account numbers in scope. Strings to preserve any leading zeros and to make
 # membership checks robust against pandas dtype inference.
-ACCOUNTS_IN_SCOPE: Final = frozenset({"63015", "63020", "63040", "63080", "63090"})
+#
+# 63015 (Capital Projects) was REMOVED from scope on 2026-06-16 — those rows
+# represent CapEx that this engine no longer tracks. Tableau exports may
+# still include them; they'll be filtered to the out-of-scope bucket and
+# show up in Run Log's "Rows Out Of Scope" total for visibility.
+ACCOUNTS_IN_SCOPE: Final = frozenset({"63020", "63040", "63080", "63090"})
 
 # Departments in scope. Strings — "000" must keep its zero-padding.
 DEPTS_IN_SCOPE: Final = frozenset({"000", "107"})

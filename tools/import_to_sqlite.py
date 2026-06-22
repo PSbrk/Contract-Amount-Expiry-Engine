@@ -111,12 +111,24 @@ def _import_campus_map(conn, rows: list[dict]) -> dict:
 
 def _import_learned_mappings(conn, rows: list[dict]) -> dict:
     inserted = skipped_dup = skipped_blank = 0
+    # Phase 7c: the Learned Mappings.Key UNIQUE index is removed (multiple
+    # pattern-specific LMs per Key are allowed). Dedup is now application-
+    # side, keyed on (Key, Description Pattern) to mirror the application's
+    # composite-uniqueness invariant. Build the existing set up front so
+    # repeated imports against an already-populated DB stay idempotent.
+    existing: set[tuple[str, str]] = {
+        (r["Key"], r["Description Pattern"] or "")
+        for r in conn.execute(
+            'SELECT "Key", "Description Pattern" FROM "Learned Mappings"'
+        ).fetchall()
+    }
     for row in rows:
         campus = (row.get("Campus") or "").strip()
         dept = (row.get("Dept") or "").strip()
         account_no = (row.get("Account No") or "").strip()
         vendor = (row.get("Vendor") or "").strip()
         contract_name = (row.get("Contract Name") or "").strip()
+        pattern = (row.get("Description Pattern") or "").strip()
         if not contract_name or not all((campus, dept, account_no, vendor)):
             # Same skip semantics as the pre-migration loader (legacy
             # airtable_client.load_learned_mappings) -- a partial row would
@@ -128,21 +140,23 @@ def _import_learned_mappings(conn, rows: list[dict]) -> dict:
         # from the Airtable export is intentionally ignored so the format
         # is guaranteed canonical.
         key = f"{campus}|{dept}|{account_no}|{vendor}"
-        try:
-            sqlite_client.insert_learned_mapping(
-                conn,
-                key=key,
-                campus=campus,
-                dept=dept,
-                account_no=account_no,
-                vendor=vendor,
-                contract_name=contract_name,
-                learned_at=row.get("Learned At", "") or "",
-                notes=row.get("Notes", "") or "",
-            )
-            inserted += 1
-        except sqlite3.IntegrityError:
+        dedup_key = (key, pattern)
+        if dedup_key in existing:
             skipped_dup += 1
+            continue
+        sqlite_client.insert_learned_mapping(
+            conn,
+            key=key,
+            campus=campus,
+            dept=dept,
+            account_no=account_no,
+            vendor=vendor,
+            contract_name=contract_name,
+            learned_at=row.get("Learned At", "") or "",
+            notes=row.get("Notes", "") or "",
+        )
+        existing.add(dedup_key)
+        inserted += 1
     return {"inserted": inserted, "skipped_dup": skipped_dup, "skipped_blank": skipped_blank}
 
 

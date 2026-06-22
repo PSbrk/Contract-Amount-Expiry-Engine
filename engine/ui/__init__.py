@@ -23,7 +23,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from flask import Flask, g
+from flask import Flask, g, request
 
 from engine import sqlite_client
 
@@ -66,6 +66,27 @@ def create_app(
     def _close_conn(_exc) -> None:
         if getattr(g, "conn_owned", False) and getattr(g, "conn", None) is not None:
             g.conn.close()
+
+    @app.after_request
+    def _backup_on_mutation(response):
+        # #4: the UI writes operator decisions to the LOCAL engine.db between
+        # ingests. Mirror them to OneDrive after each successful mutating
+        # request so a later cloud-newer restore can't silently discard them.
+        # Best-effort only — a backup failure never breaks the response.
+        try:
+            if (
+                request.method == "POST"
+                and response.status_code < 400
+                and app.config.get("ENGINE_DB_PATH")
+                and app.config.get("ENGINE_INJECTED_CONN") is None
+            ):
+                from config import settings
+                sqlite_client.backup_database_safely(
+                    app.config["ENGINE_DB_PATH"], settings.ONEDRIVE_BACKUP_PATH,
+                )
+        except Exception:  # noqa: BLE001 — never break a response on backup
+            pass
+        return response
 
     from engine.ui.routes import register_routes
     register_routes(app)

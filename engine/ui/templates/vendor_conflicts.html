@@ -1,0 +1,276 @@
+{% extends "base.html" %}
+{% block title %}Vendor Conflicts — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>Vendor Conflicts</h2>
+  <p>
+    <span class="pill">{{ conflicts|length }} unresolved{{ '' if conflicts|length == 1 else '' }}</span>
+  </p>
+  <p>
+    <small>
+      These are Needs Tagging groups where the engine matched the vendor to
+      <strong>more than one</strong> open Asana task and couldn't decide
+      between them automatically (typically same name + same campus +
+      overlapping terms, or two contracts identical on every narrow). Pick
+      which specific task this group belongs to. The choice is stored as a
+      <em>gid-pinned Learned Mapping</em>, so future runs go straight to
+      the task you picked.
+    </small>
+  </p>
+</header>
+
+{% if conflicts %}
+{% for c in conflicts %}
+  {% set nt = c.nt %}
+  <article style="margin-bottom: 2rem;">
+    <header>
+      <strong>{{ nt['Vendor'] }}</strong>
+      <span class="pill">{{ nt['Campus'] }}</span>
+      <span class="pill">Acct {{ nt['Account No'] }}</span>
+      <span class="pill">Dept {{ nt['Dept'] }}</span>
+      <span class="pill">${{ '%.2f'|format(nt['$ in group'] or 0) }} across {{ nt['Last Date'] and (nt['First Date'] ~ ' → ' ~ nt['Last Date']) or '?' }}</span>
+    </header>
+
+    <div style="background: var(--pico-card-background-color); border-left: 3px solid var(--pico-primary); padding: 0.5rem 0.8rem; margin: 0.6rem 0;">
+      <div style="font-size: 0.75rem; text-transform: uppercase; color: var(--pico-muted-color); letter-spacing: 0.04em;">Tableau Record Description (sample)</div>
+      <div style="font-style: italic;">{{ nt['Sample Record Description'] or '(no sample description on this group)' }}</div>
+    </div>
+
+    <h4 style="margin-top: 1rem; margin-bottom: 0.4rem;">Candidate Asana tasks</h4>
+    <table>
+      <thead>
+        <tr>
+          <th style="width: 28%;">Asana Task</th>
+          <th>Asana Contract Reason Text</th>
+          <th>Term &amp; Budget</th>
+          <th style="width: 9rem;">Pin whole group</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for cand in c.candidates %}
+        <tr>
+          <td>
+            <strong>{{ cand['Contract'] }}</strong><br>
+            <span class="pill">{{ cand['Campus Set'] }}</span><br>
+            <small style="color: var(--pico-muted-color);">gid <code>{{ cand['Asana Task GID'] }}</code></small>
+          </td>
+          <td style="vertical-align: top;">
+            {% if cand['Contract Reason Text'] %}
+              <span style="font-style: italic;">{{ cand['Contract Reason Text'] }}</span>
+            {% else %}
+              <span style="color: var(--pico-muted-color);">(empty — add a Contract Reason Text in Asana to help the engine auto-resolve this in future)</span>
+            {% endif %}
+          </td>
+          <td style="vertical-align: top; white-space: nowrap;">
+            <small>{{ cand['Start'] or '?' }} → {{ cand['Due'] or '?' }}</small><br>
+            <small>amt ${{ '%.2f'|format(cand['Contract Amount'] or 0) }}</small><br>
+            <small>spent ${{ '%.2f'|format(cand['Spent so far'] or 0) }}</small>
+          </td>
+          <td style="vertical-align: top;">
+            <form method="post"
+                  action="{{ url_for('vendor_conflicts_assign', record_id=nt['id']) }}"
+                  style="margin: 0;">
+              <input type="hidden" name="contract_gid" value="{{ cand['Asana Task GID'] }}">
+              <input type="hidden" name="contract_name" value="{{ cand['Contract'] }}">
+              <button type="submit" class="contrast" style="margin: 0; padding: 0.2rem 0.6rem;">
+                Pin this task
+              </button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% if c.distinct_descriptions %}
+    <h4 style="margin-top: 1.2rem; margin-bottom: 0.4rem;">
+      Or pick per Tableau Record Description
+      <small style="font-weight: normal; color: var(--pico-muted-color);">
+        ({{ c.distinct_descriptions|length }} distinct description{{ '' if c.distinct_descriptions|length == 1 else 's' }} in this group)
+      </small>
+    </h4>
+    <p><small style="color: var(--pico-muted-color);">
+      When the candidate tasks cover different work (e.g. landscaping vs snow removal),
+      pick the right task per description. Each pick becomes a description-pattern
+      Learned Mapping so future runs auto-attribute matching rows. Descriptions left
+      on &laquo;skip&raquo; will stay ambiguous until you come back.
+    </small></p>
+    <form method="post"
+          action="{{ url_for('vendor_conflicts_assign_by_description', record_id=nt['id']) }}">
+      <table class="per-desc-picker">
+        <thead>
+          <tr>
+            <th>Tableau Record Description</th>
+            <th style="width: 5rem; text-align: right;">Rows</th>
+            <th style="width: 8rem; text-align: right;">Amount</th>
+            <th style="width: 24rem;">Assign to</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for d in c.distinct_descriptions %}
+          {% set idx = loop.index0 %}
+          <tr>
+            <td style="vertical-align: top; padding: 0.7rem 0.6rem;">
+              <input type="hidden" name="desc_{{ idx }}" value="{{ d.description }}">
+              {% if d.description %}
+                <span style="font-style: italic;">{{ d.description }}</span>
+              {% else %}
+                <span style="color: var(--pico-muted-color);">(no description)</span>
+              {% endif %}
+              {# Phase 13: date range of the transactions in this description #}
+              {# bucket. Lets the operator eyeball whether each candidate's    #}
+              {# Term & Budget row could legitimately contain these dates.    #}
+              {% if d.min_date or d.max_date %}
+                <div style="margin-top: 0.3rem; font-size: 0.78rem; color: var(--pico-muted-color);">
+                  txn dates: {{ d.min_date or '?' }} → {{ d.max_date or '?' }}
+                </div>
+              {% endif %}
+            </td>
+            <td style="text-align: right; vertical-align: top; padding: 0.7rem 0.6rem;"><small>{{ d.rows }}</small></td>
+            <td style="text-align: right; vertical-align: top; padding: 0.7rem 0.6rem;"><small>${{ '%.2f'|format(d.amount or 0) }}</small></td>
+            <td style="vertical-align: top; padding: 0.7rem 0.6rem;">
+              {# Phase 13: date_compat_by_gid is a {gid: bool} map -- True   #}
+              {# when the candidate's [Start, Due] overlaps this bucket's    #}
+              {# [min_date, max_date]. We never hide incompatible options    #}
+              {# (operator may have context the engine doesn't), but we      #}
+              {# mark them with a unicode warning so the picker is honest    #}
+              {# about why the auto-suggest skipped them.                    #}
+              {% set compat_map = d.date_compat_by_gid or {} %}
+              <select name="gid_{{ idx }}"
+                      onchange="this.form.elements['name_{{ idx }}'].value = this.options[this.selectedIndex].dataset.name || '';"
+                      style="margin: 0; padding: 0.3rem 0.5rem; width: 100%;">
+                <option value=""{% if not d.suggested_gid %} selected{% endif %}>— skip —</option>
+                {% for cand in c.candidates %}
+                  {% set cand_compat = compat_map.get(cand['Asana Task GID'], true) %}
+                  <option value="{{ cand['Asana Task GID'] }}"
+                          data-name="{{ cand['Contract'] }}"
+                          {% if d.suggested_gid == cand['Asana Task GID'] %}selected{% endif %}>
+                    {{ cand['Contract'] }} ({{ cand['Campus Set'] }}, {{ cand['Start'] or '?' }}){% if not cand_compat %}  ⚠ outside term{% endif %}
+                  </option>
+                {% endfor %}
+                {# Phase 14b: sentinel option lets the operator mark a       #}
+                {# bucket as pre-dating any Asana contract for this vendor.  #}
+                {# Submitting it removes the bucket from this Needs Tagging  #}
+                {# row's JSON for THIS ingest only; no Learned Mapping is    #}
+                {# written, so the bucket re-surfaces next ingest if the     #}
+                {# same out-of-term transactions are still in the source.    #}
+                <option value="__PRE_DATES__" data-name="(Pre-dates Asana Record)">
+                  Unassigned — Pre-dates Asana Record
+                </option>
+              </select>
+              <input type="hidden" name="name_{{ idx }}"
+                     value="{% if d.suggested_gid %}{% for cand in c.candidates %}{% if cand['Asana Task GID'] == d.suggested_gid %}{{ cand['Contract'] }}{% endif %}{% endfor %}{% endif %}">
+              {% if d.suggested_gid %}
+                <div style="display: block; margin-top: 0.4rem; font-size: 0.8rem; line-height: 1.3; color: var(--pico-muted-color);">
+                  auto-matched by description ↔ reason text<br>
+                  &mdash; review &amp; submit
+                </div>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <button type="submit" class="contrast"
+              style="margin-top: 0.6rem; padding: 0.3rem 0.8rem;">
+        Save description-pattern picks
+      </button>
+    </form>
+
+    {# Phase 14c: bulk-mark every bucket whose ALL candidates are date-     #}
+    {# incompatible as Pre-dates. Saves the operator from clicking each    #}
+    {# dropdown one at a time when a whole group is out of term. The flag  #}
+    {# is computed in the route (has_all_out_of_term_bucket) because       #}
+    {# Jinja {% set %} inside {% for %} doesn't propagate out.             #}
+    {% if c.has_all_out_of_term_bucket %}
+    <form method="post"
+          action="{{ url_for('vendor_conflicts_mark_all_out_of_term_as_pre_dates', record_id=nt['id']) }}"
+          style="margin-top: 0.6rem;">
+      <button type="submit" class="secondary outline"
+              style="margin: 0; padding: 0.3rem 0.8rem;"
+              onclick="return confirm('Mark every bucket whose candidates are all outside their term as Pre-dates Asana Record?\n\nThis is one-shot for this ingest -- no Learned Mapping is written, so buckets re-surface next ingest if still out of term.');">
+        ⚠ Mark all out-of-term as Pre-dates (this group)
+      </button>
+    </form>
+    {% endif %}
+    {% endif %}
+
+    <h4 style="margin-top: 1.2rem; margin-bottom: 0.4rem;">
+      Or none of these match
+    </h4>
+    <p><small style="color: var(--pico-muted-color);">
+      Use this when the payment is for a campus / scope that <em>none</em>
+      of the candidate Asana tasks cover (e.g. the engine matched the
+      vendor but the payment is for TUL while every candidate is for
+      CEN/BAO/OKC). The row will leave Vendor Conflicts but <strong>stay
+      in Needs Tagging Open</strong> — resolve it there with
+      <em>Assign Contract</em> by typing the actual contract name.
+    </small></p>
+    <form method="post"
+          action="{{ url_for('vendor_conflicts_mark_other', record_id=nt['id']) }}"
+          style="margin-bottom: 0.6rem;">
+      <button type="submit" class="secondary outline"
+              style="margin: 0; padding: 0.3rem 0.8rem;">
+        Other — handle via Needs Tagging
+      </button>
+    </form>
+
+    {% if c.candidates|length == 2 %}
+    <h4 style="margin-top: 1.2rem; margin-bottom: 0.4rem;">
+      Or mark amendment relationship
+    </h4>
+    <p><small style="color: var(--pico-muted-color);">
+      Use this when the two candidates are actually the <strong>same</strong>
+      ongoing commitment (e.g. an amendment that added budget to a prior
+      contract). Transactions will route to the <em>parent</em>; the Dashboard
+      will show both rows with a cross-reference so you can read the
+      combined budget &amp; combined spend at a glance.
+    </small></p>
+    <form method="post"
+          action="{{ url_for('vendor_conflicts_mark_amendment', record_id=nt['id']) }}"
+          style="margin-bottom: 0.6rem;">
+      <div style="display: flex; gap: 0.6rem; align-items: end; flex-wrap: wrap;">
+        <label style="margin: 0;">
+          <small>Parent contract</small>
+          <select name="parent_gid"
+                  onchange="this.form.elements['parent_name'].value = this.options[this.selectedIndex].dataset.name || '';"
+                  style="margin: 0; padding: 0.2rem 0.4rem;">
+            <option value="">— pick parent —</option>
+            {% for cand in c.candidates %}
+              <option value="{{ cand['Asana Task GID'] }}"
+                      data-name="{{ cand['Contract'] }}">
+                {{ cand['Contract'] }} (${{ '%.2f'|format(cand['Contract Amount'] or 0) }})
+              </option>
+            {% endfor %}
+          </select>
+          <input type="hidden" name="parent_name" value="">
+        </label>
+        <label style="margin: 0;">
+          <small>Amendment task</small>
+          <select name="amendment_gid"
+                  onchange="this.form.elements['amendment_name'].value = this.options[this.selectedIndex].dataset.name || '';"
+                  style="margin: 0; padding: 0.2rem 0.4rem;">
+            <option value="">— pick amendment —</option>
+            {% for cand in c.candidates %}
+              <option value="{{ cand['Asana Task GID'] }}"
+                      data-name="{{ cand['Contract'] }}">
+                {{ cand['Contract'] }} (${{ '%.2f'|format(cand['Contract Amount'] or 0) }})
+              </option>
+            {% endfor %}
+          </select>
+          <input type="hidden" name="amendment_name" value="">
+        </label>
+        <button type="submit" class="contrast outline"
+                style="margin: 0; padding: 0.3rem 0.8rem;">
+          Link as amendment
+        </button>
+      </div>
+    </form>
+    {% endif %}
+  </article>
+{% endfor %}
+{% else %}
+<p><em>Nothing to resolve right now — every ambiguous group is either
+auto-resolved or staged in Needs Tagging.</em></p>
+{% endif %}
+{% endblock %}

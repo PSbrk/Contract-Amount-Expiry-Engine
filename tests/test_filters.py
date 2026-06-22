@@ -21,7 +21,9 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "transactions_sample.ts
 def test_in_scope_count_matches_fixture():
     df = parse_tableau_export(FIXTURE)
     kept = in_scope(df)
-    assert len(kept) == 5
+    # 4 in-scope rows: R002 (63020), R003 (63040), R004 (63080), R005 (63090).
+    # R001 (63015) MOVED to out-of-scope on 2026-06-16 when CapEx was dropped.
+    assert len(kept) == 4
     # Every kept row must satisfy BOTH filters.
     assert kept["Account No"].isin(settings.ACCOUNTS_IN_SCOPE).all()
     assert kept["Dept"].isin(settings.DEPTS_IN_SCOPE).all()
@@ -30,21 +32,22 @@ def test_in_scope_count_matches_fixture():
 def test_in_scope_signed_sum_matches_fixture():
     df = parse_tableau_export(FIXTURE)
     kept = in_scope(df)
-    # 1000 + 2500 + 750 - 250 + 3000 = 7000.
-    assert signed_sum(kept) == pytest.approx(7000.00)
+    # 2500 + 750 - 250 + 3000 = 6000 (R001 dropped after CapEx removed).
+    assert signed_sum(kept) == pytest.approx(6000.00)
 
 
 def test_out_of_scope_count_matches_fixture():
     df = parse_tableau_export(FIXTURE)
     rejected = out_of_scope(df)
-    assert len(rejected) == 10
+    # 10 originally + R001 (63015 / now out by account) = 11.
+    assert len(rejected) == 11
 
 
 def test_out_of_scope_signed_sum_matches_fixture():
     df = parse_tableau_export(FIXTURE)
     rejected = out_of_scope(df)
-    # 500 + 800 + 1200 + 400 + 600 - 150 + 250 + 900 - 1000 + 0 = 3500.
-    assert signed_sum(rejected) == pytest.approx(3500.00)
+    # 500 + 800 + 1200 + 400 + 600 - 150 + 250 + 900 - 1000 + 0 + 1000 (R001) = 4500.
+    assert signed_sum(rejected) == pytest.approx(4500.00)
 
 
 def test_in_and_out_partition_perfectly():
@@ -76,7 +79,8 @@ def test_is_in_scope_mask_shape_and_count():
     mask = is_in_scope_mask(df)
     assert len(mask) == len(df)
     assert mask.dtype == bool
-    assert mask.sum() == 5
+    # 4 in-scope after CapEx (63015) was removed from ACCOUNTS_IN_SCOPE.
+    assert mask.sum() == 4
 
 
 def test_credits_keep_negative_sign_through_filter():

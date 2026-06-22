@@ -22,6 +22,7 @@ from engine.sqlite_client import (
     cleanup_stale_needs_tagging,
     ensure_schema,
     set_needs_tagging_dismissed,
+    set_needs_tagging_once_off,
     upsert_needs_tagging_group,
 )
 from engine.ui import create_app
@@ -300,3 +301,217 @@ def test_post_dismiss_preserves_assign_contract_and_notes(conn, client):
     row = _all_nt(conn)[0]
     assert row["Dismissed"] == 1
     assert row["Assign Contract"] == "Acme SaaS"
+
+
+# ---------------------------------------------------------------------------
+# Once Off — third state alongside Open and Dismissed
+# ---------------------------------------------------------------------------
+
+def test_set_once_off_snapshots_last_date_as_anchor(conn):
+    """Marking a row as Once Off captures the row's CURRENT Last Date as
+    the anchor — that's what the next ingest compares against to decide
+    whether to re-surface."""
+    upsert_needs_tagging_group(
+        conn,
+        group_key="CEN|000|63080|OneOffVendor",
+        campus="CEN", dept="000", account_no="63080", vendor="OneOffVendor",
+        sample_description="x", amount=500.0, candidate_names=[],
+        created_at_iso_date="2026-06-15",
+        first_date="2025-04-01", last_date="2025-04-01",
+    )
+    rec_id = _all_nt(conn)[0]["id"]
+    set_needs_tagging_once_off(conn, record_id=rec_id, once_off=True)
+
+    row = _all_nt(conn)[0]
+    assert row["Once Off"] == 1
+    assert row["Once Off Anchor"] == "2025-04-01"
+
+
+def test_unmark_once_off_clears_anchor(conn):
+    upsert_needs_tagging_group(
+        conn,
+        group_key="CEN|000|63080|OneOffVendor",
+        campus="CEN", dept="000", account_no="63080", vendor="OneOffVendor",
+        sample_description="x", amount=500.0, candidate_names=[],
+        created_at_iso_date="2026-06-15",
+        first_date="2025-04-01", last_date="2025-04-01",
+    )
+    rec_id = _all_nt(conn)[0]["id"]
+    set_needs_tagging_once_off(conn, record_id=rec_id, once_off=True)
+    set_needs_tagging_once_off(conn, record_id=rec_id, once_off=False)
+
+    row = _all_nt(conn)[0]
+    assert row["Once Off"] == 0
+    assert row["Once Off Anchor"] is None
+
+
+def test_upsert_is_noop_when_once_off_and_no_new_activity(conn):
+    """Once Off snoozes the row. Subsequent --ingest runs that bring no
+    NEW transactions (Last Date unchanged from the anchor) must NOT
+    refresh the row -- the operator's snapshot of state-at-marking stays."""
+    upsert_needs_tagging_group(
+        conn,
+        group_key="CEN|000|63080|OneOffVendor",
+        campus="CEN", dept="000", account_no="63080", vendor="OneOffVendor",
+        sample_description="ORIGINAL sample", amount=500.0,
+        candidate_names=["X"], created_at_iso_date="2026-06-15",
+        first_date="2025-04-01", last_date="2025-04-01",
+    )
+    rec_id = _all_nt(conn)[0]["id"]
+    set_needs_tagging_once_off(conn, record_id=rec_id, once_off=True)
+
+    # Re-ingest with the SAME Last Date — no new activity.
+    upsert_needs_tagging_group(
+        conn,
+        group_key="CEN|000|63080|OneOffVendor",
+        campus="CEN", dept="000", account_no="63080", vendor="OneOffVendor",
+        sample_description="DIFFERENT sample", amount=9999.99,
+        candidate_names=["Y"], created_at_iso_date="2026-06-15",
+        first_date="2025-04-01", last_date="2025-04-01",
+    )
+    row = _all_nt(conn)[0]
+    assert row["Once Off"] == 1
+    assert row["Once Off Anchor"] == "2025-04-01"
+    assert row["Sample Record Description"] == "ORIGINAL sample"
+    assert row["$ in group"] == 500.0
+
+
+def test_upsert_resurfaces_once_off_when_new_activity_arrives(conn):
+    """If a future export has transactions DATED AFTER the anchor, the
+    once-off flag clears and the row resurfaces with fresh aggregates."""
+    upsert_needs_tagging_group(
+        conn,
+        group_key="CEN|000|63080|OneOffVendor",
+        campus="CEN", dept="000", account_no="63080", vendor="OneOffVendor",
+        sample_description="snapshot", amount=500.0, candidate_names=["X"],
+        created_at_iso_date="2026-06-15",
+        first_date="2025-04-01", last_date="2025-04-01",
+    )
+    rec_id = _all_nt(conn)[0]["id"]
+    set_needs_tagging_once_off(conn, record_id=rec_id, once_off=True)
+
+    # Next ingest — a new row dated AFTER the anchor pulls the group back.
+    upsert_needs_tagging_group(
+        conn,
+        group_key="CEN|000|63080|OneOffVendor",
+        campus="CEN", dept="000", account_no="63080", vendor="OneOffVendor",
+        sample_description="new activity!", amount=1500.0, candidate_names=["Y"],
+        created_at_iso_date="2026-09-01",
+        first_date="2025-04-01", last_date="2026-08-15",
+    )
+    row = _all_nt(conn)[0]
+    assert row["Once Off"] == 0
+    assert row["Once Off Anchor"] is None
+    assert row["Sample Record Description"] == "new activity!"
+    assert row["Last Date"] == "2026-08-15"
+
+
+def test_upsert_resurfaces_once_off_with_empty_anchor_when_dates_arrive(conn):
+    """#10: a group parked Once Off while it had NO parsable dates stores an
+    EMPTY anchor. When a later export brings real dated activity, the group
+    must resurface — an empty anchor previously made the resurface guard
+    falsy, suppressing the row forever."""
+    upsert_needs_tagging_group(
+        conn,
+        group_key="CEN|000|63080|NoDateVendor",
+        campus="CEN", dept="000", account_no="63080", vendor="NoDateVendor",
+        sample_description="undated snapshot", amount=500.0,
+        candidate_names=["X"], created_at_iso_date="2026-06-15",
+        first_date="", last_date="",  # no parsable dates at mark time
+    )
+    rec_id = _all_nt(conn)[0]["id"]
+    set_needs_tagging_once_off(conn, record_id=rec_id, once_off=True)
+    # Anchor was captured as empty.
+    assert (_all_nt(conn)[0]["Once Off Anchor"] or "") == ""
+
+    # Later export brings real dated activity.
+    upsert_needs_tagging_group(
+        conn,
+        group_key="CEN|000|63080|NoDateVendor",
+        campus="CEN", dept="000", account_no="63080", vendor="NoDateVendor",
+        sample_description="now it has dates", amount=1500.0,
+        candidate_names=["Y"], created_at_iso_date="2026-09-01",
+        first_date="2026-08-01", last_date="2026-08-15",
+    )
+    row = _all_nt(conn)[0]
+    assert row["Once Off"] == 0
+    assert row["Once Off Anchor"] is None
+    assert row["Sample Record Description"] == "now it has dates"
+
+
+def test_cleanup_stale_skips_once_off_rows(conn):
+    """Once Off rows are NEVER deleted by cleanup_stale — the anchor would
+    be lost and the re-surface logic would break."""
+    upsert_needs_tagging_group(
+        conn,
+        group_key="CEN|000|63080|OneOffVendor",
+        campus="CEN", dept="000", account_no="63080", vendor="OneOffVendor",
+        sample_description="x", amount=10.0, candidate_names=[],
+        created_at_iso_date="2026-06-15",
+        first_date="2025-04-01", last_date="2025-04-01",
+    )
+    rec_id = _all_nt(conn)[0]["id"]
+    set_needs_tagging_once_off(conn, record_id=rec_id, once_off=True)
+
+    deleted = cleanup_stale_needs_tagging(conn, live_group_keys=set())
+    assert deleted == 0
+    assert len(_all_nt(conn)) == 1
+
+
+def test_post_mark_once_off_writes_flag_and_anchor(client, conn):
+    rec_id = _seed_nt(conn, "CEN|000|63080|TargetVendor")
+    # Refresh the row's Last Date so the anchor isn't blank.
+    conn.execute(
+        'UPDATE "Needs Tagging" SET "Last Date" = ? WHERE id = ?',
+        ("2025-11-22", rec_id),
+    )
+    conn.commit()
+
+    resp = client.post(f"/needs-tagging/{rec_id}/mark-once-off")
+    assert resp.status_code == 302
+    row = _all_nt(conn)[0]
+    assert row["Once Off"] == 1
+    assert row["Once Off Anchor"] == "2025-11-22"
+
+
+def test_post_unmark_once_off_clears_flag_and_anchor(client, conn):
+    rec_id = _seed_nt(conn, "CEN|000|63080|TargetVendor")
+    conn.execute(
+        'UPDATE "Needs Tagging" SET "Last Date" = ? WHERE id = ?',
+        ("2025-11-22", rec_id),
+    )
+    conn.commit()
+    client.post(f"/needs-tagging/{rec_id}/mark-once-off")
+
+    resp = client.post(f"/needs-tagging/{rec_id}/unmark-once-off")
+    assert resp.status_code == 302
+    row = _all_nt(conn)[0]
+    assert row["Once Off"] == 0
+    assert row["Once Off Anchor"] is None
+
+
+def test_post_mark_once_off_404s_for_unknown_id(client):
+    resp = client.post("/needs-tagging/9999/mark-once-off")
+    assert resp.status_code == 404
+
+
+def test_get_needs_tagging_once_off_view_shows_only_once_off(conn, client):
+    _seed_nt(conn, "CEN|000|63080|OpenVendor")
+    once_id = _seed_nt(conn, "CEN|000|63080|OnceOffVendor")
+    set_needs_tagging_once_off(conn, record_id=once_id, once_off=True)
+
+    body = client.get("/needs-tagging?show=once_off").get_data(as_text=True)
+    assert "OnceOffVendor" in body
+    assert "OpenVendor" not in body
+
+
+def test_get_needs_tagging_open_view_hides_once_off(conn, client):
+    _seed_nt(conn, "CEN|000|63080|OpenVendor")
+    once_id = _seed_nt(conn, "CEN|000|63080|OnceOffVendor")
+    set_needs_tagging_once_off(conn, record_id=once_id, once_off=True)
+
+    body = client.get("/needs-tagging").get_data(as_text=True)
+    assert "OpenVendor" in body
+    assert "OnceOffVendor" not in body
+    # The header chip should announce that once-off rows are hidden.
+    assert "1 once-off (hidden)" in body

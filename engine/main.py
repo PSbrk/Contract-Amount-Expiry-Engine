@@ -170,6 +170,41 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging()
     _force_utf8_stdio()
 
+    # Ensure the inbox/processed folders exist before any subcommand runs.
+    # Without this, a brand-new bundle has no data\inbox\ on disk, and the
+    # Bookmarks-doc "Open the inbox folder" link 404s on the operator's
+    # first click (which is the very moment they need to drop a Tableau
+    # export). The ingest path also creates these lazily, but we want them
+    # present from the moment the engine launches, not after first ingest.
+    from pathlib import Path as _Path
+    for _d in (_Path("data") / "inbox", _Path("data") / "processed"):
+        try:
+            _d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Non-fatal — if mkdir fails (e.g. read-only fs), the ingest
+            # path will surface the error with better context.
+            pass
+
+    # Phase 12: pull engine.db from OneDrive if the cloud copy is newer
+    # than local. Runs BEFORE any subcommand so --ui, --ingest, --audit,
+    # etc. all see the latest operator state. Result is cached for the
+    # /settings page to render. Safe / non-failing — a broken backup
+    # never blocks an engine run.
+    global _LAST_RESTORE_RESULT
+    from config import settings
+    from engine import sqlite_client
+    # #4: only --ingest (which re-pushes immediately afterward) may overwrite
+    # an existing local engine.db from the cloud. --ui / --audit / --provision
+    # treat the local DB as authoritative and only pull when it's MISSING, so
+    # unsynced operator decisions made in the UI can't be clobbered by a
+    # mtime-newer cloud copy that doesn't contain them.
+    _LAST_RESTORE_RESULT = _restore_database_safely(
+        sqlite_client.DEFAULT_DB_PATH, settings.ONEDRIVE_BACKUP_PATH,
+        allow_overwrite=bool(args.ingest),
+    )
+    if _LAST_RESTORE_RESULT["action"] in ("restored", "local_missing_pulled"):
+        log.info(_LAST_RESTORE_RESULT["message"])
+
     if args.audit:
         from engine.audit import main as audit_main
         return audit_main([])
@@ -318,6 +353,217 @@ def _prune_run_log_safely(conn) -> None:
         )
 
 
+# Grace window (seconds) for cloud-vs-local mtime comparison. OneDrive
+# rewrites mtime when it syncs and there's small clock drift between
+# machines, so two files modified "the same time" can disagree by a
+# couple of seconds. Anything within this window is treated as in-sync
+# rather than triggering a pull.
+_RESTORE_MTIME_GRACE_SECONDS = 2.0
+
+
+def _restore_database_safely(
+    db_path, backup_path: str | None, *, allow_overwrite: bool = True,
+) -> dict:
+    """Best-effort pull of engine.db from OneDrive on engine startup. The
+    operator-state mirror of _backup_database_safely.
+
+    Pulls the OneDrive copy down to `db_path` ONLY when the cloud mtime is
+    strictly newer than the local mtime (outside the grace window). Never
+    overwrites a local file that's newer -- that case means the operator
+    ran offline and the next ingest will push local up to OneDrive.
+
+    allow_overwrite (#4): when False (the --ui path), an EXISTING local
+    engine.db is NEVER overwritten — only a MISSING one is pulled. The UI
+    writes operator decisions locally between ingests; a scheduled --ingest
+    on another machine can make the cloud copy mtime-newer without containing
+    those local edits, so blindly restoring it would silently discard them.
+    Restores are therefore confined to the --ingest path (which immediately
+    re-pushes), while the UI treats the local DB as authoritative.
+
+    A SIZE GUARD also refuses to overwrite a healthy local DB with a cloud
+    file that is empty or less than half its size — OneDrive Files-On-Demand
+    can leave a fresh-mtime placeholder / truncated stub that would otherwise
+    clobber good data.
+
+    Returns a dict the /settings page can render. Keys:
+      action  -- 'no_backup_path' | 'cloud_missing' | 'local_missing_pulled'
+                 | 'restored' | 'local_newer' | 'in_sync' | 'failed'
+                 | 'skip_ui_local_present' | 'skip_suspect_size'
+      local_mtime, cloud_mtime  -- ISO strings or None
+      message  -- human-readable one-liner
+    """
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    def _mtime_iso(p: Path) -> str | None:
+        if not p.exists():
+            return None
+        return datetime.fromtimestamp(
+            p.stat().st_mtime, tz=timezone.utc,
+        ).isoformat(timespec="seconds")
+
+    if not backup_path:
+        return {
+            "action": "no_backup_path",
+            "local_mtime": _mtime_iso(Path(db_path)),
+            "cloud_mtime": None,
+            "message": (
+                "ONEDRIVE_BACKUP_PATH not set. Engine memory lives only "
+                "in the local data/engine.db; nothing is synced to OneDrive."
+            ),
+        }
+
+    try:
+        import shutil
+        src = Path(backup_path)
+        dest = Path(db_path)
+
+        if not src.exists():
+            return {
+                "action": "cloud_missing",
+                "local_mtime": _mtime_iso(dest),
+                "cloud_mtime": None,
+                "message": (
+                    f"OneDrive backup not found at {src}. Will be created "
+                    f"on the next successful --ingest."
+                ),
+            }
+
+        if not dest.exists():
+            # Even with no local DB to protect, refuse to pull a 0-byte
+            # cloud placeholder (OneDrive Files-On-Demand stub) over nothing
+            # -- a 0-byte engine.db would fail schema bootstrap confusingly.
+            if src.stat().st_size == 0:
+                return {
+                    "action": "skip_suspect_size",
+                    "local_mtime": None,
+                    "cloud_mtime": _mtime_iso(src),
+                    "message": (
+                        f"OneDrive copy at {src} is 0 bytes (likely an "
+                        f"un-hydrated placeholder); not pulling. A fresh "
+                        f"local engine.db will be created instead."
+                    ),
+                }
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            log.info(
+                "Restored engine.db from OneDrive (local was missing): %s -> %s",
+                src, dest,
+            )
+            return {
+                "action": "local_missing_pulled",
+                "local_mtime": _mtime_iso(dest),
+                "cloud_mtime": _mtime_iso(src),
+                "message": (
+                    f"Local engine.db was missing; pulled from OneDrive "
+                    f"({src}). All operator history from previous machines "
+                    f"is now visible."
+                ),
+            }
+
+        src_mtime = src.stat().st_mtime
+        dest_mtime = dest.stat().st_mtime
+        delta = src_mtime - dest_mtime
+
+        if delta > _RESTORE_MTIME_GRACE_SECONDS:
+            # #4: the UI must not overwrite an existing local DB — it may hold
+            # operator decisions made since the last ingest that the cloud
+            # copy doesn't contain. Only --ingest (which re-pushes right
+            # after) restores in place.
+            if not allow_overwrite:
+                return {
+                    "action": "skip_ui_local_present",
+                    "local_mtime": _mtime_iso(dest),
+                    "cloud_mtime": _mtime_iso(src),
+                    "message": (
+                        f"OneDrive copy is {int(delta)}s newer, but a local "
+                        f"engine.db is present and this is a read/UI launch; "
+                        f"not overwriting it. The next --ingest reconciles "
+                        f"and re-pushes."
+                    ),
+                }
+            # Size guard: never clobber a healthy local DB with an empty or
+            # suspiciously-smaller cloud file (placeholder / truncated copy).
+            src_size = src.stat().st_size
+            dest_size = dest.stat().st_size
+            if src_size == 0 or (dest_size > 0 and src_size < dest_size * 0.5):
+                log.warning(
+                    "OneDrive copy is newer but suspiciously small "
+                    "(%d bytes vs local %d); refusing to overwrite local DB.",
+                    src_size, dest_size,
+                )
+                return {
+                    "action": "skip_suspect_size",
+                    "local_mtime": _mtime_iso(dest),
+                    "cloud_mtime": _mtime_iso(src),
+                    "message": (
+                        f"OneDrive copy is newer but only {src_size} bytes "
+                        f"(local is {dest_size}); likely a placeholder or "
+                        f"truncated sync. Kept the local engine.db; the next "
+                        f"--ingest will re-push it."
+                    ),
+                }
+            shutil.copy2(src, dest)
+            log.info(
+                "Restored engine.db from OneDrive (cloud was %.0fs newer "
+                "than local): %s -> %s", delta, src, dest,
+            )
+            return {
+                "action": "restored",
+                "local_mtime": _mtime_iso(dest),
+                "cloud_mtime": _mtime_iso(src),
+                "message": (
+                    f"Pulled engine.db from OneDrive (cloud was "
+                    f"{int(delta)}s newer than local). The previous "
+                    f"operator's session is now visible."
+                ),
+            }
+
+        if -delta > _RESTORE_MTIME_GRACE_SECONDS:
+            return {
+                "action": "local_newer",
+                "local_mtime": _mtime_iso(dest),
+                "cloud_mtime": _mtime_iso(src),
+                "message": (
+                    f"Local engine.db is {int(-delta)}s newer than the "
+                    f"OneDrive backup. Probably you ran offline since "
+                    f"the last sync; the next successful --ingest will "
+                    f"push local up to OneDrive."
+                ),
+            }
+
+        return {
+            "action": "in_sync",
+            "local_mtime": _mtime_iso(dest),
+            "cloud_mtime": _mtime_iso(src),
+            "message": (
+                f"Local and OneDrive copies match (mtime within "
+                f"{int(_RESTORE_MTIME_GRACE_SECONDS)}s). No restore needed."
+            ),
+        }
+
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "OneDrive restore attempt failed (%s: %s). Continuing with "
+            "local data/engine.db -- never fail an engine run on a "
+            "sync failure.",
+            type(exc).__name__, exc,
+        )
+        return {
+            "action": "failed",
+            "local_mtime": _mtime_iso(Path(db_path)),
+            "cloud_mtime": None,
+            "message": f"OneDrive restore failed: {type(exc).__name__}: {exc}",
+        }
+
+
+# Module-level cache of the most recent restore attempt. The Flask
+# /settings route reads it to surface sync state. Set at startup in
+# main(); never reassigned afterward (re-running main() in the same
+# process is not a supported pattern).
+_LAST_RESTORE_RESULT: dict | None = None
+
+
 def _backup_database_safely(db_path, backup_path: str | None) -> None:
     """Best-effort copy of data/engine.db to ONEDRIVE_BACKUP_PATH after a
     successful --ingest. OneDrive's sync client uploads from there, so the
@@ -331,24 +577,13 @@ def _backup_database_safely(db_path, backup_path: str | None) -> None:
     Called on every return-0 path (ok, no_new_data, duplicate) because all
     three can mutate SQLite — promotions drain on no_new_data and duplicate
     too — so skipping them would let OneDrive drift behind operator answers.
-    """
-    if not backup_path:
-        return
-    import shutil
-    from pathlib import Path
 
-    try:
-        src = Path(db_path)
-        dest = Path(backup_path)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
-        log.info("Backed up engine.db to %s", dest)
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "engine.db backup to %s failed (%s: %s). Continuing — the "
-            "local DB remains the source of truth; will retry next run.",
-            backup_path, type(exc).__name__, exc,
-        )
+    Delegates to the shared sqlite_client.backup_database_safely so the
+    --ingest path and the UI after-request hook copy identically.
+    """
+    from engine import sqlite_client
+    if sqlite_client.backup_database_safely(db_path, backup_path):
+        log.info("Backed up engine.db to %s", backup_path)
 
 
 def _build_transaction_source(conn):
@@ -587,6 +822,7 @@ def _run_attribution_and_needs_tagging(
     print(f"  total groups:      {summary['total_groups']:>6}")
     print(f"  auto-attributed:   {summary['auto']:>6}")
     print(f"  learned (operator):{summary['learned']:>6}")
+    print(f"  split (crossover): {summary['split']:>6}")
     print(f"  ambiguous:         {summary['ambiguous']:>6}  (need review)")
     print(f"  unmatched:         {summary['unmatched']:>6}  (need review)")
     print(f"  dropped (INT etc): {summary['dropped']:>6}")
@@ -605,9 +841,12 @@ def _run_attribution_and_needs_tagging(
             sample_description=group.sample_description,
             amount=group.amount,
             candidate_names=list(group.candidate_names),
+            candidate_gids=list(group.candidate_gids),
+            distinct_descriptions=list(group.distinct_descriptions),
             created_at_iso_date=today_iso,
             first_date=group.first_date,
             last_date=group.last_date,
+            out_of_term=group.all_out_of_term,
         )
         upserted += 1
     if upserted:
@@ -783,6 +1022,7 @@ def _run_attribution_and_needs_tagging(
     # Compose the audit-trail strings.
     summary_line = (
         f"auto {summary['auto']}, learned {summary['learned']}, "
+        f"split {summary['split']}, "
         f"ambiguous {summary['ambiguous']}, unmatched {summary['unmatched']}, "
         f"dropped {summary['dropped']}"
     )

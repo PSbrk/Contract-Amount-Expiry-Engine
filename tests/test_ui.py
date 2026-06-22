@@ -470,3 +470,1429 @@ def test_settings_view_shows_grouped_constants_and_env_presence(client, monkeypa
     # Set / not-set markers present.
     assert "set" in body
     assert "not set" in body
+
+
+# ---------------------------------------------------------------------------
+# /vendor-conflicts — Phase 7 review panel for same-vendor multi-task conflicts
+# ---------------------------------------------------------------------------
+
+def test_vendor_conflicts_empty_state(client):
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Vendor Conflicts" in body
+    assert "Nothing to resolve" in body
+
+
+def test_vendor_conflicts_lists_only_multi_candidate_rows(client, conn):
+    """A conflict is only shown when the Needs Tagging row has 2+ candidate
+    gids AND those gids point to actual Dashboard tasks. Single-candidate
+    rows belong to the Needs Tagging tab, not Vendor Conflicts."""
+    # Seed two Dashboard tasks (same vendor, different campuses).
+    _seed_dashboard_row(conn, contract_name="Acme Service",
+                        asana_task_gid="g_old", campus_set="CEN",
+                        start=date(2025, 9, 1), due=date(2026, 9, 1))
+    _seed_dashboard_row(conn, contract_name="Acme Service",
+                        asana_task_gid="g_new", campus_set="CEN",
+                        start=date(2026, 7, 1), due=date(2027, 7, 1))
+    # Conflict row: vendor matched, both gids in candidates.
+    _seed_needs_tagging(
+        conn,
+        group_key="CEN|000|63015|Acme Service",
+        vendor="Acme Service",
+        candidate_names=["Acme Service", "Acme Service"],
+        candidate_gids=["g_old", "g_new"],
+    )
+    # Non-conflict row: only one candidate gid, doesn't belong here.
+    _seed_needs_tagging(
+        conn,
+        group_key="OMH|000|63015|Solo Vendor",
+        vendor="Solo Vendor",
+        candidate_names=["Acme Service"],
+        candidate_gids=["g_old"],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    # The conflict row appears; the single-candidate Solo Vendor row does not.
+    assert "Acme Service" in body
+    assert "Solo Vendor" not in body
+    # Both candidates rendered (both gids appear in the page).
+    assert "g_old" in body
+    assert "g_new" in body
+
+
+def test_vendor_conflicts_assign_writes_learned_mapping_with_gid(client, conn):
+    _seed_dashboard_row(conn, contract_name="Acme Service",
+                        asana_task_gid="g_old", campus_set="CEN")
+    _seed_dashboard_row(conn, contract_name="Acme Service",
+                        asana_task_gid="g_new", campus_set="CEN")
+    rec_id = _seed_needs_tagging(
+        conn,
+        group_key="CEN|000|63015|Acme Service",
+        vendor="Acme Service",
+        candidate_names=["Acme Service", "Acme Service"],
+        candidate_gids=["g_old", "g_new"],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/assign",
+        data={"contract_gid": "g_old", "contract_name": "Acme Service"},
+    )
+    assert resp.status_code == 302
+    # Learned Mapping created with Contract Gid pinned.
+    row = conn.execute(
+        'SELECT * FROM "Learned Mappings" WHERE "Key" = ?',
+        ("CEN|000|63015|Acme Service",),
+    ).fetchone()
+    assert row is not None
+    assert row["Contract Name"] == "Acme Service"
+    assert row["Contract Gid"] == "g_old"
+    # Needs Tagging row was deleted (resolved).
+    nt_remaining = conn.execute(
+        'SELECT COUNT(*) FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()[0]
+    assert nt_remaining == 0
+
+
+def test_vendor_conflicts_assign_rejects_gid_not_in_candidates(client, conn):
+    """Form-tampering guard: the gid posted MUST be one of the engine's
+    candidate gids for this row. Otherwise the panel could be used to pin
+    an arbitrary task gid to the group key."""
+    _seed_dashboard_row(conn, contract_name="Acme Service",
+                        asana_task_gid="g_old", campus_set="CEN")
+    _seed_dashboard_row(conn, contract_name="Acme Service",
+                        asana_task_gid="g_new", campus_set="CEN")
+    rec_id = _seed_needs_tagging(
+        conn,
+        group_key="CEN|000|63015|Acme Service",
+        vendor="Acme Service",
+        candidate_names=["Acme Service", "Acme Service"],
+        candidate_gids=["g_old", "g_new"],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/assign",
+        data={"contract_gid": "g_other_unrelated", "contract_name": "Acme Service"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302
+    # No Learned Mapping written; NT row still in place.
+    assert conn.execute(
+        'SELECT COUNT(*) FROM "Learned Mappings"'
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        'SELECT COUNT(*) FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()[0] == 1
+
+
+def test_vendor_conflicts_assign_404s_for_unknown_record_id(client):
+    resp = client.post(
+        "/vendor-conflicts/99999/assign",
+        data={"contract_gid": "g_x", "contract_name": "X"},
+    )
+    assert resp.status_code == 404
+
+
+def test_vendor_conflicts_shows_asana_reason_and_tableau_description(client, conn):
+    """Operator-facing comparison: render the Tableau Sample Record
+    Description prominently AND each candidate's Asana Contract Reason
+    Text under its name so the operator can see, at a glance, which
+    contract the description matches."""
+    _seed_dashboard_row(
+        conn, contract_name="Oklahoma Chiller Corporation",
+        asana_task_gid="g_pm", campus_set="CEN",
+        contract_reason_text="HVAC preventative maintenance for CEN BAO",
+    )
+    _seed_dashboard_row(
+        conn, contract_name="Oklahoma Chiller Corporation",
+        asana_task_gid="g_coil", campus_set="CEN",
+        contract_reason_text="Replace the leaking evaporator coil for the Studio B unit (#4)",
+    )
+    _seed_needs_tagging(
+        conn, group_key="CEN|000|63040|Oklahoma Chiller Corporation",
+        vendor="Oklahoma Chiller Corporation",
+        sample_description="HVAC repair Studio C 05/01",
+        candidate_names=["Oklahoma Chiller Corporation", "Oklahoma Chiller Corporation"],
+        candidate_gids=["g_pm", "g_coil"],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    # The Tableau description is surfaced for comparison.
+    assert "HVAC repair Studio C 05/01" in body
+    assert "Tableau Record Description" in body
+    # Each candidate's Asana reason text is visible.
+    assert "HVAC preventative maintenance for CEN BAO" in body
+    assert "Replace the leaking evaporator coil for the Studio B unit (#4)" in body
+    assert "Asana Contract Reason Text" in body
+
+
+def test_vendor_conflicts_renders_per_description_picker(client, conn):
+    """When the NT row has Distinct Descriptions JSON, each unique
+    description appears as a row in a per-description picker with one
+    dropdown of the candidate Asana tasks. Each description gets a
+    rows-count and dollar-amount column so the operator sees the impact."""
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw Landscaping",
+        asana_task_gid="g_lawn", campus_set="NCS",
+        contract_reason_text="Landscape services.",
+    )
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw Landscaping Inc",
+        asana_task_gid="g_snow", campus_set="NCS",
+        contract_reason_text="Snow Removal",
+    )
+    _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|Bear Claw Landscaping, Inc",
+        vendor="Bear Claw Landscaping, Inc",
+        sample_description="Groundskeeping 12/2024",
+        candidate_names=["Bear Claw Landscaping", "Bear Claw Landscaping Inc"],
+        candidate_gids=["g_lawn", "g_snow"],
+        distinct_descriptions=[
+            ("Groundskeeping 12/2024", 12, 87000.0),
+            ("Snow Removal 02/2026", 4, 28000.0),
+        ],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    # Picker section is rendered.
+    assert "Or pick per Tableau Record Description" in body
+    assert "Groundskeeping 12/2024" in body
+    assert "Snow Removal 02/2026" in body
+    # Dropdown for each description, with both candidates as options.
+    assert "Bear Claw Landscaping" in body
+    assert "Bear Claw Landscaping Inc" in body
+    # The skip option is present so operator can leave individual rows alone.
+    assert "skip" in body.lower()
+
+
+# ---------------------------------------------------------------------------
+# Phase 13: date-aware auto-suggest in Vendor Conflicts
+# ---------------------------------------------------------------------------
+
+def test_suggest_rejects_date_incompatible_candidate_even_if_text_wins():
+    """Direct unit test: the Bear Claw scenario. Snow text matches the snow
+    candidate's reason text, BUT that candidate's term starts 2025-09-30
+    while the description's transaction dates are March 2025. Auto-suggest
+    must NOT pre-select the date-incompatible candidate."""
+    from engine.ui.routes import _suggest_candidate_per_description
+
+    candidates = [
+        {"Asana Task GID": "g_landscaping",
+         "Contract Reason Text": "NCS landscaping",
+         "Start": "2026-03-31", "Due": "2027-03-31"},
+        {"Asana Task GID": "g_snow",
+         "Contract Reason Text": "Snow Removal",
+         "Start": "2025-09-30", "Due": "2026-09-30"},
+    ]
+    # March 2025 -- before BOTH candidates' terms. Even though text matches
+    # the snow candidate (Snow ↔ Snow Removal), neither can be auto-picked.
+    descriptions = [
+        {"description": "Snow/ice management 03/2025",
+         "rows": 2, "amount": 2500.0,
+         "min_date": "2025-03-01", "max_date": "2025-03-15"},
+    ]
+    out = _suggest_candidate_per_description(descriptions, candidates)
+    assert len(out) == 1
+    assert out[0]["suggested_gid"] is None
+    # And the compat map flags BOTH candidates as out-of-term.
+    compat = out[0]["date_compat_by_gid"]
+    assert compat["g_landscaping"] is False
+    assert compat["g_snow"] is False
+
+
+def test_suggest_picks_date_compatible_candidate():
+    """When the description's dates fall inside ONE candidate's term, that
+    candidate wins -- date compatibility narrows the pool BEFORE Jaccard."""
+    from engine.ui.routes import _suggest_candidate_per_description
+
+    candidates = [
+        {"Asana Task GID": "g_landscaping",
+         "Contract Reason Text": "NCS landscaping monthly",
+         "Start": "2026-03-31", "Due": "2027-03-31"},
+        {"Asana Task GID": "g_snow",
+         "Contract Reason Text": "Snow Removal",
+         "Start": "2025-09-30", "Due": "2026-09-30"},
+    ]
+    # May 2026 -- inside snow's term (ends 2026-09-30) AND inside
+    # landscaping's term (starts 2026-03-31). Text resolves the tie.
+    descriptions = [
+        {"description": "Snow/ice management 05/2026",
+         "rows": 1, "amount": 3720.0,
+         "min_date": "2026-05-15", "max_date": "2026-05-15"},
+    ]
+    out = _suggest_candidate_per_description(descriptions, candidates)
+    assert out[0]["suggested_gid"] == "g_snow"
+    assert out[0]["date_compat_by_gid"]["g_snow"] is True
+    assert out[0]["date_compat_by_gid"]["g_landscaping"] is True
+
+
+def test_suggest_falls_back_to_text_when_dates_missing():
+    """Old Distinct Descriptions JSON rows (written before Phase 13) have
+    no min_date/max_date. The helper degrades to text-only matching rather
+    than rejecting every candidate -- otherwise existing rows would lose
+    their auto-suggestions on the first read after upgrade."""
+    from engine.ui.routes import _suggest_candidate_per_description
+
+    candidates = [
+        {"Asana Task GID": "g_snow",
+         "Contract Reason Text": "Snow Removal",
+         "Start": "2025-09-30", "Due": "2026-09-30"},
+        {"Asana Task GID": "g_landscaping",
+         "Contract Reason Text": "Landscaping monthly",
+         "Start": "2026-03-31", "Due": "2027-03-31"},
+    ]
+    descriptions = [
+        # Note: NO min_date/max_date keys -- legacy shape from before Phase 13.
+        {"description": "Snow/ice management 03/2025", "rows": 2, "amount": 2500.0},
+    ]
+    out = _suggest_candidate_per_description(descriptions, candidates)
+    # With dates missing, every candidate is compat=True so Jaccard alone wins.
+    assert out[0]["suggested_gid"] == "g_snow"
+    assert all(out[0]["date_compat_by_gid"].values())
+
+
+def test_suggest_skips_only_one_when_other_is_in_term():
+    """Hybrid case: one candidate's term fits, the other doesn't. The
+    in-term one is auto-suggested even if the out-of-term one has slightly
+    better text overlap -- date is a HARD filter, not a tiebreak."""
+    from engine.ui.routes import _suggest_candidate_per_description
+
+    candidates = [
+        # Slightly stronger text match but term doesn't fit.
+        {"Asana Task GID": "g_snow_old",
+         "Contract Reason Text": "Snow Removal services",
+         "Start": "2023-01-01", "Due": "2024-12-31"},
+        # Weaker text match but term fits.
+        {"Asana Task GID": "g_snow_new",
+         "Contract Reason Text": "Snow Removal",
+         "Start": "2025-09-30", "Due": "2026-09-30"},
+    ]
+    descriptions = [
+        {"description": "Snow/ice management 03/2026",
+         "rows": 1, "amount": 1000.0,
+         "min_date": "2026-03-15", "max_date": "2026-03-15"},
+    ]
+    out = _suggest_candidate_per_description(descriptions, candidates)
+    assert out[0]["suggested_gid"] == "g_snow_new"
+    assert out[0]["date_compat_by_gid"]["g_snow_old"] is False
+    assert out[0]["date_compat_by_gid"]["g_snow_new"] is True
+
+
+def test_date_intervals_overlap_helper():
+    """Unit test the small interval-overlap helper directly so the
+    edge cases (touching endpoints, missing dates) are pinned."""
+    from engine.ui.routes import _date_intervals_overlap
+
+    # Disjoint.
+    assert not _date_intervals_overlap("2025-01-01", "2025-06-30",
+                                       "2025-07-01", "2025-12-31")
+    # Overlap (one contains the other).
+    assert _date_intervals_overlap("2025-01-01", "2025-12-31",
+                                   "2025-05-01", "2025-06-30")
+    # Partial overlap.
+    assert _date_intervals_overlap("2025-01-01", "2025-06-30",
+                                   "2025-06-01", "2025-09-30")
+    # Touching endpoint -- inclusive.
+    assert _date_intervals_overlap("2025-01-01", "2025-06-30",
+                                   "2025-06-30", "2025-12-31")
+    # Missing date on either side -> True (graceful fallback).
+    assert _date_intervals_overlap("", "2025-12-31", "2025-06-30", "2025-12-31")
+    assert _date_intervals_overlap("2025-01-01", "", "2025-06-30", "2025-12-31")
+    assert _date_intervals_overlap("2025-01-01", "2025-12-31", "", "2025-12-31")
+    assert _date_intervals_overlap("2025-01-01", "2025-12-31", "2025-06-30", "")
+
+
+def test_vendor_conflicts_renders_out_of_term_warning(client, conn):
+    """End-to-end: a description bucket whose dates fall outside both
+    candidates' terms renders the ⚠ marker on the dropdown options AND
+    is NOT auto-picked. Mirrors the screenshot the operator reported."""
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw Landscaping",
+        asana_task_gid="g_lawn", campus_set="NCS",
+        contract_reason_text="NCS landscaping",
+        start=date(2026, 3, 31), due=date(2027, 3, 31),
+    )
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw Landscaping Inc",
+        asana_task_gid="g_snow", campus_set="NCS",
+        contract_reason_text="Snow Removal",
+        start=date(2025, 9, 30), due=date(2026, 9, 30),
+    )
+    _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|Bear Claw Landscaping, Inc",
+        vendor="Bear Claw Landscaping, Inc",
+        sample_description="Snow/ice management 3/2025",
+        candidate_names=["Bear Claw Landscaping", "Bear Claw Landscaping Inc"],
+        candidate_gids=["g_lawn", "g_snow"],
+        distinct_descriptions=[
+            # Phase 13 5-tuple shape. March 2025 -- BEFORE both contracts.
+            ("Snow/ice management 3/2025", 2, 2500.0, "2025-03-01", "2025-03-15"),
+            # March 2026 -- inside the snow contract's term.
+            ("Snow/ice management 03/2026", 1, 3720.0, "2026-03-15", "2026-03-15"),
+        ],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    # The out-of-term ⚠ marker is rendered.
+    assert "outside term" in body
+    # The "txn dates:" date-range hint is rendered for buckets with dates.
+    assert "txn dates:" in body
+    # The in-term description's dates appear in the dates row.
+    assert "2026-03-15" in body
+
+
+# ---------------------------------------------------------------------------
+# Phase 14: out-of-term routing + Pre-dates dropdown + bulk button
+# ---------------------------------------------------------------------------
+
+def test_vendor_conflicts_includes_single_candidate_when_out_of_term(client, conn):
+    """Phase 14a: a Needs Tagging row with only 1 candidate normally drops
+    out of /vendor-conflicts (it goes to Needs Tagging Open instead). But
+    when the engine flagged it as Out Of Term, it must appear in Vendor
+    Conflicts so the operator can use the per-description picker to mark
+    pre-dates or fix the Asana term."""
+    _seed_dashboard_row(
+        conn, contract_name="Office Express Janitorial Services",
+        asana_task_gid="g_solo", campus_set="CEN",
+        contract_reason_text="Janitorial",
+        start=date(2025, 11, 9), due=date(2026, 11, 9),
+    )
+    rec_id = _seed_needs_tagging(
+        conn, group_key="CEN|000|63080|Office Express Janitorial Services",
+        vendor="Office Express Janitorial Services",
+        sample_description="Cleaning April",
+        candidate_names=["Office Express Janitorial Services"],
+        candidate_gids=["g_solo"],
+        distinct_descriptions=[
+            ("Cleaning April", 1, 16000.0, "2025-04-01", "2025-04-15"),
+        ],
+    )
+    # Manually set Out Of Term to simulate what the upsert would have done.
+    conn.execute(
+        'UPDATE "Needs Tagging" SET "Out Of Term" = 1 WHERE id = ?',
+        (rec_id,),
+    )
+    conn.commit()
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Office Express Janitorial Services" in body
+    # Picker renders even though there's only 1 candidate.
+    assert "Cleaning April" in body
+
+
+def test_vendor_conflicts_excludes_single_candidate_when_not_out_of_term(client, conn):
+    """Regression: a single-candidate Needs Tagging row that is NOT
+    out-of-term still must NOT appear in /vendor-conflicts (it goes to
+    Needs Tagging Open). Phase 14a only loosens the filter for the
+    out-of-term case."""
+    _seed_dashboard_row(
+        conn, contract_name="Acme", asana_task_gid="g_acme", campus_set="CEN",
+    )
+    _seed_needs_tagging(
+        conn, group_key="CEN|000|63080|Acme",
+        vendor="Acme",
+        candidate_names=["Acme"], candidate_gids=["g_acme"],
+        distinct_descriptions=[("x", 1, 100.0, "2026-06-01", "2026-06-01")],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    # Should NOT appear -- single candidate, no Out Of Term flag.
+    assert "Acme" not in body
+
+
+def test_vendor_conflicts_dropdown_includes_pre_dates_option(client, conn):
+    """Phase 14b: every per-description dropdown now exposes a sentinel
+    'Unassigned - Pre-dates Asana Record' option."""
+    _seed_dashboard_row(conn, contract_name="Bear Claw Landscaping",
+                        asana_task_gid="g_lawn", campus_set="NCS")
+    _seed_dashboard_row(conn, contract_name="Bear Claw Landscaping Inc",
+                        asana_task_gid="g_snow", campus_set="NCS")
+    _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|Bear Claw Landscaping, Inc",
+        vendor="Bear Claw Landscaping, Inc",
+        candidate_names=["Bear Claw Landscaping", "Bear Claw Landscaping Inc"],
+        candidate_gids=["g_lawn", "g_snow"],
+        distinct_descriptions=[("Landscaping 12/2025", 1, 8157.50,
+                                "2026-01-01", "2026-01-01")],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "__PRE_DATES__" in body
+    assert "Pre-dates Asana Record" in body
+
+
+def test_vendor_conflicts_pre_dates_pick_strips_bucket_without_lm(client, conn):
+    """Phase 14b: submitting __PRE_DATES__ for a description must NOT
+    create a Learned Mapping and must remove that bucket from the row's
+    Distinct Descriptions JSON. Other buckets stay (operator's other
+    decisions are unaffected). Row stays alive when buckets remain."""
+    _seed_dashboard_row(conn, contract_name="Bear Claw Landscaping",
+                        asana_task_gid="g_lawn", campus_set="NCS")
+    _seed_dashboard_row(conn, contract_name="Bear Claw Landscaping Inc",
+                        asana_task_gid="g_snow", campus_set="NCS")
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|Bear Claw Landscaping, Inc",
+        vendor="Bear Claw Landscaping, Inc",
+        candidate_names=["Bear Claw Landscaping", "Bear Claw Landscaping Inc"],
+        candidate_gids=["g_lawn", "g_snow"],
+        distinct_descriptions=[
+            ("Landscaping 12/2025", 1, 8157.50, "2026-01-01", "2026-01-01"),
+            ("Snow Removal 03/2026", 1, 3720.00, "2026-03-15", "2026-03-15"),
+        ],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/assign-by-description",
+        data={
+            "desc_0": "Landscaping 12/2025",
+            "gid_0": "__PRE_DATES__",
+            "name_0": "(Pre-dates Asana Record)",
+            "desc_1": "Snow Removal 03/2026",
+            "gid_1": "",
+            "name_1": "",
+        },
+    )
+    assert resp.status_code == 302
+    # No LM written.
+    lm_count = conn.execute(
+        'SELECT COUNT(*) FROM "Learned Mappings" '
+        'WHERE "Key" = ?',
+        ("NCS|000|63080|Bear Claw Landscaping, Inc",),
+    ).fetchone()[0]
+    assert lm_count == 0
+    # Row still exists.
+    row = conn.execute(
+        'SELECT "Distinct Descriptions JSON" FROM "Needs Tagging" WHERE id = ?',
+        (rec_id,),
+    ).fetchone()
+    assert row is not None
+    import json
+    remaining = json.loads(row[0])
+    descs = [b["description"] for b in remaining]
+    # Landscaping bucket stripped; Snow Removal stays.
+    assert "Landscaping 12/2025" not in descs
+    assert "Snow Removal 03/2026" in descs
+
+
+def test_vendor_conflicts_pre_dates_and_lm_mixed(client, conn):
+    """Phase 14b: when the operator mixes a real LM pick AND a pre-dates
+    pick in the same submission, the LM is written and the row is deleted
+    (next ingest rebuilds). Pre-dates bucket re-surfaces naturally next
+    ingest because no LM was written for it."""
+    _seed_dashboard_row(conn, contract_name="Snow Removal Co",
+                        asana_task_gid="g_snow", campus_set="NCS")
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|Multi",
+        vendor="Multi",
+        candidate_names=["Snow Removal Co"], candidate_gids=["g_snow"],
+        distinct_descriptions=[
+            ("Snow 03/2026", 1, 1000.0, "2026-03-01", "2026-03-01"),
+            ("Snow 03/2025", 1, 800.0, "2025-03-01", "2025-03-01"),
+        ],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/assign-by-description",
+        data={
+            "desc_0": "Snow 03/2026",
+            "gid_0": "g_snow",
+            "name_0": "Snow Removal Co",
+            "desc_1": "Snow 03/2025",
+            "gid_1": "__PRE_DATES__",
+            "name_1": "(Pre-dates Asana Record)",
+        },
+    )
+    assert resp.status_code == 302
+    # One LM written for the in-term pick.
+    lms = conn.execute(
+        'SELECT "Description Pattern", "Contract Gid" '
+        'FROM "Learned Mappings" WHERE "Key" = ?',
+        ("NCS|000|63080|Multi",),
+    ).fetchall()
+    assert len(lms) == 1
+    # #7: pattern is normalized (volatile date token stripped) -> "snow".
+    assert lms[0]["Description Pattern"] == "snow"
+    # Row deleted (consistent with existing assign-by-description behavior
+    # when picks are made).
+    row = conn.execute(
+        'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (rec_id,),
+    ).fetchone()
+    assert row is None
+
+
+def test_vendor_conflicts_bulk_mark_out_of_term_strips_only_all_out_buckets(client, conn):
+    """Phase 14c: bulk button strips ONLY buckets where every candidate's
+    term excludes the bucket's date range. Buckets where at least one
+    candidate fits the date stay (operator handles per-description)."""
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw Landscaping",
+        asana_task_gid="g_lawn", campus_set="NCS",
+        start=date(2026, 3, 31), due=date(2027, 3, 31),
+    )
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw Landscaping Inc",
+        asana_task_gid="g_snow", campus_set="NCS",
+        start=date(2025, 9, 30), due=date(2026, 9, 30),
+    )
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|Bear Claw Landscaping, Inc",
+        vendor="Bear Claw Landscaping, Inc",
+        candidate_names=["Bear Claw Landscaping", "Bear Claw Landscaping Inc"],
+        candidate_gids=["g_lawn", "g_snow"],
+        distinct_descriptions=[
+            # March 2025 -- BEFORE both contracts. Should be stripped.
+            ("Snow 03/2025", 1, 1000.0, "2025-03-01", "2025-03-15"),
+            # April 2025 -- BEFORE both contracts. Should be stripped.
+            ("Snow 04/2025", 1, 800.0, "2025-04-01", "2025-04-15"),
+            # March 2026 -- inside Inc's term. Should STAY.
+            ("Snow 03/2026", 1, 3720.0, "2026-03-15", "2026-03-15"),
+        ],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/mark-all-out-of-term-as-pre-dates",
+    )
+    assert resp.status_code == 302
+    import json
+    row = conn.execute(
+        'SELECT "Distinct Descriptions JSON" FROM "Needs Tagging" WHERE id = ?',
+        (rec_id,),
+    ).fetchone()
+    remaining = json.loads(row[0])
+    descs = [b["description"] for b in remaining]
+    assert "Snow 03/2025" not in descs
+    assert "Snow 04/2025" not in descs
+    assert "Snow 03/2026" in descs
+
+
+def test_vendor_conflicts_bulk_mark_skips_buckets_with_unknown_dates(client, conn):
+    """Bucket with no min/max date can't be judged -- keep it in place.
+    Legacy rows without Phase-13 dates degrade safely."""
+    _seed_dashboard_row(
+        conn, contract_name="Vendor X", asana_task_gid="g_x", campus_set="NCS",
+        start=date(2026, 3, 31), due=date(2027, 3, 31),
+    )
+    _seed_dashboard_row(
+        conn, contract_name="Vendor X Inc", asana_task_gid="g_xinc", campus_set="NCS",
+        start=date(2025, 9, 30), due=date(2026, 9, 30),
+    )
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|Vendor X",
+        vendor="Vendor X",
+        candidate_names=["Vendor X", "Vendor X Inc"],
+        candidate_gids=["g_x", "g_xinc"],
+        # 3-tuple shape (legacy, no dates) -- the serializer fills empty
+        # min/max which the bulk handler treats as "can't judge -> keep".
+        distinct_descriptions=[("desc-no-dates", 1, 100.0)],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/mark-all-out-of-term-as-pre-dates",
+    )
+    # No buckets stripped -> error flash, redirect.
+    assert resp.status_code == 302
+    import json
+    row = conn.execute(
+        'SELECT "Distinct Descriptions JSON" FROM "Needs Tagging" WHERE id = ?',
+        (rec_id,),
+    ).fetchone()
+    remaining = json.loads(row[0])
+    assert any(b.get("description") == "desc-no-dates" for b in remaining)
+
+
+def test_vendor_conflicts_bulk_button_visible_only_when_out_of_term_present(client, conn):
+    """The bulk-strip button shows ONLY on groups that have at least one
+    bucket whose every candidate fails the date check. A group where every
+    bucket has at least one date-compatible candidate must NOT show the button."""
+    # All in-term: both candidates' terms contain the bucket date.
+    _seed_dashboard_row(
+        conn, contract_name="Beta", asana_task_gid="g_beta", campus_set="CEN",
+        start=date(2026, 1, 1), due=date(2026, 12, 31),
+    )
+    _seed_dashboard_row(
+        conn, contract_name="Beta Inc", asana_task_gid="g_beta_inc", campus_set="CEN",
+        start=date(2026, 1, 1), due=date(2026, 12, 31),
+    )
+    _seed_needs_tagging(
+        conn, group_key="CEN|000|63080|Beta",
+        vendor="Beta",
+        candidate_names=["Beta", "Beta Inc"],
+        candidate_gids=["g_beta", "g_beta_inc"],
+        distinct_descriptions=[("in-term", 1, 100.0, "2026-06-01", "2026-06-01")],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Mark all out-of-term as Pre-dates" not in body
+
+
+def test_vendor_conflicts_assign_by_description_writes_pattern_lms(client, conn):
+    """Per-description picks write one Learned Mapping each with a NORMALIZED
+    Description Pattern column populated. Pattern LMs are the mechanism
+    that lets one (Campus, Dept, Acct, Vendor) group split across multiple
+    Asana tasks on subsequent ingests. #7: the stored pattern strips volatile
+    invoice/date tokens so it keeps matching ('Groundskeeping 12/2024' ->
+    'groundskeeping')."""
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw Landscaping",
+        asana_task_gid="g_lawn", campus_set="NCS",
+    )
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw Landscaping Inc",
+        asana_task_gid="g_snow", campus_set="NCS",
+    )
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|Bear Claw Landscaping, Inc",
+        vendor="Bear Claw Landscaping, Inc",
+        candidate_names=["Bear Claw Landscaping", "Bear Claw Landscaping Inc"],
+        candidate_gids=["g_lawn", "g_snow"],
+        distinct_descriptions=[
+            ("Groundskeeping 12/2024", 12, 87000.0),
+            ("Snow Removal 02/2026", 4, 28000.0),
+        ],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/assign-by-description",
+        data={
+            "desc_0": "Groundskeeping 12/2024",
+            "gid_0": "g_lawn",
+            "name_0": "Bear Claw Landscaping",
+            "desc_1": "Snow Removal 02/2026",
+            "gid_1": "g_snow",
+            "name_1": "Bear Claw Landscaping Inc",
+        },
+    )
+    assert resp.status_code == 302
+    # Two pattern LMs written, with normalized patterns.
+    lms = conn.execute(
+        '''SELECT "Contract Name", "Contract Gid", "Description Pattern"
+           FROM "Learned Mappings"
+           WHERE "Key" = ?
+           ORDER BY "Description Pattern"''',
+        ("NCS|000|63080|Bear Claw Landscaping, Inc",),
+    ).fetchall()
+    assert len(lms) == 2
+    by_pattern = {r["Description Pattern"]: dict(r) for r in lms}
+    assert by_pattern["groundskeeping"]["Contract Gid"] == "g_lawn"
+    assert by_pattern["snow removal"]["Contract Gid"] == "g_snow"
+    # Needs Tagging row removed (it'll be re-created next ingest if any rows
+    # still attribute ambiguously).
+    nt_left = conn.execute(
+        'SELECT COUNT(*) FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()[0]
+    assert nt_left == 0
+
+
+def test_vendor_conflicts_assign_by_description_skips_unpicked_rows(client, conn):
+    """The operator can leave a description unassigned by selecting the
+    skip option (empty gid). Skipped descriptions do NOT create an LM."""
+    _seed_dashboard_row(conn, contract_name="Lawn", asana_task_gid="g_lawn", campus_set="NCS")
+    _seed_dashboard_row(conn, contract_name="Snow", asana_task_gid="g_snow", campus_set="NCS")
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|MultiVendor", vendor="MultiVendor",
+        candidate_names=["Lawn", "Snow"],
+        candidate_gids=["g_lawn", "g_snow"],
+        distinct_descriptions=[("Groundskeeping", 5, 1000.0), ("Snow Removal", 3, 500.0)],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/assign-by-description",
+        data={
+            "desc_0": "Groundskeeping", "gid_0": "g_lawn", "name_0": "Lawn",
+            "desc_1": "Snow Removal", "gid_1": "", "name_1": "",  # skipped
+        },
+    )
+    assert resp.status_code == 302
+    lms = conn.execute(
+        'SELECT "Description Pattern" FROM "Learned Mappings" WHERE "Key" = ?',
+        ("NCS|000|63080|MultiVendor",),
+    ).fetchall()
+    assert len(lms) == 1
+    assert lms[0]["Description Pattern"] == "groundskeeping"
+
+
+def test_vendor_conflicts_assign_by_description_rejects_invalid_gid(client, conn):
+    """Form-tampering guard: only candidate gids may be persisted."""
+    _seed_dashboard_row(conn, contract_name="A", asana_task_gid="g_a", campus_set="NCS")
+    _seed_dashboard_row(conn, contract_name="B", asana_task_gid="g_b", campus_set="NCS")
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|V", vendor="V",
+        candidate_names=["A", "B"], candidate_gids=["g_a", "g_b"],
+        distinct_descriptions=[("foo", 1, 1.0)],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/assign-by-description",
+        data={"desc_0": "foo", "gid_0": "g_unrelated", "name_0": "X"},
+    )
+    assert resp.status_code == 302
+    # Invalid gid filtered → no LM written → since no valid picks, NT row stays.
+    assert conn.execute('SELECT COUNT(*) FROM "Learned Mappings"').fetchone()[0] == 0
+    assert conn.execute(
+        'SELECT COUNT(*) FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()[0] == 1
+
+
+def test_vendor_conflicts_handles_candidate_without_reason_text(client, conn):
+    """Older Asana tasks may have no Contract Reason Text. The picker
+    must still render (with a hint to fill it in) instead of crashing."""
+    _seed_dashboard_row(
+        conn, contract_name="Old Vendor",
+        asana_task_gid="g_a", campus_set="CEN",
+        contract_reason_text=None,
+    )
+    _seed_dashboard_row(
+        conn, contract_name="Old Vendor",
+        asana_task_gid="g_b", campus_set="CEN",
+        contract_reason_text=None,
+    )
+    _seed_needs_tagging(
+        conn, group_key="CEN|000|63015|Old Vendor",
+        vendor="Old Vendor", sample_description="something",
+        candidate_names=["Old Vendor", "Old Vendor"],
+        candidate_gids=["g_a", "g_b"],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Old Vendor" in body
+    # The empty-reason-text hint is shown so the operator knows what to fix.
+    assert "empty" in body
+
+
+# ---------------------------------------------------------------------------
+# /vendor-conflicts/<id>/mark-amendment — Phase 8 amendment-link declaration
+# ---------------------------------------------------------------------------
+
+def test_mark_amendment_creates_link_and_pins_parent(client, conn):
+    """End-to-end: operator declares 'g_amend is amendment of g_parent'.
+    Result: Amendment Links row written, plain LM pinned to g_parent, Needs
+    Tagging row deleted (conflict resolved)."""
+    _seed_dashboard_row(conn, contract_name="Janitorial",
+                        asana_task_gid="g_parent", campus_set="OPK",
+                        contract_amount=59400.0, spent_so_far=0.0)
+    _seed_dashboard_row(conn, contract_name="Janitorial Amendment",
+                        asana_task_gid="g_amend", campus_set="OPK",
+                        contract_amount=5770.0, spent_so_far=52974.0)
+    rec_id = _seed_needs_tagging(
+        conn,
+        group_key="OPK|000|63020|Stratus Building Solutions",
+        campus="OPK", account_no="63020",
+        vendor="Stratus Building Solutions",
+        candidate_names=["Janitorial", "Janitorial Amendment"],
+        candidate_gids=["g_parent", "g_amend"],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/mark-amendment",
+        data={
+            "parent_gid": "g_parent",
+            "amendment_gid": "g_amend",
+            "parent_name": "Janitorial",
+            "amendment_name": "Janitorial Amendment",
+        },
+    )
+    assert resp.status_code == 302
+
+    link = conn.execute(
+        'SELECT * FROM "Amendment Links" WHERE "Amendment Gid" = ?',
+        ("g_amend",),
+    ).fetchone()
+    assert link is not None
+    assert link["Parent Gid"] == "g_parent"
+    assert link["Parent Name"] == "Janitorial"
+    assert link["Amendment Name"] == "Janitorial Amendment"
+
+    # A plain LM (no Description Pattern) routes the group's transactions
+    # to the PARENT gid -- otherwise the conflict re-emerges on next ingest.
+    lm = conn.execute(
+        '''SELECT * FROM "Learned Mappings"
+           WHERE "Key" = ?
+             AND COALESCE("Description Pattern", '') = '' ''',
+        ("OPK|000|63020|Stratus Building Solutions",),
+    ).fetchone()
+    assert lm is not None
+    assert lm["Contract Gid"] == "g_parent"
+    assert lm["Contract Name"] == "Janitorial"
+
+    # Needs Tagging row is resolved.
+    assert conn.execute(
+        'SELECT COUNT(*) FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()[0] == 0
+
+
+def test_mark_amendment_rejects_gid_not_in_candidates(client, conn):
+    _seed_dashboard_row(conn, contract_name="A", asana_task_gid="g_a")
+    _seed_dashboard_row(conn, contract_name="B", asana_task_gid="g_b")
+    rec_id = _seed_needs_tagging(
+        conn, group_key="CEN|000|63020|X", vendor="X",
+        candidate_names=["A", "B"], candidate_gids=["g_a", "g_b"],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/mark-amendment",
+        data={
+            "parent_gid": "g_a", "amendment_gid": "g_wild",
+            "parent_name": "A", "amendment_name": "Wild",
+        },
+    )
+    assert resp.status_code == 302
+    assert conn.execute(
+        'SELECT COUNT(*) FROM "Amendment Links"'
+    ).fetchone()[0] == 0
+    # NT row stays in place; nothing was pinned.
+    assert conn.execute(
+        'SELECT COUNT(*) FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()[0] == 1
+
+
+def test_mark_amendment_rejects_self_link(client, conn):
+    _seed_dashboard_row(conn, contract_name="A", asana_task_gid="g_a")
+    _seed_dashboard_row(conn, contract_name="B", asana_task_gid="g_b")
+    rec_id = _seed_needs_tagging(
+        conn, group_key="CEN|000|63020|X", vendor="X",
+        candidate_names=["A", "B"], candidate_gids=["g_a", "g_b"],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/mark-amendment",
+        data={
+            "parent_gid": "g_a", "amendment_gid": "g_a",
+            "parent_name": "A", "amendment_name": "A",
+        },
+    )
+    assert resp.status_code == 302
+    assert conn.execute(
+        'SELECT COUNT(*) FROM "Amendment Links"'
+    ).fetchone()[0] == 0
+
+
+def test_mark_amendment_rejects_missing_gids(client, conn):
+    _seed_dashboard_row(conn, contract_name="A", asana_task_gid="g_a")
+    _seed_dashboard_row(conn, contract_name="B", asana_task_gid="g_b")
+    rec_id = _seed_needs_tagging(
+        conn, group_key="CEN|000|63020|X", vendor="X",
+        candidate_names=["A", "B"], candidate_gids=["g_a", "g_b"],
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/mark-amendment",
+        data={"parent_gid": "", "amendment_gid": "g_a"},
+    )
+    assert resp.status_code == 302
+    assert conn.execute(
+        'SELECT COUNT(*) FROM "Amendment Links"'
+    ).fetchone()[0] == 0
+
+
+def test_mark_amendment_404s_for_unknown_record_id(client):
+    resp = client.post(
+        "/vendor-conflicts/99999/mark-amendment",
+        data={"parent_gid": "g_a", "amendment_gid": "g_b",
+              "parent_name": "A", "amendment_name": "B"},
+    )
+    assert resp.status_code == 404
+
+
+def test_dashboard_shows_amendment_cross_reference(client, conn):
+    """When two Dashboard rows are linked as parent + amendment, both rows
+    render a cross-reference line so the operator sees the combined picture."""
+    _seed_dashboard_row(conn, contract_name="Janitorial",
+                        asana_task_gid="g_parent", campus_set="OPK",
+                        contract_amount=59400.0, spent_so_far=0.0)
+    _seed_dashboard_row(conn, contract_name="Janitorial Amendment",
+                        asana_task_gid="g_amend", campus_set="OPK",
+                        contract_amount=5770.0, spent_so_far=52974.0)
+    sqlite_client.insert_amendment_link(
+        conn, parent_gid="g_parent", amendment_gid="g_amend",
+        parent_name="Janitorial", amendment_name="Janitorial Amendment",
+        linked_at="2026-06-16",
+    )
+    body = client.get("/").get_data(as_text=True)
+    # Both directions show up: parent advertises "+ amendment",
+    # amendment row says "amendment of".
+    assert "amendment of" in body
+    assert "+ amendment" in body
+    # Each linked partner's amount appears as context.
+    assert "59,400.00" in body  # parent budget shown on amendment row
+    assert "52,974.00" in body  # amendment spend shown on parent row
+
+
+# ---------------------------------------------------------------------------
+# /vendor-conflicts/<id>/mark-other — Phase 9 "none of these match" option
+# ---------------------------------------------------------------------------
+
+def test_vendor_conflicts_mark_other_hides_row_from_conflicts(client, conn):
+    """Operator picks Other → row drops out of /vendor-conflicts but stays
+    in Needs Tagging Open (no Dismiss, no Once Off, no Assign Contract
+    side-effects)."""
+    _seed_dashboard_row(conn, contract_name="Oklahoma Chiller Corp",
+                        asana_task_gid="g_bao", campus_set="BAO")
+    _seed_dashboard_row(conn, contract_name="Oklahoma Chiller Corp",
+                        asana_task_gid="g_okc", campus_set="OKC")
+    rec_id = _seed_needs_tagging(
+        conn,
+        group_key="TUL|000|63040|Oklahoma Chiller Corp",
+        campus="TUL", account_no="63040",
+        vendor="Oklahoma Chiller Corp",
+        candidate_names=["Oklahoma Chiller Corp", "Oklahoma Chiller Corp"],
+        candidate_gids=["g_bao", "g_okc"],
+    )
+    # Confirms the row IS in the conflict view before the action.
+    before = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Oklahoma Chiller Corp" in before
+
+    resp = client.post(f"/vendor-conflicts/{rec_id}/mark-other")
+    assert resp.status_code == 302
+
+    # Flag set; nothing else mutated.
+    row = conn.execute(
+        'SELECT * FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()
+    assert row is not None
+    assert (row["Conflict Other"] or 0) == 1
+    assert (row["Dismissed"] or 0) == 0
+    assert (row["Once Off"] or 0) == 0
+    assert (row["Assign Contract"] or "") == ""
+
+    # And it no longer shows up in /vendor-conflicts.
+    after = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Oklahoma Chiller Corp" not in after
+
+    # But it DOES still show up in Needs Tagging Open, with a pill.
+    nt = client.get("/needs-tagging?show=open").get_data(as_text=True)
+    assert "Oklahoma Chiller Corp" in nt
+    assert "other (hidden from conflicts)" in nt
+
+
+def test_vendor_conflicts_mark_other_404s_for_unknown_record_id(client):
+    resp = client.post("/vendor-conflicts/99999/mark-other")
+    assert resp.status_code == 404
+
+
+def test_unmark_conflict_other_restores_row_to_conflicts(client, conn):
+    """Operator undid Other → row reappears in /vendor-conflicts (engine
+    candidates still apply)."""
+    _seed_dashboard_row(conn, contract_name="A", asana_task_gid="g_a",
+                        campus_set="CEN")
+    _seed_dashboard_row(conn, contract_name="B", asana_task_gid="g_b",
+                        campus_set="CEN")
+    rec_id = _seed_needs_tagging(
+        conn, group_key="CEN|000|63020|X", vendor="X",
+        candidate_names=["A", "B"], candidate_gids=["g_a", "g_b"],
+    )
+    sqlite_client.set_needs_tagging_conflict_other(
+        conn, record_id=rec_id, conflict_other=True,
+    )
+    assert "X" not in client.get("/vendor-conflicts").get_data(as_text=True)
+
+    resp = client.post(
+        f"/needs-tagging/{rec_id}/unmark-conflict-other",
+        data={"show": "open"},
+    )
+    assert resp.status_code == 302
+    row = conn.execute(
+        'SELECT "Conflict Other" FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()
+    assert (row["Conflict Other"] or 0) == 0
+
+    # Row is back on the conflict surface.
+    assert "X" in client.get("/vendor-conflicts").get_data(as_text=True)
+
+
+def test_unmark_conflict_other_404s_for_unknown_record_id(client):
+    resp = client.post(
+        "/needs-tagging/99999/unmark-conflict-other", data={"show": "open"}
+    )
+    assert resp.status_code == 404
+
+
+def test_conflict_other_survives_engine_reupsert(client, conn):
+    """The engine's idempotent upsert on existing rows rewrites engine-owned
+    columns (Sample, $ in group, Candidate Gids) but MUST NOT touch the
+    operator-owned Conflict Other flag — otherwise the next ingest would
+    drag the row back into Vendor Conflicts after the operator just sent
+    it away. Mirrors the Dismissed / Once Off invariant."""
+    _seed_dashboard_row(conn, contract_name="A", asana_task_gid="g_a",
+                        campus_set="CEN")
+    _seed_dashboard_row(conn, contract_name="B", asana_task_gid="g_b",
+                        campus_set="CEN")
+    rec_id = _seed_needs_tagging(
+        conn, group_key="CEN|000|63020|X", vendor="X",
+        candidate_names=["A", "B"], candidate_gids=["g_a", "g_b"],
+    )
+    sqlite_client.set_needs_tagging_conflict_other(
+        conn, record_id=rec_id, conflict_other=True,
+    )
+
+    # Simulate another ingest cycle finding the same group with updated
+    # numbers and (possibly) different candidate names.
+    upsert_needs_tagging_group(
+        conn,
+        group_key="CEN|000|63020|X",
+        campus="CEN", dept="000", account_no="63020", vendor="X",
+        sample_description="NEW DESCRIPTION FROM LATER EXPORT",
+        amount=9999.99,
+        candidate_names=["A", "B"],
+        candidate_gids=["g_a", "g_b"],
+        created_at_iso_date="2026-06-30",
+        first_date="2026-01-01",
+        last_date="2026-06-30",
+    )
+    row = conn.execute(
+        'SELECT * FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()
+    # Engine-owned column refreshed...
+    assert row["Sample Record Description"] == "NEW DESCRIPTION FROM LATER EXPORT"
+    # ...but the operator's Conflict Other flag persists.
+    assert (row["Conflict Other"] or 0) == 1
+    # And the row still doesn't appear in /vendor-conflicts.
+    assert "NEW DESCRIPTION FROM LATER EXPORT" not in (
+        client.get("/vendor-conflicts").get_data(as_text=True)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 11: P-Card split surface
+# ---------------------------------------------------------------------------
+
+def test_p_card_classified_on_upsert_when_vendor_blank(conn):
+    """Engine sets Is P-Card=1 on rows the predicate matches; 0 otherwise."""
+    rec_pcard = upsert_needs_tagging_group(
+        conn, group_key="CEN|000|63040|", campus="CEN", dept="000",
+        account_no="63040", vendor="",
+        sample_description="Parking lot reflective markers, GRAINGER, Hunter",
+        amount=120.0, candidate_names=[],
+        created_at_iso_date="2026-06-12",
+    )
+    rec_normal = upsert_needs_tagging_group(
+        conn, group_key="STO|000|63090|The Stewards Company", campus="STO",
+        dept="000", account_no="63090", vendor="The Stewards Company",
+        sample_description="Window Cleaning 12/2024", amount=1050.0,
+        candidate_names=[], created_at_iso_date="2026-06-12",
+    )
+    assert rec_pcard["fields"].get("Is P-Card") == 1
+    assert rec_normal["fields"].get("Is P-Card") == 0
+
+
+def test_p_card_rows_excluded_from_needs_tagging_open(client, conn):
+    """P-card rows must NOT appear in /needs-tagging — they live on /p-card-spend."""
+    _seed_needs_tagging(
+        conn, group_key="CEN|000|63040|", vendor="",
+        sample_description="P-CARD ONLY DESC, GRAINGER, Hunter",
+    )
+    _seed_needs_tagging(
+        conn, group_key="STO|000|63090|The Stewards Company",
+        vendor="The Stewards Company",
+        sample_description="REAL CONTRACT GROUP",
+    )
+    body = client.get("/needs-tagging?show=open").get_data(as_text=True)
+    assert "REAL CONTRACT GROUP" in body
+    assert "P-CARD ONLY DESC" not in body
+
+
+def test_p_card_rows_excluded_from_vendor_conflicts(client, conn):
+    """A blank-vendor row with multiple candidate gids would never be a
+    real vendor conflict — but pin the invariant: p-card rows are filtered."""
+    _seed_dashboard_row(conn, contract_name="Foo Co",
+                        asana_task_gid="g_a", campus_set="CEN")
+    _seed_dashboard_row(conn, contract_name="Foo Co",
+                        asana_task_gid="g_b", campus_set="CEN")
+    _seed_needs_tagging(
+        conn, group_key="CEN|000|63040|", vendor="",
+        sample_description="P-CARD CONFLICT DESC, AMAZON, Davis",
+        candidate_names=["Foo Co", "Foo Co"],
+        candidate_gids=["g_a", "g_b"],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "P-CARD CONFLICT DESC" not in body
+
+
+def test_p_card_spend_lists_p_card_rows_with_totals(client, conn):
+    _seed_needs_tagging(
+        conn, group_key="CEN|000|63040|", vendor="",
+        sample_description="Reflective markers, GRAINGER, Hunter",
+        amount=120.50,
+    )
+    _seed_needs_tagging(
+        conn, group_key="STO|000|63090|", vendor="",
+        sample_description="Office monitor, AMAZON, Davis",
+        amount=350.00,
+    )
+    body = client.get("/p-card-spend").get_data(as_text=True)
+    assert "Reflective markers" in body
+    assert "Office monitor" in body
+    # Visible total chip surfaces the sum.
+    assert "$470.50" in body
+
+
+def test_p_card_spend_ignore_once_hides_row_and_shows_in_ignored_tab(client, conn):
+    rec_id = _seed_needs_tagging(
+        conn, group_key="CEN|000|63040|", vendor="",
+        sample_description="Reflective markers, GRAINGER, Hunter",
+    )
+    # Initially on Open.
+    open_body = client.get("/p-card-spend?show=open").get_data(as_text=True)
+    assert "Reflective markers" in open_body
+    # Click Ignore once.
+    resp = client.post(f"/p-card-spend/{rec_id}/ignore-once")
+    assert resp.status_code == 302
+    # Open no longer shows it; Ignored does.
+    assert "Reflective markers" not in client.get("/p-card-spend?show=open").get_data(as_text=True)
+    assert "Reflective markers" in client.get("/p-card-spend?show=ignored").get_data(as_text=True)
+    # DB state is sticky.
+    assert conn.execute(
+        'SELECT "P-Card Ignored" FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()[0] == 1
+
+
+def test_p_card_spend_restore_brings_row_back_to_open(client, conn):
+    rec_id = _seed_needs_tagging(
+        conn, group_key="CEN|000|63040|", vendor="",
+        sample_description="Office monitor, AMAZON, Davis",
+    )
+    sqlite_client.set_needs_tagging_p_card_ignored(
+        conn, record_id=rec_id, p_card_ignored=True,
+    )
+    resp = client.post(f"/p-card-spend/{rec_id}/restore")
+    assert resp.status_code == 302
+    assert "Office monitor" in client.get("/p-card-spend?show=open").get_data(as_text=True)
+
+
+def test_p_card_spend_ignore_once_404s_for_unknown_record_id(client):
+    assert client.post("/p-card-spend/99999/ignore-once").status_code == 404
+
+
+def test_p_card_spend_restore_404s_for_unknown_record_id(client):
+    assert client.post("/p-card-spend/99999/restore").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Phase 11: Vendor Conflicts description↔reason auto-narrowing
+# ---------------------------------------------------------------------------
+
+def test_vendor_conflicts_pre_selects_candidate_by_description_match(client, conn):
+    """Bear Claw case: 'Snow/Ice management' descriptions should pre-select
+    the snow-removal Asana task; 'Landscaping' descriptions should pre-select
+    the landscaping Asana task. The per-description dropdown HTML carries
+    `selected` on the auto-matched <option>."""
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw Landscaping",
+        asana_task_gid="g_land", campus_set="NCS",
+        contract_reason_text=(
+            "This is for NCS landscaping for 2026. Includes irrigation "
+            "repairs and groundskeeping."
+        ),
+    )
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw Landscaping Inc",
+        asana_task_gid="g_snow", campus_set="NCS",
+        contract_reason_text="Snow Removal",
+    )
+    # Conflict row with two distinct descriptions.
+    import json as _json
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63090|Bear Claw Landscaping",
+        vendor="Bear Claw Landscaping",
+        sample_description="mixed group",
+        candidate_names=["Bear Claw Landscaping", "Bear Claw Landscaping Inc"],
+        candidate_gids=["g_land", "g_snow"],
+        distinct_descriptions=[
+            ("Snow/Ice management 01/2025", 1, 13128.75),
+            ("Landscaping 12/2025", 1, 8157.50),
+        ],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    # The body now contains TWO per-description dropdowns, each with one
+    # option auto-selected. Easier to verify by string match: each
+    # description appears alongside its expected gid in a `selected` attr.
+    # Split body by description and check the relevant option's selected.
+    # Pragmatic: scan for the specific value="g_snow" selected and the
+    # specific value="g_land" selected.
+    assert 'value="g_snow"' in body and 'selected' in body
+    assert 'value="g_land"' in body
+    # And the helper marker is shown.
+    assert "auto-matched by description" in body
+
+
+def test_suggest_candidate_per_description_helper_clear_winner():
+    """Direct unit test of the scoring helper."""
+    from engine.ui.routes import _suggest_candidate_per_description
+    cands = [
+        {"Asana Task GID": "g_snow", "Contract Reason Text": "Snow Removal"},
+        {"Asana Task GID": "g_land",
+         "Contract Reason Text": "Landscaping irrigation groundskeeping"},
+    ]
+    distinct = [
+        {"description": "Snow/Ice management 01/2025", "rows": 1, "amount": 100.0},
+        {"description": "Landscaping 12/2025", "rows": 1, "amount": 200.0},
+        {"description": "Random description with no overlap", "rows": 1, "amount": 50.0},
+    ]
+    out = _suggest_candidate_per_description(distinct, cands)
+    assert out[0]["suggested_gid"] == "g_snow"
+    assert out[1]["suggested_gid"] == "g_land"
+    assert out[2]["suggested_gid"] is None   # no match → stay on skip
+
+
+def test_suggest_candidate_returns_none_when_tied():
+    """No clear winner → leave on skip so the operator decides."""
+    from engine.ui.routes import _suggest_candidate_per_description
+    cands = [
+        {"Asana Task GID": "g_a", "Contract Reason Text": "monthly cleaning"},
+        {"Asana Task GID": "g_b", "Contract Reason Text": "monthly cleaning"},
+    ]
+    distinct = [{"description": "monthly cleaning", "rows": 1, "amount": 0.0}]
+    out = _suggest_candidate_per_description(distinct, cands)
+    assert out[0]["suggested_gid"] is None
+
+
+def test_dashboard_amendment_xref_handles_partner_missing_from_dashboard(client, conn):
+    """If a linked partner is no longer in Dashboard (closed in Asana), we
+    fall back to the snapshot name on the Amendment Links row and flag it
+    'not in current dashboard' instead of crashing."""
+    _seed_dashboard_row(conn, contract_name="Active task",
+                        asana_task_gid="g_live", campus_set="CEN")
+    sqlite_client.insert_amendment_link(
+        conn, parent_gid="g_gone", amendment_gid="g_live",
+        parent_name="Closed Parent", amendment_name="Active task",
+        linked_at="2026-06-16",
+    )
+    body = client.get("/").get_data(as_text=True)
+    assert "Closed Parent" in body
+    assert "not in current dashboard" in body
+
+
+# ---------------------------------------------------------------------------
+# Code-review fixes: pin date-futility (#8), stale-gid clear on promote (#1),
+# p-card preservation (#9), bulk GET/POST consistency (#11), and the
+# date-overlap blank-Due handling (#6).
+# ---------------------------------------------------------------------------
+
+def test_vendor_conflicts_pin_blocked_when_date_futile(client, conn):
+    """#8: pinning a contract whose term covers NONE of the group's
+    transaction dates is refused (no LM written, row kept) — otherwise the
+    pin would be re-rejected by attribution's date guard every ingest, an
+    unresolvable loop with a lying success message."""
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw", asana_task_gid="g_bear",
+        campus_set="NCS", start=date(2026, 3, 31), due=date(2027, 3, 31),
+    )
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|Bear Claw, Inc",
+        vendor="Bear Claw, Inc",
+        candidate_names=["Bear Claw"], candidate_gids=["g_bear"],
+        first_date="2025-01-01", last_date="2025-03-15",  # all before the term
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/assign",
+        data={"contract_gid": "g_bear", "contract_name": "Bear Claw"},
+    )
+    assert resp.status_code == 302
+    lms = conn.execute('SELECT COUNT(*) FROM "Learned Mappings"').fetchone()[0]
+    assert lms == 0
+    assert conn.execute(
+        'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone() is not None
+
+
+def test_vendor_conflicts_pin_allowed_when_dates_overlap(client, conn):
+    """#8 regression guard: a pin whose term DOES cover the group's dates
+    still works (writes the gid-pinned LM, deletes the row)."""
+    _seed_dashboard_row(
+        conn, contract_name="Bear Claw", asana_task_gid="g_bear",
+        campus_set="NCS", start=date(2026, 1, 1), due=date(2026, 12, 31),
+    )
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|Bear Claw, Inc",
+        vendor="Bear Claw, Inc",
+        candidate_names=["Bear Claw"], candidate_gids=["g_bear"],
+        first_date="2026-02-01", last_date="2026-05-15",
+    )
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/assign",
+        data={"contract_gid": "g_bear", "contract_name": "Bear Claw"},
+    )
+    assert resp.status_code == 302
+    row = conn.execute(
+        'SELECT "Contract Gid" FROM "Learned Mappings" WHERE "Key" = ?',
+        ("NCS|000|63080|Bear Claw, Inc",),
+    ).fetchone()
+    assert row is not None and row["Contract Gid"] == "g_bear"
+    assert conn.execute(
+        'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone() is None
+
+
+def test_promote_clears_stale_pinned_gid(conn):
+    """#1: an operator first pins a gid via Vendor Conflicts, then later
+    answers by NAME in Needs Tagging. The name promotion must CLEAR the
+    stale gid so attribution resolves by name, not the leftover pin."""
+    conn.execute(
+        '''INSERT INTO "Learned Mappings"
+             ("Key", "Campus", "Dept", "Account No", "Vendor",
+              "Contract Name", "Contract Gid", "Learned At")
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+        ("CEN|000|63015|Acme", "CEN", "000", "63015", "Acme",
+         "Old Pinned Name", "g_stale", "2026-01-01"),
+    )
+    conn.commit()
+    rec_id = _seed_needs_tagging(
+        conn, group_key="CEN|000|63015|Acme", campus="CEN", dept="000",
+        account_no="63015", vendor="Acme",
+    )
+    sqlite_client.set_needs_tagging_assign_contract(
+        conn, record_id=rec_id, contract_name="New Name By Operator",
+    )
+    sqlite_client.promote_filled_needs_tagging(
+        conn, learned_at_iso_date="2026-06-20",
+        valid_contract_names={"New Name By Operator"},
+    )
+    row = conn.execute(
+        '''SELECT "Contract Name", "Contract Gid" FROM "Learned Mappings"
+           WHERE "Key" = ? AND COALESCE("Description Pattern", '') = '' ''',
+        ("CEN|000|63015|Acme",),
+    ).fetchone()
+    assert row["Contract Name"] == "New Name By Operator"
+    assert not (row["Contract Gid"] or "")  # stale gid cleared
+
+
+def test_upsert_does_not_flip_operator_engaged_row_to_p_card(conn):
+    """#9: a contracted group the operator has engaged with (Conflict Other
+    set) must NOT be reclassified into the hidden p-card surface when a later
+    export emits it with a blank vendor."""
+    rec_id = _seed_needs_tagging(
+        conn, group_key="CEN|000|63015|Acme", campus="CEN", dept="000",
+        account_no="63015", vendor="Acme", sample_description="Bill - Acme: svc",
+    )
+    sqlite_client.set_needs_tagging_conflict_other(
+        conn, record_id=rec_id, conflict_other=True,
+    )
+    upsert_needs_tagging_group(
+        conn, group_key="CEN|000|63015|Acme", campus="CEN", dept="000",
+        account_no="63015", vendor="", sample_description="random journal memo",
+        amount=500.0, candidate_names=["Acme"], created_at_iso_date="2026-06-20",
+    )
+    row = conn.execute(
+        'SELECT "Is P-Card" FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()
+    assert not row["Is P-Card"]  # preserved at 0, not flipped to p-card
+
+
+def test_bulk_pre_dates_button_and_post_agree_on_dashboard_absent_gid(client, conn):
+    """#11: GET (button visibility) and POST (strip) must use the SAME
+    candidate set. A candidate gid absent from the Dashboard must not be
+    treated as date-compatible by the POST while the GET considers only
+    Dashboard-present candidates — else the button appears but strips
+    nothing."""
+    _seed_dashboard_row(
+        conn, contract_name="Present", asana_task_gid="g_present",
+        campus_set="NCS", start=date(2026, 3, 31), due=date(2027, 3, 31),
+    )
+    rec_id = _seed_needs_tagging(
+        conn, group_key="NCS|000|63080|V", vendor="V",
+        candidate_names=["Present", "Absent"],
+        candidate_gids=["g_present", "g_absent"],  # g_absent NOT in Dashboard
+        distinct_descriptions=[("Snow 03/2025", 1, 1000.0, "2025-03-01", "2025-03-15")],
+        # The engine flags this out-of-term (only Dashboard-present candidate
+        # doesn't cover the bucket), which admits the single-candidate row to
+        # Vendor Conflicts.
+        out_of_term=True,
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Mark all out-of-term as Pre-dates" in body
+    resp = client.post(
+        f"/vendor-conflicts/{rec_id}/mark-all-out-of-term-as-pre-dates",
+    )
+    assert resp.status_code == 302
+    import json
+    remaining = json.loads(conn.execute(
+        'SELECT "Distinct Descriptions JSON" FROM "Needs Tagging" WHERE id = ?',
+        (rec_id,),
+    ).fetchone()[0])
+    assert remaining == []  # the all-out-of-term bucket was stripped
+
+
+def test_date_intervals_overlap_blank_due_is_not_universally_compatible():
+    """#6: a contract with an OPEN-ENDED (blank Due) term is NOT compatible
+    with a bucket entirely before its start. Previously any blank date
+    short-circuited to True."""
+    from engine.ui.routes import _date_intervals_overlap
+    assert _date_intervals_overlap("2026-09-30", "", "2025-03-01", "2025-03-15") is False
+    assert _date_intervals_overlap("2026-09-30", "", "2026-12-01", "2026-12-15") is True
+    # Unknown bucket dates -> can't judge -> compatible (text-only fallback).
+    assert _date_intervals_overlap("2026-01-01", "2026-12-31", "", "") is True

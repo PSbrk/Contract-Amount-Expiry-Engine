@@ -4,21 +4,27 @@
 <header>
   <h2>Needs Tagging</h2>
   <p>
-    <span class="pill">{{ rows|length }} {{ 'dismissed row' if show == 'dismissed' else 'open group' }}{{ '' if rows|length == 1 else 's' }}</span>
-    {% if show != 'dismissed' and unfilled %}
+    {% set view_label = {'dismissed': 'dismissed row', 'once_off': 'once-off row', 'all': 'row'}.get(show, 'open group') %}
+    <span class="pill">{{ rows|length }} {{ view_label }}{{ '' if rows|length == 1 else 's' }}</span>
+    {% if show == 'open' and unfilled %}
       <span class="pill alarm-on">{{ unfilled }} awaiting answer</span>
     {% endif %}
-    {% if dismissed_count and show != 'dismissed' %}
+    {% if show != 'dismissed' and dismissed_count %}
       <span class="pill">{{ dismissed_count }} dismissed (hidden)</span>
+    {% endif %}
+    {% if show != 'once_off' and once_off_count %}
+      <span class="pill">{{ once_off_count }} once-off (hidden)</span>
     {% endif %}
   </p>
   <p>
     <small>
       Fill <em>Assign Contract</em> on a row and save &mdash; the next
       <code>--ingest</code> promotes confirmed rows into Learned Mappings.
-      Click <em>Dismiss</em> on a row whose spend is real but belongs to
-      a different department &mdash; the engine will leave it alone on
-      future runs.
+      Click <em>Dismiss</em> when the spend belongs to a different department
+      and should be ignored forever. Click <em>Once&nbsp;Off</em> when the
+      spend is real but a one-time charge: the engine will hide the row
+      until <strong>new</strong> transactions appear in this group (any row
+      dated after today's Last Date).
       {% if not contract_names %}
         <br>(Suggestions empty &mdash; run <code>--ingest</code> at least once to populate the Dashboard, which feeds this datalist.)
       {% endif %}
@@ -28,6 +34,8 @@
     <ul>
       <li><a href="{{ url_for('needs_tagging', show='open') }}"
              {% if show == 'open' %}aria-current="page"{% endif %}>Open</a></li>
+      <li><a href="{{ url_for('needs_tagging', show='once_off') }}"
+             {% if show == 'once_off' %}aria-current="page"{% endif %}>Once Off ({{ once_off_count }})</a></li>
       <li><a href="{{ url_for('needs_tagging', show='dismissed') }}"
              {% if show == 'dismissed' %}aria-current="page"{% endif %}>Dismissed ({{ dismissed_count }})</a></li>
       <li><a href="{{ url_for('needs_tagging', show='all') }}"
@@ -50,20 +58,27 @@
       <th>Dates</th>
       <th>Sample description</th>
       <th>Engine candidates</th>
-      <th style="min-width: 18rem;">Action</th>
+      <th style="min-width: 20rem;">Action</th>
     </tr>
   </thead>
   <tbody>
   {% for r in rows %}
     {% set filled = (r["Assign Contract"] or '').strip() %}
     {% set dismissed = (r["Dismissed"] or 0) == 1 %}
-    <tr class="{{ '' if (filled or dismissed) else 'row-unfilled' }}"
-        style="{{ 'opacity: 0.55;' if dismissed else '' }}">
+    {% set once_off = (r["Once Off"] or 0) == 1 and not dismissed %}
+    {% set conflict_other = (r["Conflict Other"] or 0) == 1 and not (dismissed or once_off) %}
+    <tr class="{{ '' if (filled or dismissed or once_off) else 'row-unfilled' }}"
+        style="{{ 'opacity: 0.55;' if (dismissed or once_off) else '' }}">
       <td>
         <strong>{{ r["Vendor"] or "" }}</strong>
         {% if dismissed %}<span class="pill">dismissed</span>{% endif %}
+        {% if once_off %}<span class="pill">once-off</span>{% endif %}
+        {% if conflict_other %}<span class="pill">other (hidden from conflicts)</span>{% endif %}
         <br>
         <small>{{ r["Campus"] or "" }} &middot; {{ r["Dept"] or "" }} &middot; acct {{ r["Account No"] or "" }}</small>
+        {% if once_off and r["Once Off Anchor"] %}
+          <br><small style="color: var(--pico-muted-color);">anchor: {{ r["Once Off Anchor"] }} (will re-surface if new rows arrive after this)</small>
+        {% endif %}
       </td>
       <td class="num">${{ "{:,.2f}".format(r["$ in group"] or 0) }}</td>
       <td>
@@ -94,6 +109,13 @@
             <input type="hidden" name="show" value="{{ show }}">
             <button type="submit" class="secondary" style="margin: 0;">Restore</button>
           </form>
+        {% elif once_off %}
+          <form method="post"
+                action="{{ url_for('needs_tagging_unmark_once_off', record_id=r['id']) }}"
+                style="margin: 0;">
+            <input type="hidden" name="show" value="{{ show }}">
+            <button type="submit" class="secondary" style="margin: 0;">Restore</button>
+          </form>
         {% else %}
           <form method="post"
                 action="{{ url_for('needs_tagging_save', record_id=r['id']) }}"
@@ -105,14 +127,34 @@
                    style="margin:0; flex:1;">
             <button type="submit" style="margin:0;">Save</button>
           </form>
-          <form method="post"
-                action="{{ url_for('needs_tagging_dismiss', record_id=r['id']) }}"
-                style="margin: 0;">
-            <input type="hidden" name="show" value="{{ show }}">
-            <button type="submit" class="secondary outline" style="margin: 0; font-size: 0.85rem;">
-              Dismiss (irrelevant)
-            </button>
-          </form>
+          <div style="display: flex; gap: 0.4rem; margin: 0; flex-wrap: wrap;">
+            <form method="post"
+                  action="{{ url_for('needs_tagging_mark_once_off', record_id=r['id']) }}"
+                  style="margin: 0;">
+              <input type="hidden" name="show" value="{{ show }}">
+              <button type="submit" class="secondary outline" style="margin: 0; font-size: 0.85rem;">
+                Once Off
+              </button>
+            </form>
+            <form method="post"
+                  action="{{ url_for('needs_tagging_dismiss', record_id=r['id']) }}"
+                  style="margin: 0;">
+              <input type="hidden" name="show" value="{{ show }}">
+              <button type="submit" class="secondary outline" style="margin: 0; font-size: 0.85rem;">
+                Dismiss (irrelevant)
+              </button>
+            </form>
+            {% if conflict_other %}
+            <form method="post"
+                  action="{{ url_for('needs_tagging_unmark_conflict_other', record_id=r['id']) }}"
+                  style="margin: 0;">
+              <input type="hidden" name="show" value="{{ show }}">
+              <button type="submit" class="secondary outline" style="margin: 0; font-size: 0.85rem;">
+                Undo Other (return to Conflicts)
+              </button>
+            </form>
+            {% endif %}
+          </div>
         {% endif %}
       </td>
     </tr>
@@ -123,6 +165,8 @@
 {% else %}
   {% if show == 'dismissed' %}
     <p>No dismissed rows. Anything you mark as irrelevant will appear here.</p>
+  {% elif show == 'once_off' %}
+    <p>No once-off rows. Anything you mark as a one-time charge will appear here until new activity in the same group re-surfaces it.</p>
   {% else %}
     <p>No Needs Tagging rows. Either the engine attributed everything cleanly, or it hasn't run yet.</p>
   {% endif %}

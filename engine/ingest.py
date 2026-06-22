@@ -78,6 +78,23 @@ _ACCOUNTING_PARENS = re.compile(r"^\((.+)\)$")
 # by the rename logic below.
 _PANDAS_UNNAMED = re.compile(r"^Unnamed:\s*\d+$")
 
+# Tableau emits AP-bill rows with Vendor blank and the actual vendor name
+# embedded in Record Description as 'Bill - <Vendor>: <memo>'. Reversal
+# bookkeeping prefixes the description with 'Reversed -- '. Capturing the
+# vendor lets these rows re-merge with real Vendor='<X>' groups instead of
+# forming phantom blank-vendor groups in Needs Tagging.
+_BILL_VENDOR_DESC_RE = re.compile(
+    r"^(?:Reversed\s*--\s*)?Bill\s*-\s*(.+?):",
+    re.IGNORECASE,
+)
+
+# When accounting books a reversal (the vendor didn't show up, the prior
+# payment is being clawed back), Tableau prefixes the description with
+# 'Reversed -- ' but exports the Amount as POSITIVE with Type=Charge. Per
+# operator intent, treat any 'Reversed -- ' row as a credit regardless of
+# source sign so it nets out against the original charge.
+_REVERSED_PREFIX_RE = re.compile(r"^\s*Reversed\s*--\s*", re.IGNORECASE)
+
 
 def _parse_amount(raw: object) -> float:
     """Convert one cell from the Amount column to a signed float.
@@ -104,6 +121,77 @@ def _parse_amount(raw: object) -> float:
         s = "-" + m.group(1)
     s = s.replace("$", "").replace(",", "").replace(" ", "")
     return float(s)
+
+
+def is_p_card_row(vendor: object, description: object) -> bool:
+    """True for blank-vendor rows whose description doesn't look like an AP
+    bill (i.e. no 'Bill - <X>:' prefix). These are typically purchasing-card
+    transactions or journal entries -- operational supply spend by an
+    employee on a corporate card, NOT contracted spend. Routes such rows to
+    the /p-card-spend audit surface instead of clogging Needs Tagging.
+
+    Phase 10 vendor backfill runs FIRST during parse_tableau_export, so any
+    row whose Vendor is still blank by the time this predicate is called
+    has already failed the 'Bill - X:' match. The check here is therefore
+    just on Vendor blankness -- with the regex re-test kept as belt-and-
+    suspenders in case the predicate is called against a pre-backfill df.
+    """
+    v = str(vendor or "").strip()
+    if v:
+        return False
+    d = str(description or "").strip()
+    if _BILL_VENDOR_DESC_RE.match(d):
+        return False
+    return True
+
+
+def _apply_description_repairs(df: pd.DataFrame) -> pd.DataFrame:
+    """Heal two Tableau-source quirks using Record Description text.
+
+    1. Vendor backfill -- rows with blank Vendor and a Record Description
+       matching '(?:Reversed -- )?Bill - <Vendor>:' get Vendor set to the
+       captured name. Lets AP-bill and reversal rows re-merge with the
+       real Vendor='<X>' groups downstream instead of forming phantom
+       blank-vendor groups in Needs Tagging.
+
+    2. Reversal sign-flip -- rows whose description starts with
+       'Reversed -- ' get Amount = -abs(Amount). Reversals are
+       contracted-but-undelivered payments being clawed back, so they
+       must show up as negatives to net out against the original charge,
+       regardless of what sign Tableau exported.
+
+    Mutates and returns df.
+    """
+    desc = df["Record Description"].fillna("").astype(str)
+
+    vendor_str = df["Vendor"].fillna("").astype(str).str.strip()
+    vendor_blank = vendor_str == ""
+    bill_match = desc.str.extract(_BILL_VENDOR_DESC_RE, expand=False)
+    fill_mask = vendor_blank & bill_match.notna()
+    backfilled = int(fill_mask.sum())
+    if backfilled:
+        df.loc[fill_mask, "Vendor"] = bill_match[fill_mask].str.strip()
+        log.info(
+            "ingest: backfilled Vendor from 'Bill - X:' description on %d "
+            "row(s) where Vendor was blank", backfilled,
+        )
+
+    reversed_mask = desc.str.match(_REVERSED_PREFIX_RE)
+    reversed_count = int(reversed_mask.sum())
+    if reversed_count:
+        already_negative = int(
+            (reversed_mask & (df["Amount"] < 0)).sum()
+        )
+        df.loc[reversed_mask, "Amount"] = (
+            -df.loc[reversed_mask, "Amount"].abs()
+        )
+        log.info(
+            "ingest: forced 'Reversed --' rows to negative on %d row(s) "
+            "(%d already negative, %d had source sign overridden)",
+            reversed_count, already_negative,
+            reversed_count - already_negative,
+        )
+    return df
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -244,6 +332,11 @@ def parse_tableau_export(
                 "parens-cleaned Amount — Type-based sign is authoritative "
                 "and was applied. Investigate the export format.", mismatches,
             )
+
+    # Heal source-data quirks from description text: backfill blank Vendor
+    # from 'Bill - X:' descriptions; force 'Reversed --' rows negative so
+    # they net out against the original charge. See _apply_description_repairs.
+    df = _apply_description_repairs(df)
 
     # Parse Date: M/D/YYYY (unpadded month/day OK with this format string).
     df["Date"] = pd.to_datetime(df["Date"], format="%m/%d/%Y", errors="raise")
@@ -538,4 +631,5 @@ __all__ = [
     "LocalFileSource",
     "TableauRestSource",
     "parse_tableau_export",
+    "is_p_card_row",
 ]

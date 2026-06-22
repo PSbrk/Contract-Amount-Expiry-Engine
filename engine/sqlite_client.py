@@ -46,6 +46,43 @@ log = logging.getLogger(__name__)
 DEFAULT_DB_PATH: Path = Path("data") / "engine.db"
 
 
+def backup_database_safely(db_path, backup_path: str | None) -> bool:
+    """Best-effort copy of the SQLite DB to `backup_path` (the OneDrive
+    mirror). Returns True if a copy was made, False otherwise; NEVER raises
+    — backup is a convenience, not a correctness boundary.
+
+    Shared by the --ingest path (engine/main.py) and the web UI's
+    after-request hook (#4), so operator decisions made in the UI between
+    ingests reach OneDrive instead of living only in the local engine.db.
+    """
+    if not backup_path:
+        return False
+    import shutil
+    try:
+        src = Path(db_path)
+        dest = Path(backup_path)
+        if not src.exists():
+            # The DB should always exist by the time a backup is requested
+            # (ingest wrote it / the UI request just used it). A missing
+            # source is anomalous — surface it rather than silently skip.
+            log.warning(
+                "engine.db backup skipped: source %s does not exist. "
+                "Local DB remains the source of truth.",
+                src,
+            )
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "engine.db backup to %s failed (%s: %s). Continuing — the "
+            "local DB remains the source of truth.",
+            backup_path, type(exc).__name__, exc,
+        )
+        return False
+
+
 def get_db_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
     """Open a SQLite connection with the engine's standard settings.
 
@@ -89,15 +126,28 @@ class SchemaPlan:
 # Tables with a UNIQUE index on a single column, used by ON CONFLICT upserts.
 # Vendor Aliases intentionally has no unique field — multi-row per contract
 # is allowed (operator can split aliases across rows for readability).
+# Learned Mappings is ALSO multi-row per Key as of Phase 7c — the operator
+# can author multiple pattern-specific LMs under one (Campus, Dept, Acct,
+# Vendor) key (one per Description Pattern). Composite uniqueness on
+# (Key, Description Pattern) is enforced at the application layer.
 _UNIQUE_FIELDS: dict[str, str] = {
     "Dashboard": "Asana Task GID",
     "Needs Tagging": "Group Key",
-    "Learned Mappings": "Key",
     "State": "Asana Task GID",
     "Run Log": "Run ID",
     "Campus Map": "Tableau Code",
     "Inbox": "File Hash",
+    # One amendment task has at most one parent -- the column is the
+    # natural identity for upserts. Multiple amendments per parent are
+    # allowed (no unique index on Parent Gid).
+    "Amendment Links": "Amendment Gid",
 }
+
+# Legacy indexes that ensure_schema actively drops on existing databases
+# (one-time migration; idempotent).
+_LEGACY_INDEXES_TO_DROP: tuple[str, ...] = (
+    "ux_Learned_Mappings_Key",   # removed in Phase 7c — multi-LM-per-Key
+)
 
 
 def _existing_tables(conn: sqlite3.Connection) -> set[str]:
@@ -165,7 +215,11 @@ def ensure_schema(
                     f'ALTER TABLE "{name}" ADD COLUMN "{fname}" {col_type}'
                 )
 
+    # One-time legacy-index migrations. ensure_schema is idempotent and
+    # frequently re-run, so DROP IF EXISTS is the right shape here.
     if not dry_run:
+        for idx_name in _LEGACY_INDEXES_TO_DROP:
+            conn.execute(f'DROP INDEX IF EXISTS "{idx_name}"')
         conn.commit()
     return plan
 
@@ -433,11 +487,30 @@ def load_campus_map_overrides(
 
 def load_learned_mappings(
     conn: sqlite3.Connection,
-) -> dict[tuple[str, str, str, str], str]:
-    """Return {(Campus, Dept, Account No, Vendor): Contract Name}."""
-    out: dict[tuple[str, str, str, str], str] = {}
+) -> dict[tuple[str, str, str, str], list[tuple[str, str | None, str | None]]]:
+    """Return {(Campus, Dept, Account No, Vendor): [LearnedMapping, ...]}.
+
+    Each LearnedMapping is a 3-tuple (Contract Name, Contract Gid, Description
+    Pattern):
+      - Contract Gid: None for legacy mappings (operator picked by name only).
+        When set, attribution prefers the specific Asana task GID over the
+        name-based resolution.
+      - Description Pattern: None for group-level LMs (apply to every row in
+        the group). When set, the LM only applies to rows whose Tableau
+        Record Description CONTAINS the pattern (case-insensitive substring),
+        letting the operator split one (Campus, Dept, Acct, Vendor) group
+        across multiple Asana tasks by line-item scope (landscaping vs snow,
+        etc.).
+
+    Multiple LMs can share a key — that's the whole point of patterns. The
+    list is sorted with pattern-bearing LMs first (longest pattern first)
+    and the plain LM (if any) last; the attribution lookup walks the list
+    and picks the most-specific match.
+    """
+    out: dict[tuple[str, str, str, str], list[tuple[str, str | None, str | None]]] = {}
     for row in conn.execute(
-        '''SELECT "Campus", "Dept", "Account No", "Vendor", "Contract Name"
+        '''SELECT "Campus", "Dept", "Account No", "Vendor",
+                  "Contract Name", "Contract Gid", "Description Pattern"
            FROM "Learned Mappings"'''
     ):
         key = (
@@ -447,10 +520,77 @@ def load_learned_mappings(
             (row["Vendor"] or "").strip(),
         )
         contract = (row["Contract Name"] or "").strip()
+        gid = (row["Contract Gid"] or "").strip() or None
+        pattern = (row["Description Pattern"] or "").strip() or None
         if not contract or not all(key):
             continue
-        out[key] = contract
+        out.setdefault(key, []).append((contract, gid, pattern))
+
+    # Sort each key's list: pattern-bearing LMs first (longest pattern wins
+    # the tiebreaker at lookup time, but presorting reduces work there),
+    # plain LM last.
+    for key_list in out.values():
+        key_list.sort(
+            key=lambda lm: (0, -len(lm[2])) if lm[2] else (1, 0),
+        )
     return out
+
+
+def upsert_plain_learned_mapping(
+    conn: sqlite3.Connection,
+    *,
+    key: str,
+    campus: str,
+    dept: str,
+    account_no: str,
+    vendor: str,
+    contract_name: str,
+    contract_gid: str = "",
+    learned_at: str,
+    notes: str = "",
+    commit: bool = True,
+) -> None:
+    """Insert or update the PLAIN (no-pattern) Learned Mapping for `key`.
+
+    Single owner of the SELECT-then-UPDATE/INSERT dance for the catch-all
+    LM, shared by promote_filled_needs_tagging and the Vendor Conflicts
+    pin / mark-amendment routes (previously three near-identical copies —
+    one of which forgot to write Contract Gid, letting a stale pin override
+    an operator's later name answer).
+
+    CRITICAL: the UPDATE path ALWAYS writes "Contract Gid" (to ''/NULL when
+    the caller passes no gid). A name-based promotion therefore CLEARS any
+    stale pinned gid on the existing row, so attribution resolves by the
+    operator's freshly-chosen name instead of the leftover pin.
+    """
+    gid_val = (contract_gid or "").strip()
+    existing = conn.execute(
+        '''SELECT id FROM "Learned Mappings"
+           WHERE "Key" = ?
+             AND COALESCE("Description Pattern", '') = '' ''',
+        (key,),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            '''UPDATE "Learned Mappings"
+               SET "Campus" = ?, "Dept" = ?, "Account No" = ?,
+                   "Vendor" = ?, "Contract Name" = ?, "Contract Gid" = ?,
+                   "Learned At" = ?, "Notes" = ?
+               WHERE id = ?''',
+            (campus, dept, account_no, vendor, contract_name, gid_val,
+             learned_at, notes, existing["id"]),
+        )
+    else:
+        conn.execute(
+            '''INSERT INTO "Learned Mappings"
+                 ("Key", "Campus", "Dept", "Account No", "Vendor",
+                  "Contract Name", "Contract Gid", "Learned At", "Notes")
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (key, campus, dept, account_no, vendor, contract_name, gid_val,
+             learned_at, notes),
+        )
+    if commit:
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +623,13 @@ def upsert_needs_tagging_group(
     created_at_iso_date: str,
     first_date: str = "",
     last_date: str = "",
+    candidate_gids: list[str] | None = None,
+    distinct_descriptions: (
+        list[tuple[str, int, float]]
+        | list[tuple[str, int, float, str, str]]
+        | None
+    ) = None,
+    out_of_term: bool = False,
 ) -> dict:
     """Idempotent upsert keyed by Group Key.
 
@@ -505,6 +652,39 @@ def upsert_needs_tagging_group(
     else:
         candidate_lines.append("No vendor candidates found.")
     engine_candidates = "\n".join(candidate_lines)
+    engine_candidate_gids = "\n".join(candidate_gids or [])
+    # distinct_descriptions is a list of (desc, rows, amount) or, since
+    # Phase 13, (desc, rows, amount, min_date_iso, max_date_iso) tuples.
+    # We serialize to JSON so the UI can render the per-description picker
+    # without losing the structured fields. min_date/max_date default to ""
+    # when the input is the legacy 3-tuple shape (tolerated so a partial
+    # rollout — old code writing rows, new code reading them, or vice
+    # versa — degrades to text-only matching rather than crashing).
+    import json as _json
+    _dd_dicts: list[dict] = []
+    for _t in (distinct_descriptions or []):
+        if len(_t) == 5:
+            d, r, a, dmin, dmax = _t
+        elif len(_t) == 3:
+            d, r, a = _t
+            dmin, dmax = "", ""
+        else:
+            # Defensive: an unexpected tuple shape gets stringified into the
+            # description so it's at least visible to the operator and we
+            # don't silently drop the bucket.
+            d, r, a, dmin, dmax = (repr(_t), 0, 0.0, "", "")
+        _dd_dicts.append({
+            "description": d, "rows": r, "amount": a,
+            "min_date": dmin, "max_date": dmax,
+        })
+    distinct_descriptions_json = _json.dumps(_dd_dicts)
+
+    # Phase 11: classify p-card / journal rows so they route to the
+    # /p-card-spend audit surface instead of Needs Tagging Open. The
+    # predicate is engine-owned and recomputed on every upsert -- the
+    # classifier can evolve without an operator-driven flip.
+    from engine.ingest import is_p_card_row
+    is_p_card_flag = 1 if is_p_card_row(vendor, sample_description) else 0
 
     existing = _fetch_by_field(conn, "Needs Tagging", "Group Key", group_key)
     if existing:
@@ -515,16 +695,79 @@ def upsert_needs_tagging_group(
             # exactly as it was when dismissed so the operator's audit
             # trail (sample / amount as of dismissal time) is preserved.
             return existing
+        # #9: never let a re-ingest flip an operator-ENGAGED row into the
+        # hidden /p-card-spend surface. If a later export emits the same
+        # group with a blank vendor (backfill missed, reversal memo, etc.)
+        # is_p_card_row would return True and the row would vanish from both
+        # Needs Tagging and Vendor Conflicts, stranding the operator's
+        # Assign / Conflict-Other / Once-Off decision where it can't be
+        # acted on. Preserve the existing flag whenever the operator has
+        # engaged; recompute freely for untouched rows.
+        existing_is_p_card = 1 if existing["fields"].get("Is P-Card") else 0
+        operator_engaged = bool(
+            (existing["fields"].get("Assign Contract") or "").strip()
+            or existing["fields"].get("Conflict Other")
+            or existing["fields"].get("Once Off")
+        )
+        effective_is_p_card = (
+            existing_is_p_card if operator_engaged else is_p_card_flag
+        )
+        if existing["fields"].get("Once Off"):
+            # Once Off: the operator parked this group as a valid one-time
+            # charge. Re-surface ONLY if NEW activity has arrived since the
+            # anchor — i.e. the export's Last Date is strictly after the
+            # anchor. Same-anchor / earlier-than-anchor → no-op (preserves
+            # the operator's snapshot of state-at-marking).
+            anchor = (existing["fields"].get("Once Off Anchor") or "").strip()
+            # Resurface when genuinely NEW dated activity has arrived. An
+            # EMPTY anchor means the group had no parsable dates when it was
+            # parked (#10) — treat any later non-empty Last Date as new
+            # activity so the group can't be suppressed forever once real
+            # dates show up.
+            new_activity = bool(last_date) and (not anchor or last_date > anchor)
+            if new_activity:
+                # Resurface: clear the once-off flag and refresh the row
+                # normally so the operator sees the new state.
+                conn.execute(
+                    '''UPDATE "Needs Tagging"
+                       SET "Sample Record Description" = ?,
+                           "$ in group" = ?,
+                           "First Date" = ?,
+                           "Last Date" = ?,
+                           "Engine Candidates" = ?,
+                           "Engine Candidate Gids" = ?,
+                           "Distinct Descriptions JSON" = ?,
+                           "Is P-Card" = ?,
+                           "Out Of Term" = ?,
+                           "Once Off" = 0,
+                           "Once Off Anchor" = NULL
+                       WHERE id = ?''',
+                    (sample_description, amount, first_date, last_date,
+                     engine_candidates, engine_candidate_gids,
+                     distinct_descriptions_json, effective_is_p_card,
+                     1 if out_of_term else 0,
+                     existing["id"]),
+                )
+                conn.commit()
+                return _fetch_by_id(conn, "Needs Tagging", existing["id"])
+            # No new activity → leave the once-off snapshot intact.
+            return existing
         conn.execute(
             '''UPDATE "Needs Tagging"
                SET "Sample Record Description" = ?,
                    "$ in group" = ?,
                    "First Date" = ?,
                    "Last Date" = ?,
-                   "Engine Candidates" = ?
+                   "Engine Candidates" = ?,
+                   "Engine Candidate Gids" = ?,
+                   "Distinct Descriptions JSON" = ?,
+                   "Is P-Card" = ?,
+                   "Out Of Term" = ?
                WHERE id = ?''',
             (sample_description, amount, first_date, last_date,
-             engine_candidates, existing["id"]),
+             engine_candidates, engine_candidate_gids,
+             distinct_descriptions_json, effective_is_p_card,
+             1 if out_of_term else 0, existing["id"]),
         )
         conn.commit()
         return _fetch_by_id(conn, "Needs Tagging", existing["id"])
@@ -534,11 +777,14 @@ def upsert_needs_tagging_group(
              ("Group Key", "Campus", "Dept", "Account No", "Vendor",
               "Sample Record Description", "$ in group",
               "First Date", "Last Date",
-              "Created At", "Engine Candidates")
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              "Created At", "Engine Candidates", "Engine Candidate Gids",
+              "Distinct Descriptions JSON", "Is P-Card", "Out Of Term")
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
         (group_key, campus, dept, account_no, vendor,
          sample_description, amount, first_date, last_date,
-         created_at_iso_date, engine_candidates),
+         created_at_iso_date, engine_candidates, engine_candidate_gids,
+         distinct_descriptions_json, is_p_card_flag,
+         1 if out_of_term else 0),
     )
     conn.commit()
     return _fetch_by_id(conn, "Needs Tagging", cur.lastrowid)
@@ -598,26 +844,20 @@ def promote_filled_needs_tagging(
             f"Promoted from Needs Tagging on {learned_at_iso_date}. "
             f"Operator selected: {contract_name}."
         )
-        existing_lm = _fetch_by_field(conn, "Learned Mappings", "Key", group_key)
-        if existing_lm:
-            conn.execute(
-                '''UPDATE "Learned Mappings"
-                   SET "Campus" = ?, "Dept" = ?, "Account No" = ?,
-                       "Vendor" = ?, "Contract Name" = ?,
-                       "Learned At" = ?, "Notes" = ?
-                   WHERE id = ?''',
-                (campus, dept, account_no, vendor, contract_name,
-                 learned_at_iso_date, notes_text, existing_lm["id"]),
-            )
-        else:
-            conn.execute(
-                '''INSERT INTO "Learned Mappings"
-                     ("Key", "Campus", "Dept", "Account No", "Vendor",
-                      "Contract Name", "Learned At", "Notes")
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                (group_key, campus, dept, account_no, vendor,
-                 contract_name, learned_at_iso_date, notes_text),
-            )
+        # Write the PLAIN (no-pattern) catch-all LM for the group via the
+        # shared helper. contract_gid is intentionally omitted (->''): a
+        # NAME-based promotion must CLEAR any stale pinned gid left by a
+        # prior Vendor Conflicts pin, so attribution resolves by the
+        # operator's freshly-chosen name rather than the leftover pin (#1).
+        upsert_plain_learned_mapping(
+            conn,
+            key=group_key,
+            campus=campus, dept=dept, account_no=account_no, vendor=vendor,
+            contract_name=contract_name,
+            learned_at=learned_at_iso_date,
+            notes=notes_text,
+            commit=False,
+        )
 
         try:
             conn.execute(
@@ -787,6 +1027,96 @@ def delete_learned_mapping(conn: sqlite3.Connection, *, record_id: int) -> None:
     conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Amendment Links -- operator-declared "task A is amendment of task B"
+# ---------------------------------------------------------------------------
+
+def load_amendment_links(
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, dict], dict[str, list[dict]]]:
+    """Return (parent_by_amendment, amendments_by_parent).
+
+    parent_by_amendment maps amendment_gid -> {parent_gid, parent_name,
+    amendment_name, linked_at}. amendments_by_parent maps parent_gid ->
+    list of {amendment_gid, parent_name, amendment_name, linked_at} (one
+    parent can have multiple amendments).
+    """
+    parent_by_amendment: dict[str, dict] = {}
+    amendments_by_parent: dict[str, list[dict]] = {}
+    for row in conn.execute(
+        '''SELECT "Parent Gid", "Amendment Gid", "Parent Name",
+                  "Amendment Name", "Linked At"
+           FROM "Amendment Links"'''
+    ):
+        parent_gid = (row["Parent Gid"] or "").strip()
+        amendment_gid = (row["Amendment Gid"] or "").strip()
+        if not parent_gid or not amendment_gid:
+            continue
+        link = {
+            "parent_gid": parent_gid,
+            "amendment_gid": amendment_gid,
+            "parent_name": (row["Parent Name"] or "").strip(),
+            "amendment_name": (row["Amendment Name"] or "").strip(),
+            "linked_at": (row["Linked At"] or "").strip(),
+        }
+        parent_by_amendment[amendment_gid] = link
+        amendments_by_parent.setdefault(parent_gid, []).append(link)
+    return parent_by_amendment, amendments_by_parent
+
+
+def insert_amendment_link(
+    conn: sqlite3.Connection,
+    *,
+    parent_gid: str,
+    amendment_gid: str,
+    parent_name: str = "",
+    amendment_name: str = "",
+    linked_at: str = "",
+    notes: str = "",
+) -> dict:
+    """Insert one Amendment Links row. UNIQUE on Amendment Gid -- ON CONFLICT
+    upserts so the operator can re-link to a different parent without first
+    deleting. Self-link (parent_gid == amendment_gid) is rejected up front.
+    """
+    if not parent_gid or not amendment_gid:
+        raise ValueError("parent_gid and amendment_gid are both required.")
+    if parent_gid == amendment_gid:
+        raise ValueError(
+            f"Refusing self-link: a task cannot be an amendment of itself "
+            f"(gid {amendment_gid})."
+        )
+    conn.execute(
+        '''INSERT INTO "Amendment Links"
+             ("Parent Gid", "Amendment Gid", "Parent Name",
+              "Amendment Name", "Linked At", "Notes")
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT("Amendment Gid") DO UPDATE SET
+             "Parent Gid" = excluded."Parent Gid",
+             "Parent Name" = excluded."Parent Name",
+             "Amendment Name" = excluded."Amendment Name",
+             "Linked At" = excluded."Linked At",
+             "Notes" = excluded."Notes"''',
+        (parent_gid, amendment_gid, parent_name, amendment_name,
+         linked_at, notes),
+    )
+    conn.commit()
+    return _fetch_by_field(
+        conn, "Amendment Links", "Amendment Gid", amendment_gid
+    )
+
+
+def delete_amendment_link(
+    conn: sqlite3.Connection, *, amendment_gid: str
+) -> None:
+    """Remove the amendment-of relationship for the given amendment_gid.
+    Idempotent: deleting a non-existent link is a no-op."""
+    conn.execute(
+        'DELETE FROM "Amendment Links" WHERE "Amendment Gid" = ?',
+        (amendment_gid,),
+    )
+    conn.commit()
+
+
 def set_needs_tagging_dismissed(
     conn: sqlite3.Connection,
     *,
@@ -802,6 +1132,83 @@ def set_needs_tagging_dismissed(
     conn.execute(
         'UPDATE "Needs Tagging" SET "Dismissed" = ? WHERE id = ?',
         (1 if dismissed else 0, record_id),
+    )
+    conn.commit()
+
+
+def set_needs_tagging_once_off(
+    conn: sqlite3.Connection,
+    *,
+    record_id: int,
+    once_off: bool,
+) -> None:
+    """Operator-driven mark/unmark of the Once Off flag. When MARKING,
+    the row's current Last Date is snapshotted as the Once Off Anchor —
+    that's what the next ingest compares against to decide whether to
+    re-surface. UNMARKING clears both the flag and the anchor so the row
+    goes back to the open queue normally.
+
+    Mutually exclusive with Dismissed at the UX level (the buttons aren't
+    both shown), but not enforced at the storage level — a hand-edited
+    row with both flags set will be treated as Dismissed (which checks
+    first in upsert_needs_tagging_group).
+    """
+    if once_off:
+        # Read the current Last Date to use as the resurface anchor.
+        row = conn.execute(
+            'SELECT "Last Date" FROM "Needs Tagging" WHERE id = ?',
+            (record_id,),
+        ).fetchone()
+        anchor = (row["Last Date"] if row else "") or ""
+        conn.execute(
+            '''UPDATE "Needs Tagging"
+               SET "Once Off" = 1, "Once Off Anchor" = ?
+               WHERE id = ?''',
+            (anchor, record_id),
+        )
+    else:
+        conn.execute(
+            '''UPDATE "Needs Tagging"
+               SET "Once Off" = 0, "Once Off Anchor" = NULL
+               WHERE id = ?''',
+            (record_id,),
+        )
+    conn.commit()
+
+
+def set_needs_tagging_p_card_ignored(
+    conn: sqlite3.Connection,
+    *,
+    record_id: int,
+    p_card_ignored: bool,
+) -> None:
+    """Operator-driven UPDATE of the P-Card Ignored flag on a single Needs
+    Tagging row. Idempotent. Used by the /p-card-spend "Ignore once" button
+    so the operator can clear rows they've eyeballed off the active P-Card
+    list; restorable via the Ignored tab. Operator-owned: the engine upsert
+    never touches this flag."""
+    conn.execute(
+        'UPDATE "Needs Tagging" SET "P-Card Ignored" = ? WHERE id = ?',
+        (1 if p_card_ignored else 0, record_id),
+    )
+    conn.commit()
+
+
+def set_needs_tagging_conflict_other(
+    conn: sqlite3.Connection,
+    *,
+    record_id: int,
+    conflict_other: bool,
+) -> None:
+    """Operator-driven UPDATE of the Conflict Other flag on a single Needs
+    Tagging row. Idempotent. When True, the row is hidden from the Vendor
+    Conflicts review panel (operator has declared none of the engine's
+    vendor candidates fit) but remains in the open Needs Tagging queue so
+    the operator can resolve it via Assign Contract. When False (undo),
+    the row reappears in Vendor Conflicts if it still has candidate gids."""
+    conn.execute(
+        'UPDATE "Needs Tagging" SET "Conflict Other" = ? WHERE id = ?',
+        (1 if conflict_other else 0, record_id),
     )
     conn.commit()
 
@@ -833,17 +1240,22 @@ def cleanup_stale_needs_tagging(
     conn: sqlite3.Connection, *, live_group_keys: set[str]
 ) -> int:
     """Delete Needs Tagging rows whose Group Key is NOT in live_group_keys
-    AND whose Assign Contract is empty AND that are NOT Dismissed.
+    AND whose Assign Contract is empty AND that are NOT Dismissed AND that
+    are NOT Once Off.
 
     Filled rows (operator answers in flight) are NEVER deleted by this
     path -- they are the promotion queue's responsibility. Dismissed
     rows are also kept indefinitely so the same group does not get
     re-detected and re-surfaced after the operator marked it irrelevant.
+    Once Off rows are kept too — the anchor date stored on the row is
+    what lets the engine decide whether to re-surface, so deleting the
+    row would lose the operator's snapshot.
     """
     rows = conn.execute(
         '''SELECT id, "Group Key" FROM "Needs Tagging"
            WHERE ("Assign Contract" IS NULL OR TRIM("Assign Contract") = '')
-             AND COALESCE("Dismissed", 0) = 0'''
+             AND COALESCE("Dismissed", 0) = 0
+             AND COALESCE("Once Off", 0) = 0'''
     ).fetchall()
     deleted = 0
     for r in rows:
@@ -915,8 +1327,9 @@ def upsert_dashboard_row(conn: sqlite3.Connection, row) -> dict:
              ("Contract", "Asana Task GID", "Campus Set", "Contract Amount",
               "Spent so far", "% Spent", "Spending Rate",
               "Spending Rate Alarm", "Alarms",
-              "Start", "Due", "Status", "PM Email", "Last Updated")
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              "Start", "Due", "Status", "PM Email",
+              "Contract Reason Text", "Last Updated")
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT("Asana Task GID") DO UPDATE SET
              "Contract" = excluded."Contract",
              "Campus Set" = excluded."Campus Set",
@@ -930,6 +1343,7 @@ def upsert_dashboard_row(conn: sqlite3.Connection, row) -> dict:
              "Due" = excluded."Due",
              "Status" = excluded."Status",
              "PM Email" = excluded."PM Email",
+             "Contract Reason Text" = excluded."Contract Reason Text",
              "Last Updated" = excluded."Last Updated"''',
         (
             row.contract_name, row.asana_task_gid, row.campus_set,
@@ -937,7 +1351,8 @@ def upsert_dashboard_row(conn: sqlite3.Connection, row) -> dict:
             pct_spent, spending_rate, row.spending_rate_alarm, row.alarms,
             row.start.isoformat(),
             row.due.isoformat() if row.due is not None else None,
-            row.status, row.pm_email, row.last_updated.isoformat(),
+            row.status, row.pm_email, row.contract_reason_text,
+            row.last_updated.isoformat(),
         ),
     )
     conn.commit()
@@ -1100,6 +1515,7 @@ __all__ = [
     "Promotion",
     "DEFAULT_DB_PATH",
     "get_db_connection",
+    "backup_database_safely",
     "ensure_schema",
     "sha256_hex",
     "file_hash_already_processed",
@@ -1109,8 +1525,13 @@ __all__ = [
     "load_vendor_aliases",
     "load_campus_map_overrides",
     "load_learned_mappings",
+    "upsert_plain_learned_mapping",
     "upsert_needs_tagging_group",
     "set_needs_tagging_assign_contract",
+    "set_needs_tagging_dismissed",
+    "set_needs_tagging_once_off",
+    "set_needs_tagging_conflict_other",
+    "set_needs_tagging_p_card_ignored",
     "promote_filled_needs_tagging",
     "cleanup_stale_needs_tagging",
     "insert_vendor_alias",
@@ -1122,6 +1543,9 @@ __all__ = [
     "insert_learned_mapping",
     "update_learned_mapping",
     "delete_learned_mapping",
+    "load_amendment_links",
+    "insert_amendment_link",
+    "delete_amendment_link",
     "upsert_dashboard_row",
     "load_state_priors",
     "upsert_state_for_contract",

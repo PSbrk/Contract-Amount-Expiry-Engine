@@ -199,13 +199,14 @@ def test_parse_strips_trailing_whitespace_in_data_cells(tmp_path):
     _write_tsv(
         path,
         # In-scope row with trailing whitespace on key filter columns.
-        "R001\tCEN \t000 \t63015 \tDesc\t\tVendor\tDesc\t\tref\t1/1/2025\tCharge \t$1,000.00",
+        # Using 63080 (still in scope) — 63015 was retired on 2026-06-16.
+        "R001\tCEN \t000 \t63080 \tDesc\t\tVendor\tDesc\t\tref\t1/1/2025\tCharge \t$1,000.00",
     )
     df = parse_tableau_export(path)
     row = df.iloc[0]
     assert row["Campus"] == "CEN"
     assert row["Dept"] == "000"
-    assert row["Account No"] == "63015"
+    assert row["Account No"] == "63080"
     assert row["Type"] == "Charge"
     # And the filter actually keeps it.
     assert len(in_scope(df)) == 1
@@ -334,6 +335,99 @@ def test_transaction_source_default_is_local_inbox():
     `airtable_inbox` and `tableau_rest` remain available but are opt-in."""
     from config import settings
     assert settings.TRANSACTION_SOURCE == "local_inbox"
+
+
+def test_vendor_backfill_from_bill_description(tmp_path):
+    """Tableau emits AP bills with blank Vendor and 'Bill - <X>: <memo>' in
+    Record Description. Engine must copy the vendor name out of the
+    description so these rows merge with the real Vendor='<X>' groups."""
+    path = tmp_path / "billbackfill.tsv"
+    _write_tsv(
+        path,
+        # Blank vendor, 'Bill - X:' description → Vendor backfilled.
+        "R001\tSTO\t000\t63090\tDesc\t\t\tBill - The Stewards Company: Window Cleaning 12/2024\t\tref\t1/1/2025\tCharge\t$1,050.00",
+        # Blank vendor, no Bill - pattern → stays blank (p-card style).
+        "R002\tCEN\t000\t63040\tDesc\t\t\tCarpet square glue, LOWES #01536*\t\tref\t1/15/2025\tCharge\t$120.00",
+        # Already-filled vendor → unchanged even if description has Bill -.
+        "R003\tBAO\t000\t63090\tDesc\t\tFoo Co\tBill - Bar Co: ignore me\t\tref\t1/20/2025\tCharge\t$500.00",
+    )
+    df = parse_tableau_export(path)
+    r001 = df.loc[df["Record No"] == "R001"].iloc[0]
+    r002 = df.loc[df["Record No"] == "R002"].iloc[0]
+    r003 = df.loc[df["Record No"] == "R003"].iloc[0]
+    assert r001["Vendor"] == "The Stewards Company"
+    assert (r002["Vendor"] or "") == ""  # untouched
+    assert r003["Vendor"] == "Foo Co"     # source-truth wins
+
+
+def test_reversal_description_forces_negative_amount(tmp_path):
+    """'Reversed -- ' rows are clawbacks (vendor didn't deliver) and must
+    net out against the original charge. Tableau exports them as POSITIVE
+    Charge rows; engine forces -abs(Amount) regardless of source sign."""
+    path = tmp_path / "reversal.tsv"
+    _write_tsv(
+        path,
+        # Positive Charge with Reversed prefix → must flip to negative.
+        "R001\tSTO\t000\t63090\tDesc\t\t\tReversed -- Bill - The Stewards Company: Window Cleaning 12/2024\t\tref\t1/1/2025\tCharge\t$9,459.57",
+        # Positive Charge, no Reversed prefix → stays positive.
+        "R002\tSTO\t000\t63090\tDesc\t\tFoo Co\tWindow Cleaning 01/2025\t\tref\t1/15/2025\tCharge\t$1,000.00",
+        # Reversed prefix with no Bill - pattern (sign flips, vendor stays blank).
+        "R003\tMUS\t000\t63040\tDesc\t\t\tReversed -- MUS Lowe's CAM Charges Accrual\t\tref\t1/20/2025\tCharge\t$2,500.00",
+    )
+    df = parse_tableau_export(path)
+    r001 = df.loc[df["Record No"] == "R001"].iloc[0]
+    r002 = df.loc[df["Record No"] == "R002"].iloc[0]
+    r003 = df.loc[df["Record No"] == "R003"].iloc[0]
+    assert r001["Amount"] == pytest.approx(-9459.57)
+    assert r001["Vendor"] == "The Stewards Company"
+    assert r002["Amount"] == pytest.approx(1000.0)
+    assert r003["Amount"] == pytest.approx(-2500.0)
+    assert (r003["Vendor"] or "") == ""
+
+
+def test_reversal_already_negative_stays_negative(tmp_path):
+    """A reversal row that arrives with parens (already negative after
+    parse) must stay negative — the rule is -abs, idempotent."""
+    path = tmp_path / "reversal_neg.tsv"
+    _write_tsv(
+        path,
+        "R001\tSTO\t000\t63090\tDesc\t\t\tReversed -- Bill - X Co: memo\t\tref\t1/1/2025\tCredit\t($500.00)",
+    )
+    df = parse_tableau_export(path)
+    r001 = df.loc[df["Record No"] == "R001"].iloc[0]
+    assert r001["Amount"] == pytest.approx(-500.0)
+
+
+def test_vendor_backfill_and_sign_flip_compose(tmp_path):
+    """A 'Reversed -- Bill - X:' row gets BOTH vendor backfill AND sign
+    flip. The two operations are orthogonal."""
+    path = tmp_path / "combo.tsv"
+    _write_tsv(
+        path,
+        "R001\tSTO\t000\t63090\tDesc\t\t\tReversed -- Bill - The Stewards Company: Window Cleaning 12/2024\t\tref\t1/1/2025\tCharge\t$9,459.57",
+    )
+    df = parse_tableau_export(path)
+    r001 = df.loc[df["Record No"] == "R001"].iloc[0]
+    assert r001["Vendor"] == "The Stewards Company"
+    assert r001["Amount"] == pytest.approx(-9459.57)
+
+
+def test_is_p_card_row_predicate():
+    """Blank-vendor non-Bill rows are p-card; everything else isn't."""
+    from engine.ingest import is_p_card_row
+    # P-card: blank vendor, p-card-style description.
+    assert is_p_card_row("", "Reflective markers for parking lot, GRAINGER, Hunter, Tami, 01/03/2025")
+    assert is_p_card_row(None, "Carpet square glue, LOWES #01536*, Sanders, Jesse, 01/15/2025")
+    assert is_p_card_row("   ", "Office supplies, AMAZON MKTPL*ZP06Y5UV0, Mea, 01/19/2025")
+    # Reversed but no Bill pattern → still classified p-card (the operator
+    # can Ignore once if it's bookkeeping noise).
+    assert is_p_card_row("", "Reversed -- MUS Lowe's CAM Charges Accrual")
+    # NOT p-card: vendor populated.
+    assert not is_p_card_row("The Stewards Company", "Window Cleaning 12/2024")
+    assert not is_p_card_row("Bear Claw Landscaping", "Groundskeeping 01/2025")
+    # NOT p-card: Bill - X: pattern (AP bill row — Phase 10 would backfill).
+    assert not is_p_card_row("", "Bill - The Stewards Company: Window Cleaning 12/2024")
+    assert not is_p_card_row("", "Reversed -- Bill - Foo Co: bar memo")
 
 
 def test_parse_warns_on_extra_columns(tmp_path, caplog):

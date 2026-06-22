@@ -32,8 +32,37 @@
   </thead>
   <tbody>
   {% for r in rows %}
+    {% set xref = amendment_xref.get(r["Asana Task GID"]) %}
     <tr>
-      <td>{{ r["Contract"] }}</td>
+      <td>
+        {{ r["Contract"] }}
+        {% if xref %}
+        <br>
+        {% if xref.is_amendment_of %}
+          {% set p = xref.is_amendment_of %}
+          <small style="color: var(--pico-muted-color);">
+            ↳ amendment of <strong>{{ p.name }}</strong>
+            {% if p.in_dashboard %}
+              (${{ "{:,.2f}".format(p.contract_amount or 0) }} budget,
+              ${{ "{:,.2f}".format(p.spent_so_far or 0) }} spent)
+            {% else %}
+              <em>(not in current dashboard)</em>
+            {% endif %}
+          </small>
+        {% endif %}
+        {% for a in xref.has_amendments %}
+          <small style="color: var(--pico-muted-color);">
+            + amendment <strong>{{ a.name }}</strong>
+            {% if a.in_dashboard %}
+              (${{ "{:,.2f}".format(a.contract_amount or 0) }} budget,
+              ${{ "{:,.2f}".format(a.spent_so_far or 0) }} spent)
+            {% else %}
+              <em>(not in current dashboard)</em>
+            {% endif %}
+          </small><br>
+        {% endfor %}
+        {% endif %}
+      </td>
       <td>{{ r["Campus Set"] or "" }}</td>
       <td class="num">{% if r["Contract Amount"] is not none %}${{ "{:,.2f}".format(r["Contract Amount"]) }}{% endif %}</td>
       <td class="num">${{ "{:,.2f}".format(r["Spent so far"] or 0) }}</td>

@@ -9,8 +9,10 @@ from config import campus_map, settings
 
 
 def test_filter_sets_match_spec():
+    # 63015 (Capital Projects) removed from scope on 2026-06-16 — engine
+    # no longer tracks CapEx.
     assert settings.ACCOUNTS_IN_SCOPE == frozenset(
-        {"63015", "63020", "63040", "63080", "63090"}
+        {"63020", "63040", "63080", "63090"}
     )
     assert settings.DEPTS_IN_SCOPE == frozenset({"000", "107"})
 
@@ -66,16 +68,18 @@ def test_expected_read_fields_have_status_and_expire_options():
 
 
 def test_engine_table_names_in_schema():
-    """The 8-table contract: Inbox, Dashboard, Needs Tagging, Vendor Aliases,
-    Campus Map, Learned Mappings, State, Run Log. Pinned in config.schema
-    so a rename or deletion fails CI rather than silently breaking the UI."""
+    """The 9-table contract: Inbox, Dashboard, Needs Tagging, Vendor Aliases,
+    Campus Map, Learned Mappings, Amendment Links, State, Run Log. Pinned
+    in config.schema so a rename or deletion fails CI rather than silently
+    breaking the UI."""
     from config import schema
     expected = {
         "Inbox", "Dashboard", "Needs Tagging", "Vendor Aliases",
-        "Campus Map", "Learned Mappings", "State", "Run Log",
+        "Campus Map", "Learned Mappings", "Amendment Links",
+        "State", "Run Log",
     }
     assert set(schema.TABLE_NAMES) == expected
-    assert len(schema.TABLE_NAMES) == 8  # no duplicates
+    assert len(schema.TABLE_NAMES) == 9  # no duplicates
 
 
 def test_write_gate_section_is_active_compliant():

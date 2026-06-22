@@ -49,6 +49,12 @@ class Contract:
     expire_countdown: str | None
     pm_email: str | None
     section_name: str | None
+    # Operator-authored description of what the contract covers. Used by
+    # attribution as a tie-breaker for same-vendor multi-task ambiguity
+    # (e.g. landscaping vs snow-removal at the same vendor) — matched
+    # against the Tableau row's Record Description. Empty for older tasks
+    # that pre-date the field.
+    contract_reason_text: str | None = None
     # Current values of the five writable fields (Step 5 idempotent diff).
     current_spent_so_far: float | None = None
     current_pct_spent: float | None = None
@@ -126,6 +132,11 @@ def task_to_contract(task: dict, project_gid: str = settings.ASANA_PROJECT_GID) 
     if pm is not None:
         pm_email = pm.get("text_value") or None
 
+    contract_reason_text = None
+    crt = cf.get(settings.ASANA_FIELD_CONTRACT_REASON_TEXT)
+    if crt is not None:
+        contract_reason_text = crt.get("text_value") or None
+
     # Current values of the writable fields — Step 5 diffs against these.
     def _number(field_gid: str) -> float | None:
         f = cf.get(field_gid)
@@ -142,6 +153,7 @@ def task_to_contract(task: dict, project_gid: str = settings.ASANA_PROJECT_GID) 
         expire_countdown=_enum_name(cf.get(settings.ASANA_FIELD_EXPIRE_COUNTDOWN)),
         pm_email=pm_email,
         section_name=_section_name_for_project(task, project_gid),
+        contract_reason_text=contract_reason_text,
         current_spent_so_far=_number(settings.ASANA_FIELD_SPENT_SO_FAR),
         current_pct_spent=_number(settings.ASANA_FIELD_PCT_SPENT),
         current_spending_rate=_number(settings.ASANA_FIELD_SPENDING_RATE),

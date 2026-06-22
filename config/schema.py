@@ -103,6 +103,14 @@ TABLES_SCHEMA: Final = [
             {"name": "Status", "type": "singleLineText",
              "description": "Asana Contract Status option name (Active, etc.)."},
             {"name": "PM Email", "type": "singleLineText"},
+            {"name": "Contract Reason Text", "type": "multilineText",
+             "description": (
+                 "Operator-authored description of what this contract "
+                 "covers. Surfaced in the Vendor Conflicts UI so the "
+                 "operator can compare it against the Tableau Sample "
+                 "Record Description when picking which task a same-vendor "
+                 "ambiguous group belongs to."
+             )},
             {"name": "Last Updated", "type": "date"},
         ],
     },
@@ -139,11 +147,84 @@ TABLES_SCHEMA: Final = [
                  "etc.). Engine skips re-upserting dismissed rows and "
                  "cleanup_stale never deletes them."
              )},
+            {"name": "Once Off", "type": "checkbox",
+             "description": (
+                 "Operator-set: 1 = the current transactions in this group "
+                 "are valid one-offs (no ongoing relationship) and should "
+                 "be hidden for now. UNLIKE Dismissed, the engine will "
+                 "RE-SURFACE the row on a future ingest IF new transactions "
+                 "arrive in the group — i.e. if the group's Last Date "
+                 "advances past the Once Off Anchor. cleanup_stale never "
+                 "deletes Once Off rows; the anchor would be lost."
+             )},
+            {"name": "Once Off Anchor", "type": "date",
+             "description": (
+                 "Engine-managed: the group's Last Date at the moment the "
+                 "operator marked it Once Off. The resurface check compares "
+                 "the incoming export's Last Date against this anchor — any "
+                 "transaction dated after the anchor is 'new activity' and "
+                 "trips the once-off flag back to 0."
+             )},
+            {"name": "Conflict Other", "type": "checkbox",
+             "description": (
+                 "Operator-set: 1 = none of the engine's vendor candidates "
+                 "fit this group (e.g. payment is for a campus none of the "
+                 "candidate Asana tasks cover). Hides the row from the "
+                 "Vendor Conflicts review panel while leaving it in the "
+                 "Open Needs Tagging queue so the operator can resolve it "
+                 "via Assign Contract. Operator-owned: never touched by "
+                 "the engine upsert."
+             )},
+            {"name": "Is P-Card", "type": "checkbox",
+             "description": (
+                 "Engine-set: 1 = row is a likely purchasing-card / journal "
+                 "transaction (blank Vendor, description doesn't fit the "
+                 "'Bill - <Vendor>:' AP pattern). Hides the row from Needs "
+                 "Tagging Open and Vendor Conflicts; surfaces it on the "
+                 "/p-card-spend audit page instead. Recomputed by the "
+                 "engine on every upsert based on current Vendor + "
+                 "description, so the classifier can evolve without an "
+                 "operator-driven flip."
+             )},
+            {"name": "P-Card Ignored", "type": "checkbox",
+             "description": (
+                 "Operator-set: 1 = row has been 'ignored once' from the "
+                 "P-Card Spend view (operator has eyeballed it and wants "
+                 "it off the active list). Restorable. Operator-owned: "
+                 "never touched by the engine upsert."
+             )},
+            {"name": "Out Of Term", "type": "checkbox",
+             "description": (
+                 "Engine-set: 1 = group's ambiguity is purely date-driven "
+                 "(every candidate's [Start, Due] excludes the row dates). "
+                 "Phase 14a uses this to route the row to Vendor Conflicts "
+                 "even when there's only one candidate, so the operator "
+                 "can pick the new 'Unassigned - Pre-dates Asana Record' "
+                 "option or extend the contract's term in Asana. "
+                 "Recomputed by the engine on every upsert."
+             )},
             {"name": "Created At", "type": "date"},
             {"name": "Engine Candidates", "type": "multilineText",
              "description": (
                  "Engine-managed: vendor fuzzy-match candidates from the "
                  "last run. Rewritten every upsert."
+             )},
+            {"name": "Engine Candidate Gids", "type": "multilineText",
+             "description": (
+                 "Engine-managed: newline-separated Asana task GIDs for the "
+                 "candidate contracts (parallel to Engine Candidates). "
+                 "Drives the Vendor Conflicts review panel — lets the UI "
+                 "show same-name candidates as distinct picker rows."
+             )},
+            {"name": "Distinct Descriptions JSON", "type": "multilineText",
+             "description": (
+                 "Engine-managed JSON: list of {description, rows, amount} "
+                 "for every UNIQUE Record Description in this conflict "
+                 "group. Powers the per-description dropdown picker in the "
+                 "Vendor Conflicts UI — one row per distinct description, "
+                 "with row count and total dollar amount, so the operator "
+                 "knows the weight of each pick. Empty for non-conflict "
+                 "groups (unmatched rows have no candidates to choose between)."
              )},
             {"name": "Notes", "type": "multilineText",
              "description": "Operator-editable. The engine never writes here."},
@@ -200,6 +281,26 @@ TABLES_SCHEMA: Final = [
             {"name": "Account No", "type": "singleLineText"},
             {"name": "Vendor", "type": "singleLineText"},
             {"name": "Contract Name", "type": "singleLineText"},
+            {"name": "Contract Gid", "type": "singleLineText",
+             "description": (
+                 "Optional Asana task GID — pinned by the Vendor Conflicts "
+                 "review panel when multiple open tasks share a contract "
+                 "name. When set, attribution prefers this exact task over "
+                 "the name-based resolution (campus + date narrowing). "
+                 "Blank = legacy name-only learned mapping."
+             )},
+            {"name": "Description Pattern", "type": "singleLineText",
+             "description": (
+                 "Optional case-insensitive substring of the Tableau Record "
+                 "Description. When set, this Learned Mapping only applies "
+                 "to rows whose description CONTAINS the pattern — letting "
+                 "the operator split a single (Campus, Dept, Acct, Vendor) "
+                 "group across multiple Asana tasks by line-item scope "
+                 "(e.g. 'Groundskeeping' → landscaping contract; 'Snow' → "
+                 "snow contract). Blank = applies to the whole group "
+                 "(legacy behavior). Pattern-bearing LMs are matched FIRST; "
+                 "if none hit, the group-level LM (if any) is used."
+             )},
             {"name": "Learned At", "type": "date"},
             {"name": "Notes", "type": "multilineText"},
         ],
@@ -227,6 +328,35 @@ TABLES_SCHEMA: Final = [
             {"name": "Last Processed Hash", "type": "singleLineText",
              "description": "File hash whose run wrote these prior totals."},
             {"name": "Last Updated At", "type": "date"},
+        ],
+    },
+    {
+        "name": "Amendment Links",
+        "description": (
+            "Operator-declared 'this task is an amendment of that task' links "
+            "between Asana contract tasks. Created from the Vendor Conflicts "
+            "UI when the operator recognizes that two candidate tasks for the "
+            "same vendor are actually one logical contract (the engine's "
+            "name-only matching can't infer that). The Dashboard renders "
+            "linked rows with a cross-reference so the operator sees the "
+            "full picture (parent budget + amendment budget = combined "
+            "commitment, parent spent + amendment spent = combined activity)."
+        ),
+        "fields": [
+            {"name": "Parent Gid", "type": "singleLineText",
+             "description": "Asana task GID of the 'parent' contract -- the prior contract that the amendment extends."},
+            {"name": "Amendment Gid", "type": "singleLineText",
+             "description": (
+                 "Asana task GID of the amendment task. UNIQUE: one task can "
+                 "be an amendment of at most one parent. (1:N is supported on "
+                 "the other side -- one parent may have multiple amendments.)"
+             )},
+            {"name": "Parent Name", "type": "singleLineText",
+             "description": "Snapshot of the parent's Asana task name at link time, for display when Dashboard is empty."},
+            {"name": "Amendment Name", "type": "singleLineText",
+             "description": "Snapshot of the amendment's Asana task name at link time."},
+            {"name": "Linked At", "type": "date"},
+            {"name": "Notes", "type": "multilineText"},
         ],
     },
     {

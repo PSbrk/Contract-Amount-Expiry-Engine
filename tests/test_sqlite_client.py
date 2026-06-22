@@ -30,9 +30,12 @@ from engine.sqlite_client import (
     append_run_log,
     cleanup_stale_needs_tagging,
     cleanup_stale_state,
+    delete_amendment_link,
     ensure_schema,
     file_hash_already_processed,
+    insert_amendment_link,
     insert_inbox_processed,
+    load_amendment_links,
     load_campus_map_overrides,
     load_learned_mappings,
     load_state_priors,
@@ -382,8 +385,13 @@ def test_load_learned_mappings_builds_key_tuple(conn):
         "Key": "PARTIAL", "Campus": "CEN", "Contract Name": "",
     })
     out = load_learned_mappings(conn)
+    # Phase 7c: value is a LIST of (name, gid, description_pattern) tuples
+    # so one (campus, dept, account, vendor) key can carry multiple
+    # description-pattern-specific LMs (operator splits a single group
+    # across multiple Asana tasks by line-item scope). Legacy single-LM rows
+    # come back as a one-element list with gid + pattern both None.
     assert out == {
-        ("CEN", "000", "63015", "Acme SaaS"): "Acme SaaS Contract",
+        ("CEN", "000", "63015", "Acme SaaS"): [("Acme SaaS Contract", None, None)],
     }
 
 
@@ -1048,3 +1056,117 @@ def test_prune_run_log_keeps_everything_when_window_far_exceeds_history(conn):
                                        today=date(2026, 6, 15))
     assert deleted == 0
     assert len(_all_rows(conn, "Run Log")) == 3
+
+
+# ---------------------------------------------------------------------------
+# Amendment Links — operator-declared "this task is an amendment of that task"
+# ---------------------------------------------------------------------------
+
+def test_insert_amendment_link_stores_pair(conn):
+    row = insert_amendment_link(
+        conn,
+        parent_gid="g_parent", amendment_gid="g_amend",
+        parent_name="Janitorial", amendment_name="Janitorial Amendment",
+        linked_at="2026-06-16", notes="phase 8 test",
+    )
+    assert row["fields"]["Parent Gid"] == "g_parent"
+    assert row["fields"]["Amendment Gid"] == "g_amend"
+    assert row["fields"]["Parent Name"] == "Janitorial"
+    assert row["fields"]["Amendment Name"] == "Janitorial Amendment"
+
+
+def test_insert_amendment_link_rejects_self_link(conn):
+    with pytest.raises(ValueError, match="amendment of itself"):
+        insert_amendment_link(
+            conn, parent_gid="g_same", amendment_gid="g_same",
+            parent_name="X", amendment_name="X",
+        )
+
+
+def test_insert_amendment_link_rejects_missing_gids(conn):
+    with pytest.raises(ValueError, match="required"):
+        insert_amendment_link(conn, parent_gid="", amendment_gid="g_a")
+    with pytest.raises(ValueError, match="required"):
+        insert_amendment_link(conn, parent_gid="g_a", amendment_gid="")
+
+
+def test_insert_amendment_link_upserts_on_duplicate_amendment_gid(conn):
+    """Re-linking the same amendment to a different parent should overwrite
+    the prior link in place, not raise."""
+    insert_amendment_link(
+        conn, parent_gid="g_p1", amendment_gid="g_a",
+        parent_name="P1", amendment_name="A",
+    )
+    insert_amendment_link(
+        conn, parent_gid="g_p2", amendment_gid="g_a",
+        parent_name="P2", amendment_name="A",
+    )
+    rows = _all_rows(conn, "Amendment Links")
+    assert len(rows) == 1
+    assert rows[0]["Parent Gid"] == "g_p2"
+
+
+def test_load_amendment_links_returns_both_directions(conn):
+    """One parent → two amendments. parent_by_amendment is keyed by
+    amendment_gid (1:1); amendments_by_parent is keyed by parent_gid (1:N)."""
+    insert_amendment_link(
+        conn, parent_gid="g_parent", amendment_gid="g_a1",
+        parent_name="P", amendment_name="A1", linked_at="2026-06-10",
+    )
+    insert_amendment_link(
+        conn, parent_gid="g_parent", amendment_gid="g_a2",
+        parent_name="P", amendment_name="A2", linked_at="2026-06-11",
+    )
+    insert_amendment_link(
+        conn, parent_gid="g_other", amendment_gid="g_b",
+        parent_name="OtherP", amendment_name="OtherA", linked_at="2026-06-12",
+    )
+
+    parent_by_amendment, amendments_by_parent = load_amendment_links(conn)
+
+    assert parent_by_amendment["g_a1"]["parent_gid"] == "g_parent"
+    assert parent_by_amendment["g_a2"]["parent_gid"] == "g_parent"
+    assert parent_by_amendment["g_b"]["parent_gid"] == "g_other"
+
+    assert len(amendments_by_parent["g_parent"]) == 2
+    amend_gids = {a["amendment_gid"] for a in amendments_by_parent["g_parent"]}
+    assert amend_gids == {"g_a1", "g_a2"}
+    assert len(amendments_by_parent["g_other"]) == 1
+
+
+def test_load_amendment_links_skips_blank_rows(conn):
+    """A row with empty Parent Gid or Amendment Gid is malformed (only
+    arrives via hand-edit). load_amendment_links silently skips it
+    rather than crashing the dashboard render."""
+    _seed(conn, "Amendment Links",
+          {"Parent Gid": "g_p", "Amendment Gid": "",
+           "Parent Name": "x", "Amendment Name": "y"})
+    _seed(conn, "Amendment Links",
+          {"Parent Gid": "", "Amendment Gid": "g_a",
+           "Parent Name": "x", "Amendment Name": "y"})
+    parent_by_amendment, amendments_by_parent = load_amendment_links(conn)
+    assert parent_by_amendment == {}
+    assert amendments_by_parent == {}
+
+
+def test_delete_amendment_link_removes_row(conn):
+    insert_amendment_link(
+        conn, parent_gid="g_p", amendment_gid="g_a",
+        parent_name="P", amendment_name="A",
+    )
+    delete_amendment_link(conn, amendment_gid="g_a")
+    assert _all_rows(conn, "Amendment Links") == []
+
+
+def test_delete_amendment_link_unknown_gid_is_noop(conn):
+    """Deleting an amendment_gid that doesn't exist must not raise — the
+    UI may double-submit, and idempotency makes the delete path safe."""
+    insert_amendment_link(
+        conn, parent_gid="g_p", amendment_gid="g_a",
+        parent_name="P", amendment_name="A",
+    )
+    delete_amendment_link(conn, amendment_gid="g_nonexistent")
+    # The real link is still there.
+    rows = _all_rows(conn, "Amendment Links")
+    assert len(rows) == 1
+    assert rows[0]["Amendment Gid"] == "g_a"

@@ -156,15 +156,39 @@ def test_compute_term_days_defaults_when_due_missing():
 # Attribution annotation
 # ---------------------------------------------------------------------------
 
-def _att_result(contract_name: str, *, campus="CEN", dept="000",
-                account_no="63015", vendor="Acme", status="auto") -> AttributionResult:
+def _att_result(contract_name: str | None, *, campus="CEN", dept="000",
+                account_no="63015", vendor="Acme", status="auto",
+                gid: str = "g1") -> AttributionResult:
+    """Build an AttributionResult in the new (GID-bearing) shape.
+
+    For status='auto'/'learned' callers, the gid defaults to 'g1' to match the
+    default gid of _contract() — so AttributionRun.row_gids in tests can map
+    transaction Record Nos onto the contract directly.
+    """
+    contract_gid = gid if contract_name and status in ("auto", "learned") else None
     return AttributionResult(
         group_key=f"{campus}|{dept}|{account_no}|{vendor}",
         campus=campus, dept=dept, account_no=account_no, vendor=vendor,
-        status=status, contract_name=contract_name,
+        status=status,
+        contract_name=contract_name,
+        contract_gid=contract_gid,
         candidate_names=(contract_name,) if contract_name else (),
+        candidate_gids=(contract_gid,) if contract_gid else (),
         rows=1, amount=0.0, sample_description="",
     )
+
+
+def _run(*results: AttributionResult, row_gids=None) -> AttributionRun:
+    """Build an AttributionRun with a POSITIONAL row_gids tuple inferred from
+    the results when not provided — one entry per result, in order, equal to
+    that result's contract_gid (None for unattributed). These tests construct
+    their df rows in the SAME order as the results, so position aligns. Pass
+    `row_gids` explicitly (a positional sequence) to model multi-row-per-group
+    or mismatch scenarios.
+    """
+    if row_gids is None:
+        row_gids = tuple(r.contract_gid for r in results)
+    return AttributionRun(results=tuple(results), row_gids=tuple(row_gids))
 
 
 def test_annotate_with_contract_joins_attribution_onto_df():
@@ -176,14 +200,17 @@ def test_annotate_with_contract_joins_attribution_onto_df():
          "Vendor": "Beta", "Date": "2026-06-02", "Amount": 200.0,
          "Record Description": "y"},
     )
-    run = AttributionRun(results=(
-        _att_result("Acme Contract", campus="CEN", vendor="Acme"),
-        _att_result(None, campus="OMH", vendor="Beta", status="unmatched"),
-    ))
+    run = AttributionRun(
+        results=(
+            _att_result("Acme Contract", campus="CEN", vendor="Acme", gid="g_acme"),
+            _att_result(None, campus="OMH", vendor="Beta", status="unmatched"),
+        ),
+        row_gids=("g_acme", None),
+    )
     annotated = annotate_with_contract(df, run)
-    assert annotated.loc[annotated["Record No"] == "R1", "_contract_name"].iloc[0] == "Acme Contract"
+    assert annotated.loc[annotated["Record No"] == "R1", "_contract_gid"].iloc[0] == "g_acme"
     # Unmatched row gets None.
-    assert pd.isna(annotated.loc[annotated["Record No"] == "R2", "_contract_name"].iloc[0])
+    assert pd.isna(annotated.loc[annotated["Record No"] == "R2", "_contract_gid"].iloc[0])
 
 
 def test_annotate_with_contract_skips_dropped_and_ambiguous():
@@ -197,12 +224,15 @@ def test_annotate_with_contract_skips_dropped_and_ambiguous():
          "Vendor": "Y", "Date": "2026-06-01", "Amount": 100.0,
          "Record Description": ""},
     )
-    run = AttributionRun(results=(
-        _att_result(None, campus="INT", vendor="X", status="dropped"),
-        _att_result(None, campus="CEN", vendor="Y", status="ambiguous"),
-    ))
+    run = AttributionRun(
+        results=(
+            _att_result(None, campus="INT", vendor="X", status="dropped"),
+            _att_result(None, campus="CEN", vendor="Y", status="ambiguous"),
+        ),
+        row_gids=(None, None),
+    )
     annotated = annotate_with_contract(df, run)
-    assert pd.isna(annotated["_contract_name"]).all()
+    assert pd.isna(annotated["_contract_gid"]).all()
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +246,11 @@ def test_compute_spent_in_term_excludes_predecessor_period_spend():
     df = pd.DataFrame({
         "Date": pd.to_datetime(["2024-06-01", "2026-01-15", "2026-06-30"]),
         "Amount": [50000.0, 1000.0, 2000.0],
-        "_contract_name": ["Acme", "Acme", "Acme"],
+        "_contract_gid": ["g_acme", "g_acme", "g_acme"],
     })
     # Current term is 2026-01-01 to 2026-12-31. The 2024-06-01 row is
     # predecessor-term spend that must NOT count.
-    spent = compute_spent_in_term(df, "Acme", date(2026, 1, 1), date(2026, 12, 31))
+    spent = compute_spent_in_term(df, "g_acme", date(2026, 1, 1), date(2026, 12, 31))
     assert spent == pytest.approx(3000.0)
 
 
@@ -230,10 +260,10 @@ def test_compute_spent_in_term_excludes_post_today_spend():
     df = pd.DataFrame({
         "Date": pd.to_datetime(["2026-06-15", "2027-01-01"]),
         "Amount": [1000.0, 9999.0],
-        "_contract_name": ["Acme", "Acme"],
+        "_contract_gid": ["g_acme", "g_acme"],
     })
     today = date(2026, 6, 30)
-    spent = compute_spent_in_term(df, "Acme", date(2026, 1, 1), today)
+    spent = compute_spent_in_term(df, "g_acme", date(2026, 1, 1), today)
     assert spent == pytest.approx(1000.0)
 
 
@@ -241,9 +271,9 @@ def test_compute_spent_in_term_ignores_other_contracts():
     df = pd.DataFrame({
         "Date": pd.to_datetime(["2026-06-01", "2026-06-02"]),
         "Amount": [100.0, 200.0],
-        "_contract_name": ["Acme", "Beta"],
+        "_contract_gid": ["g_acme", "g_beta"],
     })
-    spent = compute_spent_in_term(df, "Acme", date(2026, 1, 1), date(2026, 12, 31))
+    spent = compute_spent_in_term(df, "g_acme", date(2026, 1, 1), date(2026, 12, 31))
     assert spent == pytest.approx(100.0)
 
 
@@ -253,9 +283,9 @@ def test_compute_spent_in_term_sums_signed_amounts():
     df = pd.DataFrame({
         "Date": pd.to_datetime(["2026-06-01", "2026-06-02"]),
         "Amount": [1000.0, -250.0],
-        "_contract_name": ["Acme", "Acme"],
+        "_contract_gid": ["g_acme", "g_acme"],
     })
-    spent = compute_spent_in_term(df, "Acme", date(2026, 1, 1), date(2026, 12, 31))
+    spent = compute_spent_in_term(df, "g_acme", date(2026, 1, 1), date(2026, 12, 31))
     assert spent == pytest.approx(750.0)
 
 
@@ -393,9 +423,7 @@ def test_compute_dashboard_basic_live_contract():
          "Vendor": "Acme", "Date": "2026-03-15", "Amount": 5000.0,
          "Record Description": "x"},
     )
-    run = AttributionRun(results=(
-        _att_result("Acme Contract", campus="CEN", vendor="Acme"),
-    ))
+    run = _run(_att_result("Acme Contract", campus="CEN", vendor="Acme"))
     contracts = [_contract(name="Acme Contract", contract_amount=10000.0)]
     rows, skip = compute_dashboard(df, run, contracts, today=date(2026, 6, 1))
     assert len(rows) == 1
@@ -416,7 +444,7 @@ def test_compute_dashboard_skips_non_live_contracts():
          "Vendor": "Acme", "Date": "2026-03-15", "Amount": 100.0,
          "Record Description": "x"},
     )
-    run = AttributionRun(results=(_att_result("Live", vendor="Acme"),))
+    run = _run(_att_result("Live", vendor="Acme"))
     contracts = [
         _contract(name="Live", gid="g1", section_name="Active - Compliant"),
         _contract(name="Pending", gid="g2", section_name="Pending Onboarding",
@@ -436,7 +464,7 @@ def test_compute_dashboard_alarm_trips_via_budget():
          "Vendor": "Acme", "Date": "2026-03-15", "Amount": 8000.0,
          "Record Description": "x"},
     )
-    run = AttributionRun(results=(_att_result("Acme", vendor="Acme"),))
+    run = _run(_att_result("Acme", vendor="Acme"))
     contracts = [_contract(name="Acme", contract_amount=10000.0)]
     rows, _ = compute_dashboard(df, run, contracts, today=date(2026, 6, 1))
     assert len(rows) == 1
@@ -458,7 +486,12 @@ def test_compute_dashboard_predecessor_term_spend_does_not_inflate_new_contract(
          "Vendor": "Acme", "Date": "2026-03-15", "Amount": 1000.0,
          "Record Description": "new contract"},
     )
-    run = AttributionRun(results=(_att_result("Acme", vendor="Acme"),))
+    # Both rows attributed to the same contract gid; the date-window filter
+    # in compute_spent_in_term is what excludes R0, not the attribution layer.
+    run = _run(
+        _att_result("Acme", vendor="Acme"),
+        row_gids=("g1", "g1"),
+    )
     # Contract started 2026-01-01 — old charge should be excluded.
     contracts = [_contract(name="Acme", target_start=date(2026, 1, 1),
                             due_on=date(2026, 12, 31), contract_amount=10000.0)]
@@ -477,7 +510,7 @@ def test_compute_dashboard_brand_new_contract_has_blank_spending_rate():
          "Vendor": "Acme", "Date": "2026-06-01", "Amount": 1000.0,
          "Record Description": "x"},
     )
-    run = AttributionRun(results=(_att_result("Acme", vendor="Acme"),))
+    run = _run(_att_result("Acme", vendor="Acme"))
     contracts = [_contract(name="Acme", target_start=date(2026, 5, 25),
                             contract_amount=10000.0)]
     # Today is 7 days into the term (< 30 day guard).
@@ -495,7 +528,7 @@ def test_compute_dashboard_dashboard_row_carries_campus_set_string():
          "Vendor": "Acme", "Date": "2026-03-15", "Amount": 100.0,
          "Record Description": "x"},
     )
-    run = AttributionRun(results=(_att_result("Acme", vendor="Acme"),))
+    run = _run(_att_result("Acme", vendor="Acme"))
     contracts = [_contract(
         name="Acme",
         campus_options=frozenset({"OMH", "CEN", "SBA"}),
@@ -513,7 +546,7 @@ def test_compute_dashboard_skip_counts_include_every_reason():
          "Vendor": "Acme", "Date": "2026-03-15", "Amount": 100.0,
          "Record Description": "x"},
     )
-    run = AttributionRun(results=(_att_result("OnlyLive", vendor="Acme"),))
+    run = _run(_att_result("OnlyLive", vendor="Acme"))
     contracts = [
         _contract(name="OnlyLive"),
         _contract(name="Pend", gid="g_pend", section_name="Pending Onboarding",
@@ -550,7 +583,7 @@ def test_compute_dashboard_runaway_pace_trips_alarm_below_75_pct():
          "Vendor": "Acme", "Date": "2026-02-15", "Amount": 50000.0,
          "Record Description": "x"},
     )
-    run = AttributionRun(results=(_att_result("Acme", vendor="Acme"),))
+    run = _run(_att_result("Acme", vendor="Acme"))
     contracts = [_contract(
         name="Acme",
         contract_amount=100000.0,
@@ -584,9 +617,9 @@ def test_term_window_filter_is_inclusive_on_both_ends():
     df = pd.DataFrame({
         "Date": pd.to_datetime(["2026-01-01", "2026-06-30", "2025-12-31"]),
         "Amount": [100.0, 200.0, 500.0],  # last is pre-start, must be excluded
-        "_contract_name": ["Acme", "Acme", "Acme"],
+        "_contract_gid": ["g_acme", "g_acme", "g_acme"],
     })
-    spent = compute_spent_in_term(df, "Acme", date(2026, 1, 1), date(2026, 6, 30))
+    spent = compute_spent_in_term(df, "g_acme", date(2026, 1, 1), date(2026, 6, 30))
     # Both boundary rows count; the predecessor 2025-12-31 row does not.
     assert spent == pytest.approx(300.0)
 

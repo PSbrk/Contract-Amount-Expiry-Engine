@@ -10,6 +10,53 @@
   </small></p>
 </header>
 
+{% if sync_state %}
+<article style="border-left: 3px solid
+  {%- if sync_state.action in ('restored', 'local_missing_pulled') %} var(--pico-color-green-600)
+  {%- elif sync_state.action in ('in_sync',) %} var(--pico-primary)
+  {%- elif sync_state.action in ('local_newer', 'cloud_missing') %} var(--pico-color-amber-500)
+  {%- else %} var(--pico-muted-color){% endif %};">
+  <header><h3>OneDrive sync state</h3>
+    <small>
+      State of the engine's "operator memory" file (<code>data/engine.db</code>) relative
+      to its OneDrive backup at engine startup. Lets you confirm that the next operator
+      on another machine will see your work.
+    </small>
+  </header>
+  <p>
+    {% if sync_state.action == 'restored' %}
+      <strong style="color: var(--pico-color-green-600);">✓ Restored from OneDrive.</strong>
+    {% elif sync_state.action == 'local_missing_pulled' %}
+      <strong style="color: var(--pico-color-green-600);">✓ Pulled from OneDrive (first run on this machine).</strong>
+    {% elif sync_state.action == 'in_sync' %}
+      <strong style="color: var(--pico-primary);">✓ In sync.</strong>
+    {% elif sync_state.action == 'local_newer' %}
+      <strong style="color: var(--pico-color-amber-500);">⚠ Local is newer than OneDrive</strong> &mdash; next ingest will push up.
+    {% elif sync_state.action == 'cloud_missing' %}
+      <strong style="color: var(--pico-color-amber-500);">⚠ OneDrive backup not yet created.</strong>
+    {% elif sync_state.action == 'no_backup_path' %}
+      <strong class="alarm-off">OneDrive backup not configured.</strong>
+    {% elif sync_state.action == 'failed' %}
+      <strong class="alarm-on">✗ Restore attempt failed.</strong>
+    {% endif %}
+    <br>
+    <small style="color: var(--pico-muted-color);">{{ sync_state.message }}</small>
+  </p>
+  <table role="grid" style="font-size: 0.9rem;">
+    <tbody>
+      <tr>
+        <th style="width: 18rem;">Local engine.db mtime</th>
+        <td><code>{{ sync_state.local_mtime or '(missing)' }}</code></td>
+      </tr>
+      <tr>
+        <th>OneDrive copy mtime</th>
+        <td><code>{{ sync_state.cloud_mtime or '(missing)' }}</code></td>
+      </tr>
+    </tbody>
+  </table>
+</article>
+{% endif %}
+
 {% for group_name, items in groups %}
 <article>
   <header><h3>{{ group_name }}</h3></header>

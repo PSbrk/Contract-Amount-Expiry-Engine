@@ -143,3 +143,30 @@ if _bundle_root.is_dir():
     shutil.copytree("scripts", _scripts_dst)
 
     shutil.copy2("README.txt", _bundle_root / "README.txt")
+
+# ---------------------------------------------------------------------------
+# Restore operator-owned directories that PyInstaller's COLLECT step deletes.
+#
+# COLLECT does `rmtree(dist/ContractEngine)` before laying down the new
+# bundle, which wipes config/secrets.env (PAT, OneDrive backup path) and
+# data/ (engine.db with all ingest history). We stash those before COLLECT
+# in a pre-build hook isn't easy from a .spec file, so the next-best thing:
+# detect a sibling backup dir (`dist/ContractEngine.userdata`) the operator
+# pre-creates, copy from it AFTER COLLECT recreates the bundle. The bat
+# scripts already create that dir on first install.
+# Idempotent: re-running the build copies the same files back unchanged.
+_userdata_src = Path("dist") / "ContractEngine.userdata"
+if _bundle_root.is_dir() and _userdata_src.is_dir():
+    for sub in ("config", "data"):
+        src = _userdata_src / sub
+        if not src.is_dir():
+            continue
+        dst = _bundle_root / sub
+        dst.mkdir(parents=True, exist_ok=True)
+        for item in src.rglob("*"):
+            if not item.is_file():
+                continue
+            rel = item.relative_to(src)
+            target = dst / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)

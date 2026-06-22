@@ -52,8 +52,15 @@ GRAND_TOTAL: list[str] = [
 
 
 # Each row matches the 13 columns of HEADER_COLUMNS.
+#
+# Account 63015 was REMOVED from ACCOUNTS_IN_SCOPE on 2026-06-16 (CapEx no
+# longer tracked). R001's account stays as 63015 here so the fixture also
+# proves that a previously-in-scope account now lands in the out-of-scope
+# bucket. Effective totals after the change:
+#   In-scope: 4 rows (R002–R005), signed sum $6,000.00
+#   Out-of-scope: 11 rows (R001 + the original 10), signed sum $4,500.00
 DATA_ROWS: list[tuple[str, ...]] = [
-    # IN-SCOPE (5 rows; signed sum $7,000.00)
+    # PREVIOUSLY in-scope; now out-of-scope (account 63015 / CapEx).
     ("R001", "CEN", "000", "63015", "SaaS Subscriptions", "",
      "Acme SaaS", "Annual subscription Q1", "",
      "ref-001", "1/15/2025", "Charge", "$1,000.00"),
