@@ -24,6 +24,7 @@ except ImportError:
     pass
 
 import argparse
+import csv
 import os
 import sqlite3
 import sys
@@ -52,8 +53,47 @@ def main(argv=None) -> int:
     ap.add_argument("--min-score", type=int, default=82)
     ap.add_argument("--margin", type=int, default=6,
                     help="Best must beat the runner-up by this many points to auto-apply.")
-    ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--execute", action="store_true",
+                    help="Write the EXACT-tier aliases to the DB.")
+    ap.add_argument("--review-csv", metavar="PATH",
+                    help="Write the REVIEW + AMBIGUOUS candidates to a CSV with an "
+                         "'approve' column for you to mark y/n.")
+    ap.add_argument("--apply-csv", metavar="PATH",
+                    help="Read a filled review CSV and insert aliases for rows where "
+                         "approve is y/yes/x. (Ignores everything else; safe to re-run.)")
     args = ap.parse_args(argv)
+
+    # Apply a filled review sheet: insert aliases for approved rows. No Asana
+    # call needed -- pure CSV -> DB.
+    if args.apply_csv:
+        today = date.today().isoformat()
+        conn = sqlite3.connect(args.db)
+        conn.row_factory = sqlite3.Row
+        existing = {r["Contract Name"] for r in conn.execute('SELECT "Contract Name" FROM "Vendor Aliases"')}
+        by_contract: dict[str, list[str]] = {}
+        with open(args.apply_csv, newline="", encoding="utf-8-sig") as fh:
+            for row in csv.DictReader(fh):
+                if (row.get("approve") or "").strip().lower() not in ("y", "yes", "x", "true", "1"):
+                    continue
+                vendor = (row.get("tableau_vendor") or "").strip()
+                contract = (row.get("proposed_contract") or "").strip()
+                if vendor and contract:
+                    by_contract.setdefault(contract, []).append(vendor)
+        applied = 0
+        for contract, vs in by_contract.items():
+            note = f"approved review alias {today}"
+            if contract in existing:
+                cur = conn.execute('SELECT "Aliases" FROM "Vendor Aliases" WHERE "Contract Name" = ?', (contract,)).fetchone()
+                merged = [a for a in (cur["Aliases"] or "").splitlines() if a.strip()] + vs
+                conn.execute('UPDATE "Vendor Aliases" SET "Aliases" = ? WHERE "Contract Name" = ?',
+                             ("\n".join(dict.fromkeys(merged)), contract))
+            else:
+                conn.execute('INSERT INTO "Vendor Aliases" ("Contract Name","Aliases","Notes") VALUES (?,?,?)',
+                             (contract, "\n".join(vs), note))
+            applied += len(vs)
+        conn.commit()
+        print(f"Applied {applied} approved alias(es) across {len(by_contract)} contracts from {Path(args.apply_csv).name}.")
+        return 0
 
     export = args.export
     if export is None:
@@ -131,6 +171,19 @@ def main(argv=None) -> int:
     print(f"\nAMBIGUOUS (matches >1 contract — definitely review): {len(ambiguous)}")
     for n, v, c1, c2 in sorted(ambiguous, reverse=True):
         print(f"  {v}  ->  {n} contracts incl. {c1} / {c2}")
+
+    if args.review_csv:
+        with open(args.review_csv, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow(["approve", "tableau_vendor", "proposed_contract", "alternatives", "tier"])
+            for v, c in sorted(review):
+                w.writerow(["", v, c, "", "review"])
+            for n, v, c1, c2 in sorted(ambiguous, reverse=True):
+                # proposed_contract left for you to choose; alternatives lists the rest
+                w.writerow(["", v, "", f"{c1} | {c2} | (+{n-2} more)" if n > 2 else f"{c1} | {c2}", "ambiguous"])
+        print(f"\nWrote review sheet -> {args.review_csv}")
+        print("  Mark 'y' in the approve column for correct rows; for 'ambiguous' rows also")
+        print("  fill proposed_contract. Then: python tools/build_vendor_aliases.py --apply-csv <that file>")
 
     if not args.execute:
         print("\n(preview only; re-run with --execute to write the confident aliases)")
