@@ -1157,7 +1157,9 @@ def test_vendor_conflicts_assign_by_description_writes_pattern_lms(client, conn)
     assert len(lms) == 2
     by_pattern = {r["Description Pattern"]: dict(r) for r in lms}
     assert by_pattern["groundskeeping"]["Contract Gid"] == "g_lawn"
-    assert by_pattern["snow removal"]["Contract Gid"] == "g_snow"
+    # "Snow Removal 02/2026" normalizes to "snow" — "removal" is a generic
+    # action word, dropped so the subject noun stays the pattern.
+    assert by_pattern["snow"]["Contract Gid"] == "g_snow"
     # Needs Tagging row removed (it'll be re-created next ingest if any rows
     # still attribute ambiguously).
     nt_left = conn.execute(
@@ -1707,6 +1709,27 @@ def test_suggest_candidate_per_description_helper_clear_winner():
     assert out[0]["suggested_gid"] == "g_snow"
     assert out[1]["suggested_gid"] == "g_land"
     assert out[2]["suggested_gid"] is None   # no match → stay on skip
+
+
+def test_suggest_candidate_removal_does_not_link_tree_to_snow():
+    """Regression: a 'Snow removal' description must NOT pre-select a
+    tree-removal contract just because both contain the generic word
+    'removal'. Before 'removal' was stop-worded, the short tree-removal
+    reason out-scored the real snow contract on Jaccard (1/3 > 1/4)."""
+    from engine.ui.routes import _suggest_candidate_per_description
+    cands = [
+        {"Asana Task GID": "g_snow",
+         "Contract Reason Text": "Snow plowing and salting services"},
+        {"Asana Task GID": "g_tree",
+         "Contract Reason Text": "Tree removal"},
+    ]
+    distinct = [
+        {"description": "Snow removal 02/2026", "rows": 1, "amount": 100.0},
+        {"description": "Tree removal 03/2026", "rows": 1, "amount": 200.0},
+    ]
+    out = _suggest_candidate_per_description(distinct, cands)
+    assert out[0]["suggested_gid"] == "g_snow"   # subject 'snow' wins, not 'removal'
+    assert out[1]["suggested_gid"] == "g_tree"   # subject 'tree' wins
 
 
 def test_suggest_candidate_returns_none_when_tied():

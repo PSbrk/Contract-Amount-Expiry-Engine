@@ -125,8 +125,12 @@ _TEXT_MATCH_STOPWORDS: frozenset[str] = frozenset({
     # Common engine-context noise:
     "additional", "also", "any", "applications", "amount", "amount.", "bill",
     "contract", "costs", "cover", "covers", "include", "includes", "includes.",
-    "needed", "new", "operator", "operator-authored", "reversed", "service",
-    "services", "submit", "task", "txn", "txns",
+    "needed", "new", "operator", "operator-authored", "reversed",
+    # ponytail: generic service-ACTION word (mirror of attribution._NARROW_STOPWORDS).
+    # The subject noun discriminates (snow/ice vs tree), not "removal" — otherwise
+    # a tree-removal reason out-Jaccards the real snow contract on the shared word.
+    "removal",
+    "service", "services", "submit", "task", "txn", "txns",
 })
 
 _TOKEN_RE = _re.compile(r"[A-Za-z][A-Za-z0-9]*")

@@ -42,7 +42,11 @@ const OPEN_INBOX =
   "dist/ContractEngine/data/inbox";
 
 const LAST_REFRESHED =
-  "Last refreshed after a full code-review hardening pass (15 findings " +
+  "Vendor Conflicts no longer confuses scopes that merely share the word " +
+  "“removal”: a tree-removal contract can no longer be auto-matched to " +
+  "a snow/ice record — the subject (snow vs tree) decides the match, not the " +
+  "generic action word. Earlier: refreshed after a full code-review " +
+  "hardening pass (15 findings " +
   "fixed). Spend attribution is now exact: per-row contract gids are " +
   "tracked POSITIONALLY (duplicate / blank Record No can no longer " +
   "collapse or drop a row's spend), and an ambiguous group no longer " +

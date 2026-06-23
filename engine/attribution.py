@@ -285,7 +285,12 @@ _NARROW_STOPWORDS: frozenset[str] = frozenset({
     "of", "on", "or", "she", "that", "the", "their", "them", "they", "this",
     "to", "was", "we", "were", "will", "with", "you", "your",
     "additional", "also", "amount", "bill", "contract", "costs", "cover",
-    "covers", "include", "includes", "needed", "new", "operator", "reversed",
+    "covers", "include", "includes", "needed", "new", "operator",
+    # ponytail: generic service-ACTION words — the subject noun (snow/ice vs
+    # tree/debris) is the real discriminator, so "removal" alone must not link
+    # a tree-removal contract to a snow record. Add a sibling action word here
+    # if the same cross-talk shows up (e.g. "management", "maintenance").
+    "removal", "reversed",
     "service", "services", "submit", "task", "txn", "txns",
 })
 _NARROW_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
