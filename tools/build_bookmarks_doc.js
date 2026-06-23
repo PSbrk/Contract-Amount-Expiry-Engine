@@ -44,9 +44,10 @@ const OPEN_INBOX =
 const LAST_REFRESHED =
   "Ingests now run the moment you drop a Tableau export into data\\inbox " +
   "(an inbox watcher replaces the old fixed-time daily run) — usually " +
-  "within ~10-15 seconds. Separately, the Asana write-back path was " +
-  "validated live on a single contract (the five spend custom fields); " +
-  "broad write-back stays OFF until you choose to enable it. Earlier: " +
+  "within ~10-15 seconds, and that ingest now writes the five spend custom " +
+  "fields (Spent so far, % Spent, Spending Rate, Spending Rate Alarm, " +
+  "Alarms) straight back to each live-gate Asana contract — write-back is " +
+  "LIVE. To pause it, set DRY_RUN_ASANA=true in config\\secrets.env. Earlier: " +
   "Vendor Conflicts no longer confuses scopes that merely share the word " +
   "“removal”: a tree-removal contract can no longer be auto-matched to " +
   "a snow/ice record — the subject (snow vs tree) decides the match, not the " +
