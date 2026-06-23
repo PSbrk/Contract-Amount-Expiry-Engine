@@ -282,6 +282,38 @@ def test_apply_writes_no_change_skips_with_reason(fake_tasks_api):
     assert fake_tasks_api.calls == []
 
 
+def test_apply_writes_zero_overwrite_guard_skips_when_attribution_drops_to_zero(fake_tasks_api):
+    """A run that couldn't attribute a contract computes spent_so_far=0; the
+    guard must NOT let that $0 (and the alarm clear) overwrite real Asana
+    spend. Regression for the mass-zeroing a partial ingest caused."""
+    c = _contract(
+        current_spent_so_far=46872.15, current_pct_spent=82.23,
+        current_spending_rate=1.27, current_spending_rate_alarm="75%",
+        current_alarms="ALARM",
+    )
+    d = _dashboard(spent_so_far=0.0, pct_spent=0.0, spending_rate=0.0,
+                   spending_rate_alarm=None, alarms="Clear")
+    result = apply_writes(api_client=object(), dash=d, contract=c, dry_run=False)
+    assert result.skipped_reason == "zero_overwrite_guard"
+    assert result.deltas == ()
+    assert fake_tasks_api.calls == []          # nothing written — real spend preserved
+
+
+def test_apply_writes_zero_guard_allows_new_contract_with_no_prior_spend(fake_tasks_api):
+    """The guard only protects EXISTING spend. A brand-new contract (Asana
+    fields still empty) computing $0 must still write through, not be skipped."""
+    c = _contract(
+        current_spent_so_far=None, current_pct_spent=None,
+        current_spending_rate=None, current_spending_rate_alarm=None,
+        current_alarms=None,
+    )
+    d = _dashboard(spent_so_far=0.0, pct_spent=0.0, spending_rate=0.0,
+                   spending_rate_alarm=None, alarms="Clear")
+    result = apply_writes(api_client=object(), dash=d, contract=c, dry_run=False)
+    assert result.skipped_reason != "zero_overwrite_guard"
+    assert len(fake_tasks_api.calls) == 1      # new contract still gets its baseline
+
+
 def test_apply_writes_live_sends_only_changed_fields(fake_tasks_api):
     """Only the differing fields land in the API payload — Asana's activity
     log shouldn't log fields that didn't actually change."""

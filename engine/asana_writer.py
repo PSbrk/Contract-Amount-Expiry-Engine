@@ -195,6 +195,24 @@ def apply_writes(
             skipped_reason="test_contract_filter",
         )
 
+    # Zero-overwrite guard. A run that fails to attribute a contract (sparse
+    # Learned Mappings, an unmatched vendor, everything out of term) computes
+    # spent_so_far=0 for it. Without this guard, live mode then writes $0 over
+    # the contract's real Asana spend and clears its alarm -- exactly the mass
+    # zeroing a partial/early ingest caused. So: never let an automated write
+    # take a contract from real spend BACK to $0. A genuine drop-to-zero is
+    # rare and left to the operator.
+    # ponytail: skips the WHOLE contract; to push a real $0 do it deliberately
+    # via tools/asana_write_one.py, which doesn't apply this guard.
+    if (dash.spent_so_far or 0) == 0 and (contract.current_spent_so_far or 0) > 0:
+        return WriteResult(
+            contract_gid=contract.gid,
+            contract_name=contract.name,
+            deltas=(),
+            dry_run=dry_run,
+            skipped_reason="zero_overwrite_guard",
+        )
+
     deltas = diff_dashboard_vs_current(dash, contract)
     if not deltas:
         return WriteResult(
