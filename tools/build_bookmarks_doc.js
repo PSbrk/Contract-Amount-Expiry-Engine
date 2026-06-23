@@ -42,6 +42,11 @@ const OPEN_INBOX =
   "dist/ContractEngine/data/inbox";
 
 const LAST_REFRESHED =
+  "Ingests now run the moment you drop a Tableau export into data\\inbox " +
+  "(an inbox watcher replaces the old fixed-time daily run) — usually " +
+  "within ~10-15 seconds. Separately, the Asana write-back path was " +
+  "validated live on a single contract (the five spend custom fields); " +
+  "broad write-back stays OFF until you choose to enable it. Earlier: " +
   "Vendor Conflicts no longer confuses scopes that merely share the word " +
   "“removal”: a tree-removal contract can no longer be auto-matched to " +
   "a snow/ice record — the subject (snow vs tree) decides the match, not the " +

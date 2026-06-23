@@ -13,13 +13,17 @@
 
 $ErrorActionPreference = "Stop"
 
-$TaskName = "ContractEngineDailyIngest"
+# Both names: the current inbox watcher and the legacy fixed-time task.
+$TaskNames = @("ContractEngineInboxWatcher", "ContractEngineDailyIngest")
 
-$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if (-not $existing) {
-    Write-Host "Scheduled task '$TaskName' is not registered. Nothing to do."
-    exit 0
+$removed = $false
+foreach ($name in $TaskNames) {
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false
+        Write-Host "Removed scheduled task '$name'."
+        $removed = $true
+    }
 }
-
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-Write-Host "Removed scheduled task '$TaskName'."
+if (-not $removed) {
+    Write-Host "No Contract Engine scheduled task is registered. Nothing to do."
+}
