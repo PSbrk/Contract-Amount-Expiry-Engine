@@ -47,7 +47,17 @@ $Action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$WatcherPs1`"" `
     -WorkingDirectory $BundleRoot
 
-$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# Two triggers: launch the watcher at logon, AND a 5-minute keep-alive so a
+# crashed/killed watcher is relaunched without waiting for the next logon.
+# MultipleInstances IgnoreNew makes the keep-alive a no-op while the watcher is
+# already running; when it has died, the relaunch's startup catch-up drains
+# anything dropped meanwhile. ponytail: worst-case recovery latency is the 5-min
+# interval; lower it if exports must never wait that long after a watcher death.
+$tLogon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$tKeepAlive = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5) `
+    -RepetitionDuration (New-TimeSpan -Days 3650)
+$Trigger = @($tLogon, $tKeepAlive)
 
 # Interactive logon: no stored password, no admin needed.
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited

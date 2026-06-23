@@ -97,6 +97,10 @@ def _dashboard_row_for(conn: sqlite3.Connection, gid: str):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--gid", help="Asana task GID of the one contract to write.")
+    ap.add_argument("--all", action="store_true",
+                    help="Write EVERY live-gate contract with a pending delta "
+                         "(one contract-load, then a write per changed task). "
+                         "Dry-run summary unless --execute.")
     ap.add_argument("--execute", action="store_true",
                     help="Perform the live write. Without this, dry-run preview only.")
     ap.add_argument("--db", default=str(DEFAULT_BUNDLE / "data" / "engine.db"),
@@ -112,6 +116,43 @@ def main(argv=None) -> int:
     contracts = {c.gid: c for c in asana_contracts.load_open_contracts(api)}
 
     conn = sqlite3.connect(args.db)
+
+    # --all: write (or preview) every live-gate contract with a pending delta.
+    if args.all:
+        conn.row_factory = sqlite3.Row
+        gids = [r["Asana Task GID"]
+                for r in conn.execute('SELECT "Asana Task GID" FROM "Dashboard"').fetchall()]
+        wrote = nochange = skipped = 0
+        errors: list[tuple[str, str, str]] = []
+        verb = "WRITE" if args.execute else "DRY-RUN"
+        print(f"[{verb}] scanning {len(gids)} Dashboard contracts...\n")
+        for gid in gids:
+            c = contracts.get(gid)
+            dash = _dashboard_row_for(conn, gid)
+            if c is None or dash is None:
+                skipped += 1
+                continue
+            res = asana_writer.apply_writes(
+                api, dash, c, dry_run=not args.execute, test_contract_gid=None,
+            )
+            if res.error:
+                errors.append((c.name, gid, res.error))
+                print(f"  ERROR {c.name} [{gid}]: {res.error}")
+            elif res.deltas:
+                wrote += 1
+                tag = "wrote" if args.execute else "would write"
+                print(f"  {tag} {len(res.deltas)} field(s): {c.name}")
+            else:
+                nochange += 1
+        print(f"\nSummary: {wrote} {'written' if args.execute else 'to write'}, "
+              f"{nochange} already current, {skipped} skipped (not open in Asana), "
+              f"{len(errors)} error(s).")
+        if errors:
+            print("\nERRORS:")
+            for name, gid, err in errors:
+                print(f"  {name} [{gid}]: {err}")
+            return 1
+        return 0
 
     # No gid: list live contracts whose Asana values differ from the Dashboard.
     if not args.gid:
