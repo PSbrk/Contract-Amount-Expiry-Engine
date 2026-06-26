@@ -281,6 +281,52 @@ def test_miscoded_confirm_correct_moves_to_confirmed_view(client, conn):
     assert "Lux Lawns" in client.get("/miscoded?show=confirmed").get_data(as_text=True)
 
 
+def test_miscoded_cross_tier_offers_accept_to_capex_contract(client, conn):
+    """A cross-tier coding mismatch surfaces the matched CapEx contract as its
+    candidate, so the operator can Accept and link the opex charge to the CapEx
+    project despite the Tableau miscoding. Accept writes the Ignore-Coding pin."""
+    _seed_dashboard_row(conn, contract_name="JBP Concrete & Construction, LLC",
+                        asana_task_gid="g_capex")
+    rid = _seed_needs_tagging(
+        conn, group_key="OMH|000|63040|JBP Concrete", account_no="63040",
+        vendor="JBP Concrete",
+        candidate_names=["JBP Concrete & Construction, LLC"],
+        candidate_gids=["g_capex"], coding_mismatch=True,
+        cross_tier_hint=("Coding mismatch: this vendor matches 'JBP Concrete & "
+                         "Construction, LLC' (acct 63015, CapEx project FFE001428), "
+                         "but this charge is acct 63040 (opex). Accept to attribute "
+                         "it to the CapEx project anyway, or fix the coding upstream."),
+    )
+    body = client.get("/miscoded").get_data(as_text=True)
+    assert "JBP Concrete" in body
+    assert f"/miscoded/{rid}/accept" in body          # CapEx candidate → Accept offered
+    resp = client.post(f"/miscoded/{rid}/accept",
+                       data={"contract_gid": "g_capex",
+                             "contract_name": "JBP Concrete & Construction, LLC"})
+    assert resp.status_code in (302, 303)
+    lm = conn.execute(
+        'SELECT "Contract Gid", "Ignore Coding" FROM "Learned Mappings" '
+        'WHERE "Key" = ?', ("OMH|000|63040|JBP Concrete",)).fetchone()
+    assert lm is not None and lm["Contract Gid"] == "g_capex"
+    assert lm["Ignore Coding"] == 1
+
+
+def test_miscoded_no_candidate_row_shows_acknowledge_only(client, conn):
+    """Fallback: a coding-mismatch row with NO candidate gid (no contract to
+    link) offers only the acknowledge action, not an Accept button."""
+    rid = _seed_needs_tagging(
+        conn, group_key="OMH|000|63040|Mystery Co", account_no="63040",
+        vendor="Mystery Co", candidate_names=[], candidate_gids=[],
+        coding_mismatch=True,
+        cross_tier_hint="Coding mismatch: no contract to link - fix coding upstream.",
+    )
+    body = client.get("/miscoded").get_data(as_text=True)
+    assert f"/miscoded/{rid}/accept" not in body
+    assert "fix coding at source" in body
+    client.post(f"/miscoded/{rid}/confirm-correct")
+    assert "Mystery Co" not in client.get("/miscoded?show=open").get_data(as_text=True)
+
+
 # ---------------------------------------------------------------------------
 # /needs-tagging — list + inline edit
 # ---------------------------------------------------------------------------

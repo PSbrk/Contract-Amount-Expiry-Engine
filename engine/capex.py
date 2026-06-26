@@ -259,11 +259,48 @@ def summarize_unlinked(
     return out
 
 
+def apply_capex_redirects(
+    df: pd.DataFrame,
+    redirects: dict[tuple[str, str, str, str], str],
+    capex_account: str,
+) -> tuple[pd.DataFrame, int]:
+    """Recode operator-accepted *miscoded* opex rows INTO the CapEx tier.
+
+    The opex Miscoded? 'Accept' can pin a group to a CapEx contract — the charge
+    is opex-coded in Tableau (e.g. 63040) but really belongs to a CapEx project
+    that can't be fixed at source. `redirects` maps the group key
+    (Campus, Dept, Account No, Vendor) → the target contract's CapEx ID. Every
+    matching row is recoded: Account No → `capex_account`, Project ID → CapEx ID.
+
+    Run this on the in-scope frame BEFORE the opex/CapEx split. The recoded row
+    then leaves the opex tier (opex_df filters out capex_account) and is counted
+    exactly once by compute_capex's Project-ID join — no double-count, no
+    duplicate Dashboard row. The match mirrors attribution's own group-row filter
+    (Campus & Dept & Account No & Vendor equality). Returns (df, rows_recoded).
+    """
+    if not redirects:
+        return df, 0
+    df = df.copy()
+    total = 0
+    for (campus, dept, acct, vendor), capex_id in redirects.items():
+        mask = (
+            (df["Campus"] == campus) & (df["Dept"] == dept)
+            & (df["Account No"] == acct) & (df["Vendor"] == vendor)
+        )
+        n = int(mask.sum())
+        if n:
+            df.loc[mask, "Account No"] = capex_account
+            df.loc[mask, "Project ID"] = capex_id
+            total += n
+    return df, total
+
+
 __all__ = [
     "CapExRun",
     "compute_capex",
     "capex_lines",
     "summarize_unlinked",
+    "apply_capex_redirects",
 ]
 
 
@@ -323,6 +360,29 @@ def demo() -> None:
     assert len(ffe) == 4 and all(l["in_term"] for l in ffe), ffe
     assert all(l["tier"] == "capex" for l in lines)
     assert {l["gid"] for l in lines} == {"g1", "g2", "g3"}, {l["gid"] for l in lines}
+
+    # apply_capex_redirects: a 63040 opex group accepted onto a CapEx project
+    # recodes into the CapEx tier and is counted under that project; a
+    # non-matching row is untouched (stays opex → no double-count).
+    rdf = pd.DataFrame({
+        "Campus":     ["OMH", "OMH", "AAA"],
+        "Dept":       ["000", "000", "000"],
+        "Account No": ["63040", "63040", "63040"],
+        "Vendor":     ["JBP Concrete", "JBP Concrete", "Other Vendor"],
+        "Project ID": ["", "", ""],
+        "Amount":     [3_400.0, 100.0, 50.0],
+        "Date":       pd.to_datetime(["2026-03-10", "2026-03-11", "2026-03-12"]),
+    })
+    redirects = {("OMH", "000", "63040", "JBP Concrete"): "FFE001428"}
+    recoded, n_rc = apply_capex_redirects(rdf, redirects, "63015")
+    assert n_rc == 2, n_rc
+    assert (recoded["Account No"] == "63015").sum() == 2
+    assert (recoded["Account No"] == "63040").sum() == 1          # 'Other Vendor' stays opex
+    assert set(recoded.loc[recoded["Account No"] == "63015", "Project ID"]) == {"FFE001428"}
+    rrun = compute_capex(recoded, [C("gj", "JBP", "FFE001428")],
+                         {"FFE001428": 100_000.0}, _d(2026, 6, 24))
+    assert {r.asana_task_gid for r in rrun.rows} == {"gj"}
+    assert rrun.rows[0].spent_so_far == 3_500.0, rrun.rows[0].spent_so_far  # 3400 + 100
 
     print("capex.demo OK:", run.summary_dict())
 

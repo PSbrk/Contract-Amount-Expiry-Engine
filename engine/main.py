@@ -808,6 +808,28 @@ def _run_attribution_and_needs_tagging(
         c for c in contracts
         if not (c.acc == capex_account or c.capex_id is not None)
     ]
+
+    # Cross-tier Miscoded? acceptances: an opex charge the operator pinned to a
+    # CapEx contract (a Tableau miscoding that can't be fixed at source). Recode
+    # those rows to the CapEx account + the target's CapEx ID BEFORE the split,
+    # so they leave the opex tier and the CapEx Project-ID join counts them once
+    # (no double-count). Only Ignore-Coding pins whose gid is a CapEx contract
+    # redirect; opex pins fall through to the normal learned path untouched.
+    from engine import capex as _capex_mod
+    from engine.sqlite_client import load_capex_redirect_pins
+    _capex_id_by_gid = {c.gid: c.capex_id for c in contracts if c.capex_id}
+    _capex_redirects = {
+        key: _capex_id_by_gid[gid]
+        for key, gid in load_capex_redirect_pins(conn).items()
+        if gid in _capex_id_by_gid
+    }
+    if _capex_redirects:
+        kept_df, _n_recoded = _capex_mod.apply_capex_redirects(
+            kept_df, _capex_redirects, capex_account
+        )
+        print(f"  cross-tier redirects: recoded {_n_recoded} opex row(s) "
+              f"into the CapEx tier ({len(_capex_redirects)} accepted group(s)).")
+
     opex_df = kept_df.loc[kept_df["Account No"] != capex_account].copy()
 
     # Operator-driven promotions first. With valid_contract_names plumbed in,
@@ -879,6 +901,10 @@ def _run_attribution_and_needs_tagging(
         if (c.acc == capex_account or c.capex_id is not None) and c.name
     ]
     cross_tier_hints: dict[str, str] = {}
+    # group_key -> (capex_gid, capex_name): the matched CapEx contract, exposed
+    # as the Miscoded? row's candidate so the operator can Accept and link the
+    # opex charge to the CapEx project despite the Tableau miscoding.
+    cross_tier_candidate: dict[str, tuple[str, str]] = {}
     if capex_contracts:
         for group in run.needs_tagging_groups:
             if group.candidate_names:
@@ -895,9 +921,11 @@ def _run_attribution_and_needs_tagging(
                 cross_tier_hints[group.group_key] = (
                     f"Coding mismatch: this vendor matches '{best_c.name}' "
                     f"(acct {best_c.acc or capex_account}, {tier}), but this "
-                    f"charge is acct {group.account_no}. Fix the account coding "
-                    f"in Asana or Tableau - it can't be tagged here."
+                    f"charge is acct {group.account_no} (opex). Accept to attribute "
+                    f"it to the CapEx project anyway, or fix the coding upstream."
                 )
+                if best_c.gid:
+                    cross_tier_candidate[group.group_key] = (best_c.gid, best_c.name)
 
     # Miscoded groups: vendor matches a LIVE contract that aligns on campus +
     # term; only the Dept/Acct coding differs. Lead the Engine Candidates with
@@ -925,6 +953,11 @@ def _run_attribution_and_needs_tagging(
     needs_tag = run.needs_tagging_groups
     upserted = 0
     for group in needs_tag:
+        # Cross-tier groups have no OPEX candidate; surface the matched CapEx
+        # contract as the candidate so the Miscoded? Accept button can link to it.
+        ct_cand = cross_tier_candidate.get(group.group_key)
+        cand_names = [ct_cand[1]] if ct_cand else list(group.candidate_names)
+        cand_gids = [ct_cand[0]] if ct_cand else list(group.candidate_gids)
         upsert_needs_tagging_group(
             conn,
             group_key=group.group_key,
@@ -934,14 +967,15 @@ def _run_attribution_and_needs_tagging(
             vendor=group.vendor,
             sample_description=group.sample_description,
             amount=group.amount,
-            candidate_names=list(group.candidate_names),
-            candidate_gids=list(group.candidate_gids),
+            candidate_names=cand_names,
+            candidate_gids=cand_gids,
             distinct_descriptions=list(group.distinct_descriptions),
             created_at_iso_date=today_iso,
             first_date=group.first_date,
             last_date=group.last_date,
             out_of_term=group.all_out_of_term,
-            coding_mismatch=(group.status == "miscoded"),
+            coding_mismatch=(group.status == "miscoded"
+                             or group.group_key in cross_tier_hints),
             cross_tier_hint=cross_tier_hints.get(group.group_key, ""),
         )
         upserted += 1
