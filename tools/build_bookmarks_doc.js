@@ -42,29 +42,24 @@ const OPEN_INBOX =
   "dist/ContractEngine/data/inbox";
 
 const LAST_REFRESHED =
-  "MAJOR REBUILD (2026-06-24): the engine now tracks Capital Projects " +
-  "(account 63015) as a dedicated CapEx tier. CapEx transactions match an " +
-  "Asana contract by an EXACT CapEx ID = Tableau Project ID join (no fuzzy " +
-  "guessing); each project's spend is summed across ALL its transactions and " +
-  "compared to a total budget you enter once on the new CapEx Budgets page, " +
-  "and the resulting % / band / alarm is broadcast to EVERY contract sharing " +
-  "that CapEx ID. Scope changed: 63015 is tracked again, 63020 is no longer " +
-  "tracked, and department 110 was added. Opex (everything else) now narrows " +
-  "candidates by the Campus + Dept + Acc coding Asana mirrors from Tableau " +
-  "before fuzzy vendor matching, and campus is matched EXACTLY — an " +
-  "unrecognized campus (e.g. YVN, ZNR with no Asana option yet) goes to Needs " +
-  "Tagging for you rather than being auto-guessed. Learned mappings were reset " +
-  "to a clean slate; rebuild them by answering Needs Tagging exactly as " +
-  "before. Asana write-back of the five spend custom fields (Spent so far, % " +
-  "Spent, Spending Rate, Spending Rate Alarm, Alarms) is PAUSED " +
-  "(DRY_RUN_ASANA=true): validate the dry-run Dashboard — especially the CapEx " +
-  "broadcast and your re-taught mappings — then set DRY_RUN_ASANA=false in " +
-  "config\\secrets.env to go live. CapEx contracts deliberately leave Spending " +
-  "Rate untouched (a multi-year project has no annual pace). The zero-" +
-  "overwrite guard still prevents an un-attributed contract being written back " +
-  "to $0 over real spend. Ingests still run automatically within ~10-15s of " +
-  "dropping an export into data\\inbox. Page 2 documents the OneDrive " +
-  "operator-handoff process.";
+  "UPDATE (2026-06-26): The old 'P-Card Spend' tab is now 'Blank Vendor or " +
+  "P-Card to allocate' — blank-vendor spend you can ALLOCATE to a contract, " +
+  "not just ignore. Expand a group's 'Allocate N line items to contracts': " +
+  "line items with NO cardholder name (likely contract spend) get a contract " +
+  "picker; employee card buys ('…, Name, MM/DD/YYYY') are summarized — Ignore " +
+  "those. A one-click 'Attribute to X' also appears when a contract name shows " +
+  "up in the description. NEW Unlinked CapEx page: CapEx (63015) spend with no " +
+  "linked Asana contract, with its likely owner named so you can add the CapEx " +
+  "ID in Asana. The Miscoded? tab can now 'Accept' an opex charge that's really " +
+  "a CapEx project (links it across tiers). Foundation unchanged: 63015 is a " +
+  "dedicated CapEx tier (exact CapEx ID = Tableau Project ID join, budget per " +
+  "project on CapEx Budgets); opex narrows by Campus + Dept + Acct before fuzzy " +
+  "vendor matching. Asana write-back of the five spend fields (Spent so far, % " +
+  "Spent, Spending Rate, Spending Rate Alarm, Alarms) remains PAUSED " +
+  "(DRY_RUN_ASANA=true): validate the dry-run Dashboard, then set " +
+  "DRY_RUN_ASANA=false in config\\secrets.env to go live. Ingests run " +
+  "automatically within ~10-15s of dropping an export into data\\inbox. " +
+  "Page 2 documents the OneDrive operator-handoff process.";
 
 function p(text, opts = {}) {
   return new Paragraph({
@@ -150,6 +145,8 @@ const doc = new Document({
         "live contracts (opex + CapEx), spend, alarm bands; amendments show cross-reference"),
       linkWithBlurb("CapEx Budgets", BASE + "/capex-budgets",
         "enter total budget per CapEx ID (account 63015 projects); shows the Needs-Budget queue + a bulk paste box for the Google-Doc figures"),
+      linkWithBlurb("Unlinked CapEx", BASE + "/unlinked-capex",
+        "CapEx (63015) spend with NO linked Asana contract; names the likely owner so you can add the CapEx ID on the Asana task"),
       linkWithBlurb("Vendor Conflicts", BASE + "/vendor-conflicts",
         "pick which Asana task a same-vendor group belongs to; declare amendment links"),
       linkWithBlurb("Miscoded?", BASE + "/miscoded",
@@ -160,8 +157,8 @@ const doc = new Document({
         "valid one-off charges hidden until new activity in the same group"),
       linkWithBlurb("Needs Tagging — Dismissed", BASE + "/needs-tagging?show=dismissed",
         "rows marked irrelevant; never re-surfaced"),
-      linkWithBlurb("P-Card Spend", BASE + "/p-card-spend",
-        "read-only audit of blank-vendor purchasing-card / journal spend (Amazon, Lowes, fuel, …) — not contracted spend; Ignore once to clear reviewed rows"),
+      linkWithBlurb("Blank Vendor / P-Card", BASE + "/p-card-spend",
+        "blank-vendor spend; ALLOCATE contract line items to a contract (per line item, with a contract picker) or Ignore the employee card buys"),
       linkWithBlurb("Run Log", BASE + "/run-log",
         "every engine run, newest first; outcomes, anomalies, review flags"),
       linkWithBlurb("State", BASE + "/state",
