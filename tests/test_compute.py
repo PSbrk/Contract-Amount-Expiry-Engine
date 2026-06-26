@@ -472,6 +472,72 @@ def test_compute_dashboard_alarm_trips_via_budget():
     assert rows[0].alarms == "ALARM"
 
 
+def test_compute_dashboard_amendment_budget_folds_into_parent():
+    """An amendment adds budget to its parent. The parent's % / band are
+    computed against the COMBINED budget, and the row reports the combined
+    amount as Contract Amount so the row reads consistently. Models the real
+    Stratus case: $91,590 spent, $59,400 parent + $5,770 amendment."""
+    df = _df(
+        {"Record No": "R1", "Campus": "OPK", "Dept": "000", "Account No": "63090",
+         "Vendor": "Stratus", "Date": "2026-03-15", "Amount": 91590.0,
+         "Record Description": "x"},
+    )
+    run = _run(_att_result("Stratus Building Solutions", campus="OPK",
+                           account_no="63090", vendor="Stratus"))
+    contracts = [_contract(name="Stratus Building Solutions",
+                           campus_options=frozenset({"OPK"}),
+                           contract_amount=59400.0)]
+    # Parent budget alone: 91590 / 59400 = 154.19%.
+    rows, _ = compute_dashboard(df, run, contracts, today=date(2026, 6, 1))
+    assert rows[0].pct_spent == pytest.approx(154.19, abs=0.01)
+    assert rows[0].contract_amount == pytest.approx(59400.0)
+    # Fold in the $5,770 amendment: combined 65170, 91590 / 65170 = 140.55%.
+    rows2, _ = compute_dashboard(
+        df, run, contracts, today=date(2026, 6, 1),
+        amendment_budgets={"g1": 5770.0},
+    )
+    assert rows2[0].contract_amount == pytest.approx(65170.0)
+    assert rows2[0].pct_spent == pytest.approx(140.55, abs=0.05)
+    assert rows2[0].spending_rate_alarm == "Over"  # still over, on combined budget
+
+
+def test_attributed_lines_splits_in_and_out_of_term():
+    """attributed_lines flags each assigned row in_term iff its Date falls in
+    [start, min(today, due)] — the same window compute_spent_in_term uses."""
+    from engine.compute import attributed_lines
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63040",
+         "Vendor": "Acme", "Date": "2026-03-15", "Amount": 100.0,
+         "Record Description": "in term", "Reference": "ref-1"},
+        {"Record No": "R2", "Campus": "CEN", "Dept": "000", "Account No": "63040",
+         "Vendor": "Acme", "Date": "2025-06-15", "Amount": 50.0,
+         "Record Description": "pre term", "Reference": "ref-2"},
+    )
+    run = _run(_att_result("Acme", vendor="Acme"), row_gids=("g1", "g1"))
+    contracts = [_contract(name="Acme", gid="g1")]  # term 2026-01-01 .. 2026-12-31
+    lines = attributed_lines(df, run, contracts, today=date(2026, 6, 1))
+    by_ref = {l["reference"]: l for l in lines}
+    assert by_ref["ref-1"]["in_term"] is True
+    assert by_ref["ref-2"]["in_term"] is False      # 2025 pre-dates the term
+    assert by_ref["ref-1"]["vendor"] == "Acme"
+    assert all(l["tier"] == "opex" and l["gid"] == "g1" for l in lines)
+
+
+def test_attributed_lines_omits_unmatched_rows():
+    """A row whose group didn't attribute cleanly (gid None) is NOT a line —
+    it belongs to Needs Tagging, not a contract. This is the Clear Creek $0
+    case: nothing assigned, so the drill-down is correctly empty."""
+    from engine.compute import attributed_lines
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63040",
+         "Vendor": "Mystery", "Date": "2026-03-15", "Amount": 100.0,
+         "Record Description": "x", "Reference": "r"},
+    )
+    run = _run(_att_result(None, vendor="Mystery", status="unmatched"))
+    contracts = [_contract(name="Acme", gid="g1")]
+    assert attributed_lines(df, run, contracts, today=date(2026, 6, 1)) == []
+
+
 def test_compute_dashboard_predecessor_term_spend_does_not_inflate_new_contract():
     """End-to-end regression for the spec §7 critical guard. A 2024 charge
     at the same vendor/campus/account as a 2026 contract must NOT count

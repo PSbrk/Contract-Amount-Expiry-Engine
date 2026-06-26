@@ -98,7 +98,7 @@ class AttributionResult:
     dept: str
     account_no: str
     vendor: str
-    status: str              # "auto" | "learned" | "split" | "ambiguous" | "unmatched" | "dropped"
+    status: str              # "auto" | "learned" | "split" | "ambiguous" | "unmatched" | "miscoded" | "dropped"
     contract_name: str | None
     contract_gid: str | None
     candidate_names: tuple[str, ...]
@@ -128,7 +128,7 @@ class AttributionResult:
 
     @property
     def needs_tagging(self) -> bool:
-        return self.status in ("ambiguous", "unmatched")
+        return self.status in ("ambiguous", "unmatched", "miscoded")
 
 
 @dataclass(frozen=True)
@@ -165,6 +165,8 @@ class AttributionRun:
     @property
     def unmatched(self) -> list[AttributionResult]: return self.by_status("unmatched")
     @property
+    def miscoded(self) -> list[AttributionResult]: return self.by_status("miscoded")
+    @property
     def dropped(self) -> list[AttributionResult]: return self.by_status("dropped")
 
     @property
@@ -179,6 +181,7 @@ class AttributionRun:
             "split": len(self.split),
             "ambiguous": len(self.ambiguous),
             "unmatched": len(self.unmatched),
+            "miscoded": len(self.miscoded),
             "dropped": len(self.dropped),
         }
 
@@ -355,20 +358,79 @@ def _lm_pattern_matches(pattern: str | None, description: str) -> bool:
     return pat_tokens <= _meaningful_tokens(description)
 
 
+def _dept_set(raw: str | None) -> frozenset[str]:
+    """Asana's Dept is free text and may list MULTIPLE accepted codes
+    ('000, 107' means a row coded to either 000 or 107 belongs here). Split on
+    commas/whitespace into the set of accepted codes. Empty when uncoded."""
+    if not raw:
+        return frozenset()
+    return frozenset(t for t in re.split(r"[,\s]+", raw.strip()) if t)
+
+
+def _coding_compatible(c: Contract, dept: str, account_no: str) -> bool:
+    """True unless the contract's Dept/Acc CONTRADICTS the row's coding.
+
+    The opex coding-narrow (2026-06): Asana now carries Dept + Acc, so a vendor
+    fuzzy-match to a contract in a DIFFERENT account/dept is a false positive
+    and gets excluded. Leniency is reserved for UNCODED contracts (dept/acc
+    None) — a wildcard while the operator is mid-rollout coding Asana, so
+    nothing regresses. A coded-but-mismatched contract is excluded (hard).
+
+    Dept may be multi-valued ('000, 107') — the row matches if its single
+    Tableau dept is in that set. Acc is an Asana number field (single value)."""
+    dept_set = _dept_set(c.dept)
+    if dept_set and dept and dept not in dept_set:
+        return False
+    if c.acc is not None and account_no and c.acc != account_no:
+        return False
+    return True
+
+
+def _strip_campus_suffix(vendor: str, campus_codes: frozenset[str]) -> str:
+    """Drop a trailing ' - <CAMPUS>(-<CAMPUS>)*' suffix from a Tableau vendor.
+
+    Tableau sometimes bakes the campus list into the vendor name itself, e.g.
+    'Corporate Cleaning Group Inc - LNX-OPK-WWK-DRB'. Campus already lives in
+    its own column, so that suffix is pure noise — and because it's long, it
+    drags the WRatio below threshold (90 vs the real 95), so the contract never
+    matches. Strips it ONLY when EVERY token after the last ' - ' is a known
+    campus code, so a vendor legitimately named 'X - Downtown Branch' is left
+    untouched. Returns the vendor unchanged when there is no campus suffix.
+    """
+    if not campus_codes or " - " not in vendor:
+        return vendor
+    head, tail = vendor.rsplit(" - ", 1)
+    tokens = tail.split("-")
+    if tokens and all(t in campus_codes for t in tokens):
+        return head.strip()
+    return vendor
+
+
 def _match_vendor(
     vendor: str,
     searchable: list[tuple[str, Contract]],
     fuzzy_threshold: int,
+    campus_codes: frozenset[str] = frozenset(),
 ) -> list[Contract]:
     """Return unique contracts whose name or any alias scores ≥ threshold
-    against the Tableau Vendor string. Dedup by contract.gid."""
+    against the Tableau Vendor string. Dedup by contract.gid.
+
+    Also scores a campus-suffix-stripped variant of the vendor (see
+    _strip_campus_suffix) so a 'Vendor - CAMPUS-LIST' Tableau name still
+    matches its contract. The stripped variant only differs for suffix-bearing
+    vendors, so the common case stays a single pass."""
     if not vendor or not vendor.strip():
         return []
+    queries = [vendor]
+    stripped = _strip_campus_suffix(vendor, campus_codes)
+    if stripped and stripped != vendor:
+        queries.append(stripped)
     matches: dict[str, Contract] = {}
-    for name_or_alias, contract in searchable:
-        score = fuzz.WRatio(vendor, name_or_alias, processor=fuzz_utils.default_process)
-        if score >= fuzzy_threshold:
-            matches.setdefault(contract.gid, contract)
+    for q in queries:
+        for name_or_alias, contract in searchable:
+            score = fuzz.WRatio(q, name_or_alias, processor=fuzz_utils.default_process)
+            if score >= fuzzy_threshold:
+                matches.setdefault(contract.gid, contract)
     return list(matches.values())
 
 
@@ -552,11 +614,14 @@ def _attribute_row(
     contracts_by_name: Mapping[str, list[Contract]],
     fuzzy_threshold: int,
     stale_learned_seen: set[tuple[str, str, str, str]],
+    campus_codes: frozenset[str] = frozenset(),
 ) -> tuple[str, str | None, tuple[Contract, ...], tuple[Contract, ...]]:
     """Attribute a single row.
 
     Returns (status, gid, narrowed_candidates, vendor_only_candidates).
-      - status: "auto" | "learned" | "ambiguous" | "unmatched" | "dropped"
+      - status: "auto" | "learned" | "ambiguous" | "unmatched" | "miscoded" | "dropped"
+        ("miscoded" = vendor+campus+term align, only Dept/Acct differ;
+        narrowed_candidates holds the would-attribute-except-coding contract(s))
       - gid: contract gid when status is auto/learned, else None
       - narrowed_candidates: contracts surviving narrowing (used for
         "ambiguous" surfacing)
@@ -617,25 +682,34 @@ def _attribute_row(
                     (c for c in same_name_contracts if c.gid == pinned_gid), None,
                 )
                 if pinned_match is not None:
-                    # Phase 14a: pinned LM still has to pass the date check.
-                    # Operator pinned this contract once; the engine must NOT
-                    # silently apply that pin to rows whose dates pre-date the
-                    # contract's term. Surface as ambiguous so the operator
-                    # can either fix the term in Asana or mark as pre-dates.
+                    # Pinned LM still has to pass the date check. But the
+                    # operator pinned THIS contract, so an out-of-term row is
+                    # not an ambiguity — under the current-term-only model it's
+                    # pre-term spend that belongs to a prior contract. Drop it
+                    # (excluded from spend, gid None) rather than flagging the
+                    # row ambiguous, which would poison the whole group and
+                    # force the operator to re-mark pre-dates every ingest (the
+                    # export carries full history). ponytail: drop is the
+                    # operator's stated intent for spend outside the term.
                     if _date_contains(pinned_match, row_date):
                         return "learned", pinned_gid, (pinned_match,), ()
-                    return "ambiguous", None, (pinned_match,), (pinned_match,)
+                    return "dropped", None, (), ()
                 # Pinned gid no longer exists — fall through to name resolution.
             if len(same_name_contracts) == 1:
-                # Phase 14a: even when the learned name resolves to exactly
-                # one open contract, enforce the date check. Same rationale
-                # as the pinned-gid path -- a learned name match doesn't
-                # license attribution outside the contract's term.
+                # The learned name resolves to exactly one open contract;
+                # enforce the date check. Out-of-term → pre-term spend → drop
+                # (same rationale as the pinned-gid path above).
                 only = same_name_contracts[0]
                 if _date_contains(only, row_date):
                     return "learned", only.gid, (only,), ()
-                return "ambiguous", None, (only,), (only,)
+                return "dropped", None, (), ()
             if len(same_name_contracts) > 1:
+                # Out-of-term for EVERY task under the operator's learned name
+                # → pre-term spend → drop, consistent with the single-name and
+                # pinned paths. (Only an in-term-but-undecidable row stays
+                # ambiguous below.)
+                if not any(_date_contains(c, row_date) for c in same_name_contracts):
+                    return "dropped", None, (), ()
                 # Treat learned-name as the candidate set and run normal narrowing.
                 winner, surviving = _narrow_and_pick(
                     same_name_contracts, campus=campus, row_date=row_date,
@@ -657,27 +731,58 @@ def _attribute_row(
                 )
 
     # 3. Vendor fuzzy match (with aliases). Candidates may be empty.
-    vendor_candidates = _match_vendor(vendor, searchable, fuzzy_threshold)
+    vendor_candidates = _match_vendor(vendor, searchable, fuzzy_threshold, campus_codes)
     if not vendor_candidates:
         return "unmatched", None, (), ()
 
+    # 3b. Coding-narrow: drop vendor matches whose Dept/Acc contradict the row.
+    coding_candidates = [
+        c for c in vendor_candidates if _coding_compatible(c, dept, account_no)
+    ]
+    if not coding_candidates:
+        # Vendor matched, but every match is coded to a different Dept/Acc.
+        # If a vendor match STILL aligns on campus + term (the only thing
+        # failing is the Dept/Acc coding), this is a "miscoded" near-miss for
+        # the /miscoded tab — narrow the vendor matches by campus + date
+        # (bypassing coding) to find the would-attribute-except-for-coding
+        # contract(s). If NONE align on campus/term, it's a plain coding/campus
+        # miss → unmatched, with the vendor hits as hints.
+        #
+        # EXCLUDE CapEx-account (63015) charges: those belong to the CapEx tier
+        # (matched by Project ID, not vendor). Surfacing a 63015 charge whose
+        # vendor happens to have an OPEX contract would invite the operator to
+        # pull CapEx-project dollars into an opex contract — and double-count if
+        # that same row also matched a CapEx project. The opex /miscoded tab is
+        # for opex-vs-opex coding only. A 63015 charge stays "unmatched" here;
+        # the CapEx tier and the cross-tier hint own the CapEx concerns.
+        if account_no != settings.CAPEX_ACCOUNT_NO:
+            mc_winner, mc_surviving = _narrow_and_pick(
+                vendor_candidates, campus=campus, row_date=row_date,
+                record_description=record_description, crosswalk=crosswalk,
+            )
+            miscoded_candidates = (
+                (mc_winner,) if mc_winner is not None else tuple(mc_surviving)
+            )
+            if miscoded_candidates:
+                return "miscoded", None, miscoded_candidates, tuple(vendor_candidates)
+        return "unmatched", None, (), tuple(vendor_candidates)
+
     # 4-7. Campus + date + description + tiebreak.
     winner, surviving = _narrow_and_pick(
-        vendor_candidates, campus=campus, row_date=row_date,
+        coding_candidates, campus=campus, row_date=row_date,
         record_description=record_description, crosswalk=crosswalk,
     )
 
     if winner is not None:
-        return "auto", winner.gid, tuple(surviving), tuple(vendor_candidates)
+        return "auto", winner.gid, tuple(surviving), tuple(coding_candidates)
 
     if not surviving:
-        # Campus narrow zeroed the candidate list — vendor matched but no
-        # contract covers this campus. Surface as "unmatched" with the
-        # vendor-only hints.
-        return "unmatched", None, (), tuple(vendor_candidates)
+        # Campus narrow zeroed the candidate list — vendor+coding matched but no
+        # contract covers this campus. Surface as "unmatched" with hints.
+        return "unmatched", None, (), tuple(coding_candidates)
 
     # surviving > 1 → ambiguous.
-    return "ambiguous", None, tuple(surviving), tuple(vendor_candidates)
+    return "ambiguous", None, tuple(surviving), tuple(coding_candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +865,11 @@ def attribute(
     # description narrowing (engine falls through to earliest-start tiebreak).
     desc_arr = df["Record Description"].values if "Record Description" in df.columns else None
 
+    # Known campus codes (this export's distinct Campus values) — used to safely
+    # strip a 'Vendor - CAMPUS-LIST' suffix off Tableau vendor names at match
+    # time without touching vendors legitimately named 'X - Something'.
+    campus_codes = frozenset(c for c in (_safe_str(x) for x in pd.unique(campus_arr)) if c)
+
     for i in range(len(df)):
         campus = _safe_str(campus_arr[i])
         dept = _safe_str(dept_arr[i])
@@ -775,6 +885,7 @@ def attribute(
             learned_mappings=learned_mappings, contracts_by_name=contracts_by_name,
             fuzzy_threshold=fuzzy_threshold,
             stale_learned_seen=stale_learned_seen,
+            campus_codes=campus_codes,
         )
         row_raw_gids.append(gid)
 
@@ -871,6 +982,7 @@ def attribute(
         # makes the WHOLE group ambiguous (operator must clear it).
         any_ambiguous = any(s == "ambiguous" for s in row_statuses)
         any_unmatched = any(s == "unmatched" for s in row_statuses)
+        any_miscoded = any(s == "miscoded" for s in row_statuses)
         attributed_gids = [gid for gid in row_gids_list if gid is not None]
         unique_gids = list(dict.fromkeys(attributed_gids))   # preserves order, dedup
 
@@ -945,6 +1057,21 @@ def attribute(
             ))
             continue
 
+        if any_miscoded and not attributed_gids:
+            # Vendor matches a live contract that aligns on campus + term;
+            # only the Dept/Acct coding differs. Route to the /miscoded tab.
+            # narrowed_union holds the campus+term-aligned candidate(s); the
+            # operator decides "Miscoded" (attribute anyway) or "Correctly
+            # coded". Beats plain "unmatched" — there IS a contract behind it.
+            cands = list(st["narrowed_union"].values())
+            results.append(AttributionResult(
+                **base, status="miscoded",
+                contract_name=None, contract_gid=None,
+                candidate_names=tuple(c.name for c in cands),
+                candidate_gids=tuple(c.gid for c in cands),
+            ))
+            continue
+
         if any_unmatched and not attributed_gids:
             # No rows attributed AND any unmatched → genuine unmatched.
             # Show the vendor-only matches as hints.
@@ -981,11 +1108,13 @@ def attribute(
         if len(unique_gids) == 1:
             gid = unique_gids[0]
             c = contracts_by_gid.get(gid)
-            # Status preference: "learned" if EVERY row's status was "learned",
-            # else "auto". Mixed learned+auto on the same gid → "auto" (the
-            # operator's mapping is still respected; we just don't claim the
-            # whole group was learned).
-            group_status = "learned" if all(s == "learned" for s in row_statuses) else "auto"
+            # Status preference: "learned" if every NON-DROPPED row was
+            # "learned", else "auto". Dropped (out-of-term, current-term-only)
+            # rows are excluded from this vote so a pinned group whose pre-term
+            # rows were dropped still reads "learned", not "auto". Mixed
+            # learned+auto on the same gid → "auto".
+            _voting = [s for s in row_statuses if s != "dropped"]
+            group_status = "learned" if _voting and all(s == "learned" for s in _voting) else "auto"
             _warn_if_non_live(c, group_key_str, source=group_status)
             results.append(AttributionResult(
                 **base, status=group_status,

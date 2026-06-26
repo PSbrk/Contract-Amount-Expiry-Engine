@@ -54,6 +54,42 @@ def client(conn):
     return app.test_client()
 
 
+def test_capex_budgets_page_and_bulk_crud(client, conn, monkeypatch):
+    """The CapEx Budgets page renders without a live Asana pull, the bulk
+    grid parses tab/CSV/space + $ and thousands-commas, and delete works."""
+    from engine import asana_client
+
+    def _no_asana(*a, **k):
+        raise RuntimeError("no asana in test")
+    # Keep hermetic — the route catches this and renders budgets-only.
+    monkeypatch.setattr(asana_client, "get_api_client", _no_asana)
+
+    assert client.get("/capex-budgets").status_code == 200
+
+    client.post("/capex-budgets/bulk", data={
+        # Mix of separators; the last line is the regression case — a SPACE
+        # separator with a thousands-comma in the amount, which the old
+        # first-comma split mangled into cid='FFE001500 $800' / amount=0.
+        "bulk": ("FFE001428\t120000\n"
+                 "NCD000083, $1,250,000.00\n"
+                 " rmd000361 80000\n"
+                 "FFE001500 $800,000.00"),
+    }, follow_redirects=True)
+    assert sqlite_client.load_capex_budgets(conn) == {
+        "FFE001428": 120000.0, "NCD000083": 1250000.0, "RMD000361": 80000.0,
+        "FFE001500": 800000.0,
+    }
+
+    page = client.get("/capex-budgets")
+    assert b"FFE001428" in page.data
+
+    rid = conn.execute(
+        'SELECT id FROM "CapEx Budgets" WHERE "CapEx ID" = ?', ("FFE001428",)
+    ).fetchone()["id"]
+    client.post(f"/capex-budgets/{rid}/delete", follow_redirects=True)
+    assert "FFE001428" not in sqlite_client.load_capex_budgets(conn)
+
+
 def _seed_dashboard_row(conn, **overrides) -> None:
     base = dict(
         contract_name="Acme",
@@ -86,6 +122,11 @@ def _seed_needs_tagging(conn, **overrides) -> int:
         candidate_names=["Acme"],
         created_at_iso_date="2026-06-12",
     )
+    # Keep campus consistent with group_key (Campus|Dept|Acct|Vendor) when a
+    # test overrides the key but not the campus — Vendor Conflicts now filters
+    # candidates by campus, so the group's campus must match its key.
+    if "group_key" in overrides and "campus" not in overrides:
+        overrides = {**overrides, "campus": overrides["group_key"].split("|", 1)[0]}
     fields.update(overrides)
     rec = upsert_needs_tagging_group(conn, **fields)
     return rec["id"]
@@ -117,6 +158,54 @@ def test_dashboard_lists_seeded_contracts(client, conn):
     assert "1 ALARM" in body
 
 
+def test_dashboard_detail_shows_assigned_entries(client, conn):
+    """Clicking a contract drills into the Tableau entries assigned to it,
+    split into in-term (counted) and out-of-term (excluded)."""
+    from engine import sqlite_client
+    _seed_dashboard_row(conn, contract_name="Acme", asana_task_gid="g_acme",
+                        spent_so_far=100.0)
+    sqlite_client.replace_attributed_lines(conn, [
+        {"gid": "g_acme", "date": "2026-03-15", "campus": "CEN",
+         "account_no": "63040", "vendor": "Acme Co", "description": "Service call",
+         "reference": "INV-1", "amount": 100.0, "in_term": True, "tier": "opex"},
+        {"gid": "g_acme", "date": "2025-06-15", "campus": "CEN",
+         "account_no": "63040", "vendor": "Acme Co", "description": "Old call",
+         "reference": "INV-0", "amount": 40.0, "in_term": False, "tier": "opex"},
+    ])
+    body = client.get("/dashboard-detail/g_acme").get_data(as_text=True)
+    assert "Assigned Tableau entries" in body
+    assert "INV-1" in body and "INV-0" in body
+    assert "Out of term" in body
+
+
+def test_dashboard_detail_empty_entries_points_to_needs_tagging(client, conn):
+    """The Clear Creek case: $0 spent, nothing assigned. The drill-down says
+    so plainly and routes the operator to Needs Tagging."""
+    _seed_dashboard_row(conn, contract_name="Clear Creek", asana_task_gid="g_cc",
+                        spent_so_far=0.0)
+    body = client.get("/dashboard-detail/g_cc").get_data(as_text=True)
+    assert "No Tableau entries are assigned" in body
+    assert "Needs" in body  # link out to Needs Tagging
+
+
+def test_dashboard_detail_resolve_unresolve_toggle(client, conn):
+    """Mark Resolved snapshots the current band as the re-arm baseline and
+    shows the muted state on the detail page + a pill on the list; un-resolve
+    clears it."""
+    from engine import sqlite_client
+    _seed_dashboard_row(conn, contract_name="Marmic", asana_task_gid="g_m",
+                        spending_rate_alarm="90%", alarms="ALARM")
+    client.post("/dashboard-detail/g_m/resolve")
+    resolved = sqlite_client.load_resolved_contracts(conn)
+    assert "g_m" in resolved
+    assert resolved["g_m"]["baseline_band"] == "90%"   # band snapshotted
+    detail = client.get("/dashboard-detail/g_m").get_data(as_text=True)
+    assert "muted" in detail.lower()
+    assert "resolved" in client.get("/").get_data(as_text=True).lower()  # list pill
+    client.post("/dashboard-detail/g_m/unresolve")
+    assert "g_m" not in sqlite_client.load_resolved_contracts(conn)
+
+
 def test_dashboard_sorts_alarm_rows_first(client, conn):
     """A contract in ALARM must render BEFORE a Clear contract regardless
     of name/percent. Operator scanning the page needs the actionable
@@ -132,6 +221,64 @@ def test_dashboard_sorts_alarm_rows_first(client, conn):
     body = resp.get_data(as_text=True)
     # ZZZ Alarm appears earlier in the rendered HTML than AAA Clear.
     assert body.index("ZZZ Alarm") < body.index("AAA Clear")
+
+
+# ---------------------------------------------------------------------------
+# /miscoded — coding-mismatch tab
+# ---------------------------------------------------------------------------
+
+def _seed_miscoded(conn):
+    """A Coding Mismatch row + the candidate contract on the Dashboard."""
+    _seed_dashboard_row(conn, contract_name="Lux Lawns", asana_task_gid="g_lux")
+    return _seed_needs_tagging(
+        conn, group_key="MUS|000|63040|Lux Lawns",
+        account_no="63040", vendor="Lux Lawns",
+        candidate_names=["Lux Lawns"], candidate_gids=["g_lux"],
+        coding_mismatch=True,
+    )
+
+
+def test_miscoded_open_lists_rows_and_hides_from_other_tabs(client, conn):
+    _seed_miscoded(conn)
+    body = client.get("/miscoded").get_data(as_text=True)
+    assert "Lux Lawns" in body
+    assert "Accept as miscoded" in body
+    # Must NOT leak into Needs Tagging or Vendor Conflicts.
+    assert "Lux Lawns" not in client.get("/needs-tagging").get_data(as_text=True)
+    assert "Lux Lawns" not in client.get("/vendor-conflicts").get_data(as_text=True)
+
+
+def test_miscoded_accept_writes_ignore_coding_lm_and_clears_row(client, conn):
+    rid = _seed_miscoded(conn)
+    resp = client.post(f"/miscoded/{rid}/accept",
+                       data={"contract_gid": "g_lux", "contract_name": "Lux Lawns"})
+    assert resp.status_code in (302, 303)
+    lm = conn.execute(
+        'SELECT "Contract Gid", "Ignore Coding" FROM "Learned Mappings" '
+        'WHERE "Key" = ?', ("MUS|000|63040|Lux Lawns",)).fetchone()
+    assert lm is not None
+    assert lm["Contract Gid"] == "g_lux"
+    assert lm["Ignore Coding"] == 1
+    # NT row is consumed (it attributes on the next ingest).
+    assert conn.execute('SELECT COUNT(*) FROM "Needs Tagging"').fetchone()[0] == 0
+    # The accepted view sources from the LM.
+    assert "Lux Lawns" in client.get("/miscoded?show=accepted").get_data(as_text=True)
+
+
+def test_miscoded_accept_rejects_non_candidate_gid(client, conn):
+    rid = _seed_miscoded(conn)
+    client.post(f"/miscoded/{rid}/accept",
+                data={"contract_gid": "g_evil", "contract_name": "Injected"})
+    # No LM written; the row survives.
+    assert conn.execute('SELECT COUNT(*) FROM "Learned Mappings"').fetchone()[0] == 0
+    assert conn.execute('SELECT COUNT(*) FROM "Needs Tagging"').fetchone()[0] == 1
+
+
+def test_miscoded_confirm_correct_moves_to_confirmed_view(client, conn):
+    rid = _seed_miscoded(conn)
+    client.post(f"/miscoded/{rid}/confirm-correct")
+    assert "Lux Lawns" not in client.get("/miscoded?show=open").get_data(as_text=True)
+    assert "Lux Lawns" in client.get("/miscoded?show=confirmed").get_data(as_text=True)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +372,64 @@ def test_needs_tagging_datalist_pulls_from_dashboard_contracts(client, conn):
     assert '<datalist id="contract-names">' in body
     assert 'value="Acme SaaS"' in body
     assert 'value="Beta Tools"' in body
+
+
+def test_needs_tagging_datalist_shows_campuses_per_name(client, conn):
+    """Near-identical contract names are distinguished in the dropdown by
+    the campuses each covers, aggregated across same-named Dashboard rows."""
+    _seed_dashboard_row(conn, contract_name="Marmic Fire & Safety",
+                        asana_task_gid="gid-lnx", campus_set="LNX")
+    _seed_dashboard_row(conn, contract_name="Marmic Fire & Safety",
+                        asana_task_gid="gid-opk", campus_set="OPK")
+    _seed_dashboard_row(conn, contract_name="Marmic Fire and Safety",
+                        asana_task_gid="gid-stw", campus_set="STW")
+    _seed_needs_tagging(conn)
+    body = client.get("/needs-tagging").get_data(as_text=True)
+    # One <option> per distinct name, value stays the exact name (LM resolves
+    # by exact name) and the campuses show as the visible hint. GROUP_CONCAT
+    # order isn't guaranteed, so accept either ordering.
+    assert 'value="Marmic Fire &amp; Safety">' in body
+    assert ("LNX,OPK" in body) or ("OPK,LNX" in body)
+    assert '<option value="Marmic Fire and Safety">STW</option>' in body
+
+
+def test_needs_tagging_out_of_term_row_shows_park_guidance(client, conn):
+    """Out-of-term rows are pre-term spend: assigning a contract won't clear
+    them, so the row is flagged and offered a one-click Park (reusing the
+    once-off route) instead of inviting a futile Assign Contract answer."""
+    rec_id = _seed_needs_tagging(conn, vendor="Pre Term Vendor")
+    conn.execute('UPDATE "Needs Tagging" SET "Out Of Term" = 1 WHERE id = ?', (rec_id,))
+    conn.commit()
+    body = client.get("/needs-tagging").get_data(as_text=True)
+    assert "Pre-dates the contract" in body          # the guidance
+    assert "Park (pre-dates contract)" in body        # the one-click action
+    assert f"/needs-tagging/{rec_id}/mark-once-off" in body  # posts to the once-off route
+
+
+def test_needs_tagging_cross_tier_mismatch_hint(client, conn):
+    """An opex charge whose vendor matches a CapEx-coded contract surfaces a
+    'coding mismatch' hint instead of a bare 'no candidates' dead-end — so the
+    operator knows to fix the account upstream, not fight the Assign box."""
+    from engine.sqlite_client import upsert_needs_tagging_group
+    upsert_needs_tagging_group(
+        conn,
+        group_key="OMH|000|63040|JBP Concrete And Construction LLC",
+        campus="OMH", dept="000", account_no="63040",
+        vendor="JBP Concrete And Construction LLC",
+        sample_description="Parking Lot Repairs",
+        amount=3400.0,
+        candidate_names=[],
+        created_at_iso_date="2026-06-25",
+        cross_tier_hint=(
+            "Coding mismatch: this vendor matches 'JBP Concrete & Construction, "
+            "LLC' (acct 63015, CapEx project FFE001428), but this charge is acct "
+            "63040. Fix the account coding in Asana or Tableau - it can't be tagged here."
+        ),
+    )
+    body = client.get("/needs-tagging").get_data(as_text=True)
+    assert "coding mismatch" in body                          # the pill
+    assert "Coding mismatch: this vendor matches" in body     # the prominent hint
+    assert "JBP Concrete &amp; Construction, LLC" in body     # the real contract surfaced
 
 
 def test_needs_tagging_unfilled_row_gets_highlight_class(client, conn):
@@ -871,6 +1076,40 @@ def test_vendor_conflicts_includes_single_candidate_when_out_of_term(client, con
     assert "Cleaning April" in body
 
 
+def test_vendor_conflicts_mark_pre_dates_parks_group(client, conn):
+    """Regression: a single-candidate out-of-term group with EMPTY Distinct
+    Descriptions JSON (the bundle's real case) reaches Vendor Conflicts but
+    the per-description Pre-dates option can't render. The group-level
+    'Pre-dates Asana Record' button must still be available, set Once Off,
+    and make the group leave the list."""
+    _seed_dashboard_row(
+        conn, contract_name="Collett Mechanical Inc.",
+        asana_task_gid="g_collett", campus_set="ALB",
+        start=date(2026, 6, 15), due=date(2027, 6, 9),
+    )
+    rec_id = _seed_needs_tagging(
+        conn, group_key="ALB|000|63040|Collett Mechanical Service Inc",
+        vendor="Collett Mechanical Service Inc",
+        candidate_names=["Collett Mechanical Inc."],
+        candidate_gids=["g_collett"],
+        distinct_descriptions=[],   # empty — picker can't render
+    )
+    conn.execute(
+        'UPDATE "Needs Tagging" SET "Out Of Term" = 1 WHERE id = ?', (rec_id,),
+    )
+    conn.commit()
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Collett Mechanical Service Inc" in body
+    assert "Pre-dates Asana Record" in body   # button present even w/ empty JSON
+
+    client.post(f"/vendor-conflicts/{rec_id}/mark-pre-dates")
+    assert conn.execute(
+        'SELECT "Once Off" FROM "Needs Tagging" WHERE id = ?', (rec_id,)
+    ).fetchone()[0] == 1
+    body2 = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Collett Mechanical Service Inc" not in body2   # left the list
+
+
 def test_vendor_conflicts_excludes_single_candidate_when_not_out_of_term(client, conn):
     """Regression: a single-candidate Needs Tagging row that is NOT
     out-of-term still must NOT appear in /vendor-conflicts (it goes to
@@ -1403,17 +1642,21 @@ def test_vendor_conflicts_mark_other_hides_row_from_conflicts(client, conn):
     """Operator picks Other → row drops out of /vendor-conflicts but stays
     in Needs Tagging Open (no Dismiss, no Once Off, no Assign Contract
     side-effects)."""
+    # Two SAME-campus (TUL) tasks for one vendor → a genuine conflict that
+    # legitimately appears in Vendor Conflicts. (A TUL group with only
+    # BAO/OKC candidates is now correctly filtered OUT, so it could not be
+    # used to test mark-other.)
     _seed_dashboard_row(conn, contract_name="Oklahoma Chiller Corp",
-                        asana_task_gid="g_bao", campus_set="BAO")
+                        asana_task_gid="g_tul1", campus_set="TUL")
     _seed_dashboard_row(conn, contract_name="Oklahoma Chiller Corp",
-                        asana_task_gid="g_okc", campus_set="OKC")
+                        asana_task_gid="g_tul2", campus_set="TUL")
     rec_id = _seed_needs_tagging(
         conn,
         group_key="TUL|000|63040|Oklahoma Chiller Corp",
         campus="TUL", account_no="63040",
         vendor="Oklahoma Chiller Corp",
         candidate_names=["Oklahoma Chiller Corp", "Oklahoma Chiller Corp"],
-        candidate_gids=["g_bao", "g_okc"],
+        candidate_gids=["g_tul1", "g_tul2"],
     )
     # Confirms the row IS in the conflict view before the action.
     before = client.get("/vendor-conflicts").get_data(as_text=True)
@@ -1445,6 +1688,42 @@ def test_vendor_conflicts_mark_other_hides_row_from_conflicts(client, conn):
 def test_vendor_conflicts_mark_other_404s_for_unknown_record_id(client):
     resp = client.post("/vendor-conflicts/99999/mark-other")
     assert resp.status_code == 404
+
+
+def test_vendor_conflicts_excludes_campus_mismatched_candidates(client, conn):
+    """A TUL transaction group whose only vendor matches are OTHER-campus tasks
+    (BAO/OKC) must NOT appear in Vendor Conflicts — there is no campus-
+    compatible task to pin it to. It stays on Needs Tagging Open for Assign
+    Contract instead. (The bug the operator caught.)"""
+    _seed_dashboard_row(conn, contract_name="Oklahoma Chiller Corp",
+                        asana_task_gid="g_bao", campus_set="BAO")
+    _seed_dashboard_row(conn, contract_name="Oklahoma Chiller Corp",
+                        asana_task_gid="g_okc", campus_set="OKC")
+    _seed_needs_tagging(
+        conn, group_key="TUL|000|63040|Oklahoma Chiller Corp",
+        campus="TUL", account_no="63040", vendor="Oklahoma Chiller Corp",
+        candidate_names=["Oklahoma Chiller Corp", "Oklahoma Chiller Corp"],
+        candidate_gids=["g_bao", "g_okc"],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Oklahoma Chiller Corp" not in body
+
+
+def test_vendor_conflicts_keeps_all_campuses_candidate(client, conn):
+    """An 'All Campuses' wildcard task IS campus-compatible with any group, so
+    a genuine 2-candidate conflict (one TUL + one All-Campuses) still shows."""
+    _seed_dashboard_row(conn, contract_name="Oklahoma Chiller Corp",
+                        asana_task_gid="g_tul", campus_set="TUL")
+    _seed_dashboard_row(conn, contract_name="Oklahoma Chiller Corp",
+                        asana_task_gid="g_all", campus_set="All Campuses")
+    _seed_needs_tagging(
+        conn, group_key="TUL|000|63040|Oklahoma Chiller Corp",
+        campus="TUL", account_no="63040", vendor="Oklahoma Chiller Corp",
+        candidate_names=["Oklahoma Chiller Corp", "Oklahoma Chiller Corp"],
+        candidate_gids=["g_tul", "g_all"],
+    )
+    body = client.get("/vendor-conflicts").get_data(as_text=True)
+    assert "Oklahoma Chiller Corp" in body
 
 
 def test_unmark_conflict_other_restores_row_to_conflicts(client, conn):

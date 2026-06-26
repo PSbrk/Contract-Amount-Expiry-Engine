@@ -69,6 +69,73 @@ def test_auto_single_candidate_via_exact_vendor_and_campus():
     assert run.auto[0].amount == pytest.approx(1000.0)
 
 
+def test_strip_campus_suffix_unit():
+    from engine.attribution import _strip_campus_suffix
+    cc = frozenset({"LNX", "OPK", "WWK", "DRB"})
+    # campus suffix stripped (all trailing tokens are real campus codes)
+    assert _strip_campus_suffix("Corporate Cleaning Group Inc - LNX-OPK-WWK-DRB", cc) == "Corporate Cleaning Group Inc"
+    assert _strip_campus_suffix("X - LNX", cc) == "X"
+    # NOT stripped — trailing part isn't campus codes
+    assert _strip_campus_suffix("Acme Co - Downtown Branch", cc) == "Acme Co - Downtown Branch"
+    assert _strip_campus_suffix("Plain Vendor Inc", cc) == "Plain Vendor Inc"
+    # no known campus codes → never strips (defensive)
+    assert _strip_campus_suffix("Y - LNX", frozenset()) == "Y - LNX"
+
+
+def test_coding_compatible_multi_value_dept():
+    """Asana Dept may list multiple accepted codes ('000, 107'); a Tableau row
+    coded to EITHER belongs to the contract. Single-value behaviour unchanged."""
+    import dataclasses
+    from engine.attribution import _coding_compatible, _dept_set
+
+    assert _dept_set("000, 107") == frozenset({"000", "107"})
+    assert _dept_set("000") == frozenset({"000"})
+    assert _dept_set("") == frozenset()
+    assert _dept_set(None) == frozenset()
+
+    multi = dataclasses.replace(
+        _contract("Vendor", frozenset({"CEN"})), dept="000, 107", acc="63080"
+    )
+    assert _coding_compatible(multi, "000", "63080") is True   # first code
+    assert _coding_compatible(multi, "107", "63080") is True   # second code
+    assert _coding_compatible(multi, "204", "63080") is False  # neither
+
+    single = dataclasses.replace(
+        _contract("Vendor", frozenset({"CEN"})), dept="000", acc="63080"
+    )
+    assert _coding_compatible(single, "000", "63080") is True
+    assert _coding_compatible(single, "107", "63080") is False
+
+
+def test_campus_suffix_in_vendor_name_still_matches():
+    """Tableau bakes the campus list into the vendor name itself
+    ('Corporate Cleaning Group Inc - LNX-OPK-WWK-DRB'). The suffix drops WRatio
+    to 90 (<92), so without stripping the contract never matches. With the
+    strip, the LNX row attributes; the other campuses stay unmatched (no
+    contract covers them) — campus exact-match still holds."""
+    df = _df(
+        {"Record No": "R1", "Campus": "LNX", "Dept": "000", "Account No": "63090",
+         "Vendor": "Corporate Cleaning Group Inc - LNX-OPK-WWK-DRB",
+         "Record Description": "Janitorial", "Amount": 3130.0},
+        {"Record No": "R2", "Campus": "OPK", "Dept": "000", "Account No": "63090",
+         "Vendor": "Corporate Cleaning Group Inc - LNX-OPK-WWK-DRB",
+         "Record Description": "Janitorial", "Amount": 3130.0},
+        {"Record No": "R3", "Campus": "WWK", "Dept": "000", "Account No": "63090",
+         "Vendor": "Corporate Cleaning Group Inc - LNX-OPK-WWK-DRB",
+         "Record Description": "Janitorial", "Amount": 3130.0},
+        {"Record No": "R4", "Campus": "DRB", "Dept": "000", "Account No": "63090",
+         "Vendor": "Corporate Cleaning Group Inc - LNX-OPK-WWK-DRB",
+         "Record Description": "Janitorial", "Amount": 3130.0},
+    )
+    contracts = [_contract("Corporate Cleaning Group", frozenset({"LNX"}))]
+    run = attribute(df, contracts, aliases={}, crosswalk=campus_map.build(), learned_mappings={})
+    assert len(run.auto) == 1
+    assert run.auto[0].contract_name == "Corporate Cleaning Group"
+    assert run.auto[0].campus == "LNX"
+    assert run.auto[0].rows == 1
+    assert run.auto[0].amount == pytest.approx(3130.0)
+
+
 def test_auto_groups_aggregate_multiple_transactions_for_same_key():
     """The (Campus, Dept, Account No, Vendor) groupby must collapse rows
     that share the key. amount is the signed sum across the group."""
@@ -242,17 +309,113 @@ def test_omh_transaction_matches_contract_with_nor_override():
     assert len(run.auto) == 1
 
 
-def test_yvn_transaction_matches_contract_with_cen_edm_option():
-    """Tableau YVN crosswalks to {CEN, CEN/EDM}, so a CEN/EDM contract
-    matches a YVN transaction."""
+def test_yvn_transaction_needs_exact_campus_match():
+    """Exact-match (2026-06-24): YVN no longer auto-maps to CEN/EDM. A YVN
+    transaction does NOT match a contract tagged only CEN/EDM — it falls to
+    unmatched for the operator. It matches once a contract carries YVN."""
     df = _df(
-        {"Record No": "R1", "Campus": "YVN", "Dept": "000", "Account No": "63015",
+        {"Record No": "R1", "Campus": "YVN", "Dept": "000", "Account No": "63040",
          "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 100.0},
     )
-    contracts = [_contract("Acme SaaS", frozenset({"CEN/EDM"}))]
-    run = attribute(df, contracts, aliases={}, crosswalk=campus_map.build(),
+    cen_edm = [_contract("Acme SaaS", frozenset({"CEN/EDM"}))]
+    run = attribute(df, cen_edm, aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings={})
+    assert len(run.auto) == 0
+    assert len(run.unmatched) == 1
+
+    yvn = [_contract("Acme SaaS", frozenset({"YVN"}))]
+    run2 = attribute(df, yvn, aliases={}, crosswalk=campus_map.build(),
+                     learned_mappings={})
+    assert len(run2.auto) == 1
+
+
+# ---------------------------------------------------------------------------
+# Opex coding-narrow (2026-06) — Dept/Acc filter on vendor candidates
+# ---------------------------------------------------------------------------
+
+def _coded(name, campus_options, *, dept, acc, gid=None):
+    return Contract(
+        gid=gid or f"gid:{name}:{acc}", name=name, campus_options=campus_options,
+        contract_amount=10000.0, target_start=date(2026, 1, 1),
+        due_on=date(2026, 12, 31), status="Active", expire_countdown=None,
+        pm_email=None, section_name="Active - Compliant", dept=dept, acc=acc,
+    )
+
+
+def test_coding_narrow_excludes_mismatched_account():
+    """A vendor that fuzzy-matches two contracts in different accounts
+    attributes to the Acc that matches the row; the mismatched one is excluded."""
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63040",
+         "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 500.0},
+    )
+    right = _coded("Acme SaaS", frozenset({"CEN"}), dept="000", acc="63040", gid="g_right")
+    wrong = _coded("Acme SaaS", frozenset({"CEN"}), dept="000", acc="63090", gid="g_wrong")
+    run = attribute(df, [right, wrong], aliases={}, crosswalk=campus_map.build(),
                     learned_mappings={})
     assert len(run.auto) == 1
+    assert run.auto[0].contract_gid == "g_right"
+
+
+def test_coding_narrow_uncoded_contract_is_wildcard():
+    """A contract with no Dept/Acc coded yet (mid-rollout) still matches —
+    leniency prevents regressions while the operator codes Asana."""
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63040",
+         "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 500.0},
+    )
+    uncoded = _contract("Acme SaaS", frozenset({"CEN"}))  # dept/acc None
+    run = attribute(df, [uncoded], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings={})
+    assert len(run.auto) == 1
+
+
+def test_coding_only_mismatch_is_miscoded():
+    """Vendor + campus + term align and ONLY the Dept/Acct coding differs →
+    the group is 'miscoded' (routed to the Miscoded? tab), NOT auto-attributed
+    and NOT plain unmatched. The campus+term-aligned contract is surfaced as
+    the candidate to accept."""
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63040",
+         "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 500.0},
+    )
+    wrong = _coded("Acme SaaS", frozenset({"CEN"}), dept="000", acc="63090")
+    run = attribute(df, [wrong], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings={})
+    assert len(run.auto) == 0
+    assert len(run.unmatched) == 0
+    assert len(run.miscoded) == 1
+    assert len(run.miscoded[0].candidate_gids) == 1
+
+
+def test_coding_mismatch_with_campus_mismatch_stays_unmatched():
+    """If the only vendor match ALSO differs in campus (not just coding), it is
+    NOT a miscoding — no contract covers this campus, so it stays unmatched."""
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63040",
+         "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 500.0},
+    )
+    wrong = _coded("Acme SaaS", frozenset({"OKC"}), dept="000", acc="63090")
+    run = attribute(df, [wrong], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings={})
+    assert len(run.miscoded) == 0
+    assert len(run.unmatched) == 1
+
+
+def test_capex_account_charge_not_routed_to_miscoded():
+    """A charge coded to the CapEx account (63015) whose vendor matches an
+    OPEX contract is NOT 'miscoded' — CapEx is the other tier (matched by
+    Project ID). It stays unmatched so accepting it could never pull
+    CapEx-project dollars into an opex contract."""
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63015",
+         "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 500.0},
+    )
+    opex = _coded("Acme SaaS", frozenset({"CEN"}), dept="000", acc="63040")
+    run = attribute(df, [opex], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings={})
+    assert len(run.miscoded) == 0
+    assert len(run.unmatched) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -938,11 +1101,12 @@ def test_single_campus_candidate_with_in_term_date_still_auto():
     assert len(run.auto) == 1
 
 
-def test_pinned_learned_mapping_with_out_of_term_date_is_ambiguous():
-    """A pinned-gid Learned Mapping (operator chose the specific contract
-    via Vendor Conflicts) must NOT override the date check. Otherwise an
-    operator pin made for one season's invoices would silently pull in
-    pre-contract spend on a future ingest."""
+def test_pinned_learned_mapping_drops_out_of_term_row():
+    """current-term-only: a pinned-gid Learned Mapping does NOT override the
+    date check, but an out-of-term row under that pin is treated as PRE-TERM
+    spend and DROPPED (excluded), not flagged ambiguous. The operator already
+    declared the contract; spend before its term belongs to a prior contract,
+    and re-surfacing it as ambiguous every ingest is pure toil."""
     contract = Contract(
         gid="g_pinned", name="Bear Claw Landscaping",
         campus_options=frozenset({"NCS"}),
@@ -965,16 +1129,56 @@ def test_pinned_learned_mapping_with_out_of_term_date_is_ambiguous():
     }])
     run = attribute(df, [contract], aliases={}, crosswalk=campus_map.build(),
                     learned_mappings=learned)
-    assert run.row_gids == (None,)
+    assert run.row_gids == (None,)            # excluded from spend
     assert len(run.learned) == 0
-    assert len(run.ambiguous) == 1
-    assert run.ambiguous[0].candidate_gids == ("g_pinned",)
+    assert len(run.ambiguous) == 0            # NOT surfaced for review
+    assert len(run.dropped) == 1              # cleanly dropped as pre-term
 
 
-def test_single_same_name_learned_mapping_with_out_of_term_date_is_ambiguous():
-    """When a learned name resolves to exactly one open contract, the
-    Phase 14a date check still applies. An LM is operator intent for
-    grouping, NOT a license to attribute outside the contract's term."""
+def test_pinned_learned_mapping_keeps_in_term_drops_out_of_term_in_same_group():
+    """The whole point of the drop: in-term spend in a pinned group still
+    posts while the out-of-term rows are excluded — the out-of-term row no
+    longer poisons the group into ambiguous, so the operator's pin actually
+    attributes the current-term spend hands-free."""
+    contract = Contract(
+        gid="g_pinned", name="Bear Claw Landscaping",
+        campus_options=frozenset({"NCS"}),
+        contract_amount=50000.0,
+        target_start=date(2026, 3, 31), due_on=date(2027, 3, 31),
+        status="Active", expire_countdown=None, pm_email=None,
+        section_name="Active - Compliant",
+    )
+    learned = {
+        ("NCS", "000", "63080", "Bear Claw Landscaping, Inc"): [
+            ("Bear Claw Landscaping", "g_pinned", None),
+        ],
+    }
+    df = pd.DataFrame([
+        {"Date": pd.Timestamp("2026-06-01"),   # IN term
+         "Record No": "R_in", "Campus": "NCS", "Dept": "000", "Account No": "63080",
+         "Vendor": "Bear Claw Landscaping, Inc",
+         "Record Description": "Landscaping 05/2026", "Amount": 5000.0},
+        {"Date": pd.Timestamp("2026-01-15"),   # BEFORE term start 2026-03-31
+         "Record No": "R_pre", "Campus": "NCS", "Dept": "000", "Account No": "63080",
+         "Vendor": "Bear Claw Landscaping, Inc",
+         "Record Description": "Landscaping 12/2025", "Amount": 8000.0},
+    ])
+    run = attribute(df, [contract], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings=learned)
+    # In-term row posts to the pinned gid; out-of-term row contributes nothing.
+    assert run.row_gids == ("g_pinned", None)
+    assert len(run.ambiguous) == 0
+    assert len(run.unmatched) == 0
+    # One clean group, labeled "learned" — the dropped row doesn't demote it.
+    assert len(run.learned) == 1
+    assert len(run.auto) == 0
+
+
+def test_single_same_name_learned_mapping_drops_out_of_term_row():
+    """When a learned name resolves to exactly one open contract, an
+    out-of-term row is DROPPED (current-term-only), consistent with the
+    pinned-gid path. The LM is operator intent for grouping, not a license to
+    attribute outside the term — and pre-term spend is excluded, not surfaced."""
     contract = _contract("Acme", frozenset({"CEN"}), gid="g_only")
     learned = {("CEN", "000", "63015", "Acme"): [("Acme", None, None)]}
     df = pd.DataFrame([{
@@ -985,8 +1189,30 @@ def test_single_same_name_learned_mapping_with_out_of_term_date_is_ambiguous():
     run = attribute(df, [contract], aliases={}, crosswalk=campus_map.build(),
                     learned_mappings=learned)
     assert run.row_gids == (None,)
-    assert len(run.ambiguous) == 1
-    assert run.ambiguous[0].candidate_gids == ("g_only",)
+    assert len(run.dropped) == 1
+    assert len(run.ambiguous) == 0
+
+
+def test_multi_same_name_learned_mapping_drops_fully_out_of_term_row():
+    """When a learned name maps to >1 open contract and the row is out of term
+    for EVERY one of them, it's pre-term spend → dropped (not ambiguous),
+    consistent with the single-name and pinned paths."""
+    contracts = [
+        _contract("Acme", frozenset({"CEN"}), gid="g_cen"),
+        _contract("Acme", frozenset({"OMH"}), gid="g_omh"),
+    ]
+    # _contract default term is 2026-01-01 -> 2026-12-31; this row pre-dates both.
+    learned = {("CEN", "000", "63015", "Acme"): [("Acme", None, None)]}
+    df = pd.DataFrame([{
+        "Date": pd.Timestamp("2024-12-15"),
+        "Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63015",
+        "Vendor": "Acme", "Record Description": "x", "Amount": 100.0,
+    }])
+    run = attribute(df, contracts, aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings=learned)
+    assert run.row_gids == (None,)
+    assert len(run.dropped) == 1
+    assert len(run.ambiguous) == 0
 
 
 def test_learned_mapping_with_multi_task_name_falls_through_to_narrowing():

@@ -7,8 +7,42 @@
     <a href="{{ url_for('dashboard') }}">← back to Dashboard</a>
     &nbsp;·&nbsp;
     <small><code>{{ row["Asana Task GID"] }}</code></small>
+    {% if resolved %}&nbsp;·&nbsp;<span class="pill">Resolved (alarms muted)</span>{% endif %}
   </p>
 </header>
+
+<article>
+  <header><h3>Alarm notifications</h3></header>
+  {% if resolved %}
+    <p>
+      <span class="pill">Resolved {{ resolved.resolved_at }}</span>
+      This contract's <strong>Alarms</strong> and <strong>Spending Rate Alarm</strong>
+      are <strong>muted</strong> — the engine keeps writing Spent&nbsp;so&nbsp;far,
+      %&nbsp;Spent and Spending&nbsp;Rate, but won't touch the alarm fields, so your
+      email-on-ALARM rule stays quiet.
+      {% if resolved.baseline_band %}
+        It will re-arm once if the spending-rate band climbs above
+        <strong>{{ resolved.baseline_band }}</strong>.
+      {% else %}
+        It will re-arm once if a spending-rate band alarm appears.
+      {% endif %}
+    </p>
+    <form method="post" action="{{ url_for('dashboard_detail_unresolve', gid=row['Asana Task GID']) }}" style="margin:0;">
+      <button type="submit" class="secondary" style="margin:0;">Un-resolve (resume alarm writes)</button>
+    </form>
+  {% else %}
+    <p>
+      <small>Mark this contract <em>Resolved</em> once you've acknowledged its alarm
+      and don't want Asana to keep emailing you about it. Spend, % Spent and Spending
+      Rate keep updating; only the alarm fields stop. It re-arms once if the
+      spending-rate band gets worse than it is now
+      ({{ row["Spending Rate Alarm"] or "no band" }}).</small>
+    </p>
+    <form method="post" action="{{ url_for('dashboard_detail_resolve', gid=row['Asana Task GID']) }}" style="margin:0;">
+      <button type="submit" style="margin:0;">Mark Resolved (mute alarm emails)</button>
+    </form>
+  {% endif %}
+</article>
 
 <article>
   <header><h3>Live values</h3></header>
@@ -34,6 +68,67 @@
       <tr><th>Last Updated</th><td>{{ row["Last Updated"] or "" }}</td></tr>
     </tbody>
   </table>
+</article>
+
+{% macro lines_table(lines) %}
+  <table role="grid">
+    <thead>
+      <tr><th>Date</th><th>Campus</th><th>Acct</th><th>Vendor</th>
+          <th>Record Description</th><th>Reference</th><th class="num">Amount</th></tr>
+    </thead>
+    <tbody>
+      {% for l in lines %}
+      <tr>
+        <td style="white-space: nowrap;"><small>{{ l["Date"] or "?" }}</small></td>
+        <td><small>{{ l["Campus"] }}</small></td>
+        <td><small>{{ l["Account No"] }}</small></td>
+        <td><small>{{ l["Vendor"] }}</small></td>
+        <td><small>{{ l["Record Description"] }}</small></td>
+        <td><small>{{ l["Reference"] }}</small></td>
+        <td class="num">${{ "{:,.2f}".format(l["Amount"] or 0) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endmacro %}
+
+<article>
+  <header>
+    <h3>Assigned Tableau entries
+      <small>(from the most recent ingest)</small></h3>
+  </header>
+  {% if in_term or out_term %}
+    <p><strong>Counted toward Spent so far</strong>
+      <small style="color: var(--pico-muted-color);">
+        — {{ in_term|length }} entr{{ 'y' if in_term|length == 1 else 'ies' }},
+        ${{ "{:,.2f}".format(in_total) }}</small></p>
+    {% if in_term %}{{ lines_table(in_term) }}
+    {% else %}<p><small style="color: var(--pico-muted-color);">None within the term window.</small></p>{% endif %}
+
+    {% if out_term %}
+    <p style="margin-top: 1rem;"><strong>Out of term — attributed but NOT counted</strong>
+      <small style="color: var(--pico-muted-color);">
+        — {{ out_term|length }} entr{{ 'y' if out_term|length == 1 else 'ies' }},
+        ${{ "{:,.2f}".format(out_total) }}</small></p>
+    <p><small style="color: var(--pico-muted-color);">
+      Same vendor/coding but dated outside this contract's term
+      ({{ row["Start"] or "?" }} → {{ row["Due"] or "(today)" }}) — likely a
+      prior contract's spend. Extend the term in Asana if these belong here.
+    </small></p>
+    {{ lines_table(out_term) }}
+    {% endif %}
+  {% else %}
+    <p><strong>No Tableau entries are assigned to this contract.</strong></p>
+    <p><small style="color: var(--pico-muted-color);">
+      That's why Spent so far is ${{ "{:,.2f}".format(row["Spent so far"] or 0) }}.
+      The spend may exist in Tableau but the vendor name didn't match this
+      contract — it falls into <a href="{{ url_for('needs_tagging') }}">Needs
+      Tagging</a> as unmatched, or routed to a different contract. Resolve it
+      there with <em>Assign Contract</em>, or add a
+      <a href="{{ url_for('vendor_aliases_list') }}">Vendor Alias</a> so the engine
+      matches it next ingest.
+    </small></p>
+  {% endif %}
 </article>
 
 <article>

@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}CapEx Budgets — Contract Engine{% endblock %}
+
+{% block content %}
+<header>
+  <h2>CapEx Budgets</h2>
+  <p><small>
+    Total budget per CapEx ID (Project ID) — the denominator for that project's
+    <b>% Spent</b>, broadcast across <em>every</em> contract carrying the ID.
+    Budgets live in the Google Doc; enter them here once. A budget can be entered
+    before its contract is coded in Asana — it just sits until the next ingest
+    finds a matching contract.
+  </small></p>
+</header>
+
+{% if asana_error %}
+  <p class="flash-error" style="padding:0.6rem 0.9rem;border-radius:0.4rem;">
+    Could not reach Asana to compute the Needs-Budget queue ({{ asana_error }}).
+    Existing budgets below are still editable.
+  </p>
+{% endif %}
+
+<h3>Needs a budget
+  <span class="pill">{{ queue|length }}</span>
+</h3>
+{% if queue %}
+<p><small>These CapEx IDs are on a live Asana contract but have no budget yet.
+  Until you enter one, they compute no % and write nothing. Paste them into the
+  box below with their dollar amounts.</small></p>
+<figure>
+<table role="grid">
+  <thead><tr><th>CapEx ID</th><th class="num">Live contracts</th><th>Contract names</th></tr></thead>
+  <tbody>
+  {% for q in queue %}
+    <tr>
+      <td><code>{{ q.capex_id }}</code></td>
+      <td class="num">{{ q.n }}</td>
+      <td><small>{{ q.contracts | join(", ") }}</small></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% else %}
+  <p><small>{% if asana_error %}—{% else %}Nothing awaiting a budget. Every coded
+    CapEx project on a live contract has one.{% endif %}</small></p>
+{% endif %}
+
+<h3>Enter / update budgets (bulk)</h3>
+<p><small>One project per line: <code>CapEx ID&nbsp;&nbsp;amount</code> — tab,
+  comma, or space separated. Amounts may include <code>$</code> and commas.
+  Re-entering an existing CapEx ID updates it.</small></p>
+<form method="post" action="{{ url_for('capex_budgets_bulk') }}">
+  <textarea name="bulk" rows="8" placeholder="FFE001428	120000&#10;NCD000083	$1,250,000.00&#10;RMD000361, 80000"
+            style="font-family:monospace;"></textarea>
+  <button type="submit" class="contrast" style="margin:0;">Save budgets</button>
+</form>
+
+<h3 style="margin-top:1.5rem;">Current budgets
+  <span class="pill">{{ budget_rows|length }}</span>
+</h3>
+{% if budget_rows %}
+<figure>
+<table role="grid">
+  <thead>
+    <tr>
+      <th>CapEx ID</th><th class="num">Budget</th><th class="num">Live contracts</th>
+      <th>Entered</th><th>Notes</th><th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in budget_rows %}
+    <tr>
+      <td><code>{{ r["CapEx ID"] }}</code></td>
+      <td class="num">${{ "{:,.2f}".format(r["Budget"]) }}</td>
+      <td class="num">
+        {% set n = live_counts.get(r["CapEx ID"], 0) %}
+        {% if n %}{{ n }}{% else %}<span class="alarm-off">0 (no live contract yet)</span>{% endif %}
+      </td>
+      <td><small>{{ r["Entered At"] or "" }}</small></td>
+      <td><small>{{ r["Notes"] or "" }}</small></td>
+      <td>
+        <form method="post" action="{{ url_for('capex_budgets_delete', record_id=r['id']) }}"
+              onsubmit="return confirm('Delete budget for {{ r['CapEx ID'] }}?');" style="margin:0;">
+          <button type="submit" class="secondary outline" style="margin:0;">Delete</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% else %}
+  <p><small>No budgets entered yet.</small></p>
+{% endif %}
+{% endblock %}

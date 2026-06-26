@@ -36,3 +36,7 @@ Thumbs.db
 data/
 out/
 *.log
+
+# Node deps for tools/build_bookmarks_doc.js (docx)
+node_modules/
+package-lock.json

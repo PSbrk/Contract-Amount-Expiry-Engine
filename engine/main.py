@@ -796,6 +796,19 @@ def _run_attribution_and_needs_tagging(
     contracts = asana_contracts.load_open_contracts(asana_api)
     valid_contract_names = frozenset(c.name for c in contracts if c.name)
 
+    # Split the two tiers. CapEx (63015) contracts/rows are handled
+    # deterministically by engine.capex (CapEx-ID join, project budget, no term
+    # window); everything else is the opex fuzzy + coding-narrow path. A
+    # contract counts as CapEx if it's coded to the CapEx account OR carries a
+    # CapEx ID — so a mid-rollout contract with only one of the two still routes
+    # correctly and never gets opex-attributed by mistake.
+    capex_account = settings.CAPEX_ACCOUNT_NO
+    opex_contracts = [
+        c for c in contracts
+        if not (c.acc == capex_account or c.capex_id is not None)
+    ]
+    opex_df = kept_df.loc[kept_df["Account No"] != capex_account].copy()
+
     # Operator-driven promotions first. With valid_contract_names plumbed in,
     # a typo or stale rename in Assign Contract is caught at promotion time
     # rather than baked into a permanent Learned Mappings row.
@@ -813,8 +826,8 @@ def _run_attribution_and_needs_tagging(
     crosswalk = campus_map.build(forward_overrides, drop_override)
     learned = load_learned_mappings(conn)
 
-    # Attribute.
-    run = attribution.attribute(kept_df, contracts, aliases, crosswalk, learned)
+    # Attribute the OPEX tier only (CapEx is deterministic, handled below).
+    run = attribution.attribute(opex_df, opex_contracts, aliases, crosswalk, learned)
 
     summary = run.summary_dict()
     print()
@@ -825,9 +838,65 @@ def _run_attribution_and_needs_tagging(
     print(f"  split (crossover): {summary['split']:>6}")
     print(f"  ambiguous:         {summary['ambiguous']:>6}  (need review)")
     print(f"  unmatched:         {summary['unmatched']:>6}  (need review)")
+    print(f"  miscoded:          {summary.get('miscoded', 0):>6}  (coding mismatch)")
     print(f"  dropped (INT etc): {summary['dropped']:>6}")
 
-    # Upsert Needs Tagging for ambiguous + unmatched groups.
+    # Cross-tier coding-mismatch hints. An opex charge whose vendor matches a
+    # CapEx-coded contract surfaces as "no vendor candidates" because CapEx
+    # contracts are deliberately excluded from the opex pool (see opex_contracts
+    # above). Assigning won't stick (the LM is stale against the opex set), so
+    # tell the operator the real cause: it's an account-coding mismatch to fix
+    # upstream, not a missing contract. Only the truly-unmatched groups (no
+    # candidates) are checked; a reasonable WRatio match is enough for a hint.
+    from rapidfuzz import fuzz as _fuzz, utils as _fuzz_utils
+    capex_contracts = [
+        c for c in contracts
+        if (c.acc == capex_account or c.capex_id is not None) and c.name
+    ]
+    cross_tier_hints: dict[str, str] = {}
+    if capex_contracts:
+        for group in run.needs_tagging_groups:
+            if group.candidate_names:
+                continue
+            best_c, best_score = None, 0.0
+            for c in capex_contracts:
+                s = _fuzz.WRatio(group.vendor, c.name,
+                                 processor=_fuzz_utils.default_process)
+                if s > best_score:
+                    best_c, best_score = c, s
+            if best_c is not None and best_score >= attribution.DEFAULT_FUZZY_THRESHOLD:
+                tier = (f"CapEx project {best_c.capex_id}"
+                        if best_c.capex_id else "CapEx")
+                cross_tier_hints[group.group_key] = (
+                    f"Coding mismatch: this vendor matches '{best_c.name}' "
+                    f"(acct {best_c.acc or capex_account}, {tier}), but this "
+                    f"charge is acct {group.account_no}. Fix the account coding "
+                    f"in Asana or Tableau - it can't be tagged here."
+                )
+
+    # Miscoded groups: vendor matches a LIVE contract that aligns on campus +
+    # term; only the Dept/Acct coding differs. Lead the Engine Candidates with
+    # the coding DIFF so the /miscoded tab can show Asana-coding vs Tableau-
+    # coding without a live Asana re-fetch. Reuses the cross_tier_hint channel
+    # — the group sets are disjoint (cross-tier groups have NO candidates;
+    # miscoded groups always do).
+    contracts_by_gid = {c.gid: c for c in contracts}
+    for group in run.miscoded:
+        cand = next(
+            (contracts_by_gid[gid] for gid in group.candidate_gids
+             if gid in contracts_by_gid),
+            None,
+        )
+        if cand is not None:
+            campuses = "/".join(sorted(cand.campus_options)) or "—"
+            cross_tier_hints[group.group_key] = (
+                f"Coding mismatch: vendor matches '{cand.name}' "
+                f"(campus {campuses}, Dept {cand.dept or '—'} / "
+                f"Acct {cand.acc or '—'}), but this charge is "
+                f"Dept {group.dept or '—'} / Acct {group.account_no}."
+            )
+
+    # Upsert Needs Tagging for ambiguous + unmatched + miscoded groups.
     needs_tag = run.needs_tagging_groups
     upserted = 0
     for group in needs_tag:
@@ -847,6 +916,8 @@ def _run_attribution_and_needs_tagging(
             first_date=group.first_date,
             last_date=group.last_date,
             out_of_term=group.all_out_of_term,
+            coding_mismatch=(group.status == "miscoded"),
+            cross_tier_hint=cross_tier_hints.get(group.group_key, ""),
         )
         upserted += 1
     if upserted:
@@ -861,18 +932,50 @@ def _run_attribution_and_needs_tagging(
     if stale_deleted:
         print(f"  cleaned up {stale_deleted} stale Needs Tagging row(s).")
 
-    # Step 4: compute per-contract Dashboard rows for live contracts.
-    from engine import compute
-    from engine.sqlite_client import upsert_dashboard_row
-    today_date = datetime.now(timezone.utc).date()
-    dashboard_rows, skip_counts = compute.compute_dashboard(
-        kept_df, run, contracts, today_date,
+    # Step 4: compute per-contract Dashboard rows — TWO TIERS merged into one
+    # row set. Opex: compute_dashboard over the non-63015 rows + opex contracts
+    # (annual term window, pace). CapEx: compute_capex aggregates each project
+    # vs. its operator-entered budget and broadcasts to every live contract
+    # carrying the CapEx ID (no term, no pace; is_capex=True so the writer
+    # leaves Spending Rate untouched). Both write the same 5 Asana fields, so a
+    # single merged list flows through change-detection / Dashboard / State /
+    # writes below.
+    from engine import capex as capex_mod, compute
+    from engine.sqlite_client import (
+        load_amendment_links,
+        load_capex_budgets,
+        replace_attributed_lines,
+        upsert_dashboard_row,
     )
+    today_date = datetime.now(timezone.utc).date()
+
+    # Amendment links: an amendment adds budget to its parent. Sum each
+    # parent's linked amendment amounts so compute folds them into the
+    # parent's effective ceiling (% / band / Alarms vs. the COMBINED budget).
+    _, amendments_by_parent = load_amendment_links(conn)
+    amt_by_gid = {c.gid: (c.contract_amount or 0.0) for c in contracts}
+    amendment_budgets = {
+        parent_gid: sum(amt_by_gid.get(l["amendment_gid"], 0.0) for l in links)
+        for parent_gid, links in amendments_by_parent.items()
+    }
+    amendment_budgets = {k: v for k, v in amendment_budgets.items() if v}
+
+    opex_rows, skip_counts = compute.compute_dashboard(
+        opex_df, run, opex_contracts, today_date,
+        amendment_budgets=amendment_budgets,
+    )
+
+    budgets = load_capex_budgets(conn)
+    capex_run = capex_mod.compute_capex(kept_df, contracts, budgets, today_date)
+    capex_rows = list(capex_run.rows)
+
+    dashboard_rows = opex_rows + capex_rows
     alarms_count = sum(1 for r in dashboard_rows if r.alarms == "ALARM")
     over_count = sum(1 for r in dashboard_rows if r.spending_rate_alarm == "Over")
     print()
     print("Dashboard compute")
-    print(f"  live rows:              {len(dashboard_rows):>6}")
+    print(f"  opex live rows:         {len(opex_rows):>6}")
+    print(f"  capex broadcast rows:   {len(capex_rows):>6}")
     print(f"  ALARM tripping:         {alarms_count:>6}")
     print(f"  Over budget (>100%):    {over_count:>6}")
     print(f"  skipped not-active:     {skip_counts['not_active']:>6}")
@@ -880,6 +983,17 @@ def _run_attribution_and_needs_tagging(
     print(f"  skipped future-start:   {skip_counts['future_start']:>6}")
     print(f"  skipped past-due:       {skip_counts['past_due']:>6}")
     print(f"  skipped no-start-data:  {skip_counts['no_start_data']:>6}")
+    print()
+    print("CapEx (63015) tier")
+    print(f"  projects computed:      "
+          f"{len({(r.spent_so_far, r.contract_amount) for r in capex_rows}):>6}")
+    print(f"  needs budget:           {len(capex_run.needs_budget):>6}")
+    print(f"  parked (no contract):   {len(capex_run.spend_no_contract):>6}")
+    print(f"  awaiting CapEx ID rows: {capex_run.awaiting_rows:>6}")
+    if capex_run.needs_budget:
+        print("  --- CapEx IDs awaiting a budget (enter in the UI) ---")
+        for cid, spend, n in capex_run.needs_budget[:20]:
+            print(f"      {cid:14} ${spend:>14,.2f}  ({n} contract(s))")
     # Step 6: change detection. Load prior State (BEFORE Dashboard upsert so
     # the diff is against the truly-prior snapshot, not what we're about to
     # write). State PERSIST happens after the Asana write loop so a hard
@@ -923,6 +1037,17 @@ def _run_attribution_and_needs_tagging(
     if dashboard_rows:
         print(f"  upserted {len(dashboard_rows)} Dashboard row(s).")
 
+    # Per-contract attributed Tableau lines (Dashboard drill-down). Snapshot of
+    # THIS ingest only — opex row→gid + capex broadcast. Lets the operator click
+    # a contract and see exactly which entries landed on it (and which were
+    # excluded by the term window), instead of guessing why a total looks off.
+    attr_lines = (
+        compute.attributed_lines(opex_df, run, opex_contracts, today_date)
+        + capex_mod.capex_lines(kept_df, contracts, today_date)
+    )
+    n_lines = replace_attributed_lines(conn, attr_lines)
+    print(f"  recorded {n_lines} attributed line(s) for the Dashboard drill-down.")
+
     # Step 5: Asana writes. Strictly gated:
     #   - settings.DRY_RUN_ASANA defaults True (writes are logged, not sent).
     #   - settings.WRITE_TEST_CONTRACT, when set to a task GID, restricts
@@ -931,9 +1056,20 @@ def _run_attribution_and_needs_tagging(
     #     values against the Contract's cached current Asana values; only
     #     fields that actually changed get written (idempotent).
     from engine import asana_writer
+    from engine.sqlite_client import (
+        load_resolved_contracts,
+        update_resolved_baseline,
+    )
     contracts_by_gid = {c.gid: c for c in contracts}
     write_results: list[asana_writer.WriteResult] = []
     test_gid = settings.WRITE_TEST_CONTRACT or None
+    # Operator-resolved contracts: mute the two alarm enums, but RE-ARM (let
+    # them write once, then raise the baseline) if the Spending Rate Alarm
+    # band climbs above the band recorded at resolve time. Baseline bumps are
+    # collected and applied after the loop, mirroring the State-persist
+    # discipline (don't mutate operator state mid-pipeline).
+    resolved = load_resolved_contracts(conn)
+    rearm_bumps: list[tuple[str, str]] = []  # (gid, new_band)
     for dash_row in dashboard_rows:
         current_contract = contracts_by_gid.get(dash_row.asana_task_gid)
         if current_contract is None:
@@ -944,12 +1080,33 @@ def _run_attribution_and_needs_tagging(
                 dash_row.asana_task_gid, dash_row.contract_name,
             )
             continue
+        suppress: frozenset[str] = frozenset()
+        info = resolved.get(dash_row.asana_task_gid)
+        if info is not None:
+            new_band = dash_row.spending_rate_alarm
+            if asana_writer.band_severity(new_band) > asana_writer.band_severity(
+                info["baseline_band"]
+            ):
+                # Band worsened past the baseline — break silence this once,
+                # then re-baseline so it goes quiet again at the new level.
+                rearm_bumps.append((dash_row.asana_task_gid, new_band or ""))
+                log.info(
+                    "resolved re-arm: %s (%s) band %r -> %r; alarm writes "
+                    "allowed this run",
+                    dash_row.asana_task_gid, dash_row.contract_name,
+                    info["baseline_band"], new_band,
+                )
+            else:
+                suppress = asana_writer.ALARM_FIELDS
         res = asana_writer.apply_writes(
             asana_api, dash_row, current_contract,
             dry_run=settings.DRY_RUN_ASANA,
             test_contract_gid=test_gid,
+            suppress_fields=suppress,
         )
         write_results.append(res)
+    for gid, new_band in rearm_bumps:
+        update_resolved_baseline(conn, gid=gid, baseline_band=new_band)
 
     # State PERSIST — runs AFTER Dashboard upsert AND AFTER Asana writes so
     # State becomes the "high-water mark of a fully-successful run". If
@@ -1024,6 +1181,7 @@ def _run_attribution_and_needs_tagging(
         f"auto {summary['auto']}, learned {summary['learned']}, "
         f"split {summary['split']}, "
         f"ambiguous {summary['ambiguous']}, unmatched {summary['unmatched']}, "
+        f"miscoded {summary.get('miscoded', 0)}, "
         f"dropped {summary['dropped']}"
     )
     notes_lines = [f"Attribution summary: {summary_line}.", f"Open contracts loaded: {len(contracts)}."]
@@ -1032,10 +1190,18 @@ def _run_attribution_and_needs_tagging(
     if stale_deleted:
         notes_lines.append(f"Cleaned up {stale_deleted} stale Needs Tagging rows.")
     dashboard_line = (
-        f"Dashboard: {len(dashboard_rows)} live rows ({alarms_count} ALARM, "
-        f"{over_count} Over)."
+        f"Dashboard: {len(dashboard_rows)} live rows "
+        f"({len(opex_rows)} opex + {len(capex_rows)} capex; "
+        f"{alarms_count} ALARM, {over_count} Over)."
     )
     notes_lines.append(dashboard_line)
+    notes_lines.append(
+        "CapEx: "
+        f"{len(capex_run.needs_budget)} project(s) awaiting a budget, "
+        f"{len(capex_run.spend_no_contract)} parked (no live contract), "
+        f"{capex_run.awaiting_rows} row(s) with a blank CapEx ID "
+        f"(${capex_run.awaiting_amount:,.2f})."
+    )
     notes_lines.append(
         "Dashboard skips: "
         f"not_active={skip_counts['not_active']}, "
@@ -1063,6 +1229,11 @@ def _run_attribution_and_needs_tagging(
     review_flags = []
     if needs_tag:
         review_flags.append(f"{len(needs_tag)} group(s) in Needs Tagging awaiting Assign Contract.")
+    if capex_run.needs_budget:
+        review_flags.append(
+            f"{len(capex_run.needs_budget)} CapEx project(s) awaiting an "
+            f"operator-entered budget (Needs-Budget queue)."
+        )
     if alarms_count:
         review_flags.append(f"{alarms_count} contract(s) tripping ALARM.")
     if write_summary.contracts_errored:

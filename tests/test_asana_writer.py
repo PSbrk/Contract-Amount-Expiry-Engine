@@ -15,10 +15,12 @@ import pytest
 from config import settings
 from engine.asana_contracts import Contract
 from engine.asana_writer import (
+    ALARM_FIELDS,
     FieldDelta,
     WriteResult,
     WriteRunSummary,
     apply_writes,
+    band_severity,
     build_custom_fields_payload,
     diff_dashboard_vs_current,
     summarize,
@@ -183,6 +185,41 @@ def test_diff_catches_meaningful_cent_difference():
     deltas = diff_dashboard_vs_current(d, c)
     # 0.01 < 0.005 tolerance? No, 0.01 > 0.005 — must be flagged.
     assert any(x.field_name == "Spent so far" for x in deltas)
+
+
+# ---------------------------------------------------------------------------
+# Resolved mute — suppress_fields + re-arm band severity
+# ---------------------------------------------------------------------------
+
+def test_band_severity_orders_bands():
+    assert band_severity(None) == 0
+    assert band_severity("") == 0
+    assert band_severity("75%") < band_severity("90%") < band_severity("100%") < band_severity("Over")
+
+
+def test_apply_writes_suppress_drops_alarm_fields_keeps_numbers():
+    """A resolved contract: the alarm enums are dropped from the write, but
+    the numeric spend fields still go through."""
+    c = _contract(current_spent_so_far=5000.0, current_alarms="Clear")
+    d = _dashboard(spent_so_far=6000.0, alarms="ALARM")
+    res = apply_writes(
+        None, d, c, dry_run=True, suppress_fields=ALARM_FIELDS,
+    )
+    names = {x.field_name for x in res.deltas}
+    assert names == {"Spent so far"}
+    assert "Alarms" not in names
+
+
+def test_apply_writes_suppress_makes_alarm_only_change_a_noop():
+    """If the ONLY change is an alarm field, suppressing it leaves nothing to
+    write — reported as no_change so the email rule never fires."""
+    c = _contract(current_alarms="Clear")
+    d = _dashboard(alarms="ALARM")  # only the Alarms field differs
+    res = apply_writes(
+        None, d, c, dry_run=True, suppress_fields=ALARM_FIELDS,
+    )
+    assert res.deltas == ()
+    assert res.skipped_reason == "no_change"
 
 
 # ---------------------------------------------------------------------------

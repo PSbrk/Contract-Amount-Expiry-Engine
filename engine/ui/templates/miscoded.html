@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Miscoded? — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>Miscoded?</h2>
+  <p>
+    <small>
+      These groups match a <strong>live contract</strong> on vendor, campus,
+      and term &mdash; the <strong>only</strong> difference is the Dept/Acct
+      coding. Decide each one:
+      <em>Accept as miscoded</em> attributes the spend to the contract anyway
+      (the coding check is bypassed, and it keeps showing here until the source
+      coding is fixed); <em>Correctly coded</em> confirms the difference is
+      real and leaves the spend unattributed (it counts as genuinely-separate,
+      no-contract spend).
+    </small>
+  </p>
+  <nav>
+    <ul>
+      <li><a href="{{ url_for('miscoded', show='open') }}"
+             {% if show == 'open' %}aria-current="page"{% endif %}>Open ({{ open_count }})</a></li>
+      <li><a href="{{ url_for('miscoded', show='accepted') }}"
+             {% if show == 'accepted' %}aria-current="page"{% endif %}>Accepted as miscoded ({{ accepted_count }})</a></li>
+      <li><a href="{{ url_for('miscoded', show='confirmed') }}"
+             {% if show == 'confirmed' %}aria-current="page"{% endif %}>Confirmed correct ({{ confirmed_count }})</a></li>
+    </ul>
+  </nav>
+</header>
+
+{% if show == 'accepted' %}
+  {% if accepted %}
+  <figure>
+  <table role="grid">
+    <thead>
+      <tr><th>Vendor</th><th>Charge coding</th><th>&rarr; Attributed to</th><th>Since</th><th>Action</th></tr>
+    </thead>
+    <tbody>
+    {% for a in accepted %}
+      <tr>
+        <td><strong>{{ a["Vendor"] or "" }}</strong></td>
+        <td><small>{{ a["Campus"] or "" }} &middot; Dept {{ a["Dept"] or "—" }} &middot; acct {{ a["Account No"] or "—" }}</small></td>
+        <td>{{ a["Contract Name"] or "" }}<br><small style="color: var(--pico-muted-color);">{{ a["Contract Gid"] or "" }}</small></td>
+        <td><small>{{ a["Learned At"] or "" }}</small></td>
+        <td>
+          <form method="post" action="{{ url_for('miscoded_revert', record_id=a['id']) }}" style="margin:0;">
+            <button type="submit" class="secondary outline" style="margin:0; font-size:0.85rem;">Revert</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </figure>
+  {% else %}
+    <p>No accepted miscodings. When you accept one, it attributes on the next ingest and lists here so the coding error stays visible.</p>
+  {% endif %}
+
+{% elif items %}
+<figure>
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Group</th>
+      <th class="num">$</th>
+      <th>Dates</th>
+      <th>Coding mismatch</th>
+      <th style="min-width: 22rem; width: 26rem;">Action</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for item in items %}
+    {% set r = item.row %}
+    <tr>
+      <td>
+        <strong>{{ r["Vendor"] or "" }}</strong>
+        {% if show == 'confirmed' %}<span class="pill">confirmed correct</span>{% endif %}
+        <br>
+        <small>{{ r["Campus"] or "" }} &middot; Dept {{ r["Dept"] or "—" }} &middot; acct {{ r["Account No"] or "" }}</small>
+        <br><small style="color: var(--pico-muted-color);">{{ (r["Sample Record Description"] or "")[:90] }}</small>
+      </td>
+      <td class="num">${{ "{:,.2f}".format(r["$ in group"] or 0) }}</td>
+      <td>
+        <small>
+          {% if r["First Date"] and r["Last Date"] and r["First Date"] != r["Last Date"] %}
+            {{ r["First Date"] }}<br>&hellip; {{ r["Last Date"] }}
+          {% else %}{{ r["First Date"] or r["Last Date"] or "—" }}{% endif %}
+        </small>
+      </td>
+      <td>
+        <small><strong>&#9888; {{ (r["Engine Candidates"] or '')|replace('Engine vendor candidates:','')|replace('No vendor candidates found.','')|trim }}</strong></small>
+      </td>
+      <td>
+        {% if show == 'confirmed' %}
+          <form method="post" action="{{ url_for('miscoded_unconfirm', record_id=r['id']) }}" style="margin:0;">
+            <button type="submit" class="secondary" style="margin:0;">Reopen</button>
+          </form>
+        {% else %}
+          {% for c in item.candidates %}
+          <form method="post" action="{{ url_for('miscoded_accept', record_id=r['id']) }}"
+                style="display:inline; margin:0 0 0.3rem 0;">
+            <input type="hidden" name="contract_gid" value="{{ c.gid }}">
+            <input type="hidden" name="contract_name" value="{{ c.name }}">
+            <button type="submit" style="margin:0;">Accept as miscoded &rarr; {{ c.name }}</button>
+          </form>
+          {% endfor %}
+          <form method="post" action="{{ url_for('miscoded_confirm_correct', record_id=r['id']) }}" style="margin:0.3rem 0 0 0;">
+            <button type="submit" class="secondary outline" style="margin:0; font-size:0.85rem;">Correctly coded (leave unattributed)</button>
+          </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</figure>
+
+{% else %}
+  {% if show == 'confirmed' %}
+    <p>No groups confirmed as correctly-coded.</p>
+  {% else %}
+    <p>No coding mismatches awaiting a decision. The engine routes a group here only when a live contract matches on vendor, campus, and term but the Dept/Acct differs.</p>
+  {% endif %}
+{% endif %}
+{% endblock %}

@@ -40,6 +40,13 @@ ASANA_FIELD_PM_EMAIL: Final = "1213557820320006"         # text — used by the 
 ASANA_FIELD_CONTRACT_REASON_TEXT: Final = "1213527792866809"
 ASANA_FIELD_CREATED_DATE: Final = "1213417707609925"     # date (fallback only; see spec §7)
 
+# Coding fields mirrored from Tableau (added to Asana 2026-06). The deterministic
+# join keys: Campus (above) + Dept + Acc narrow the opex candidate set; CapEx ID
+# is the exact key for 63015 (== Tableau Project ID, after strip().upper()).
+ASANA_FIELD_DEPT: Final = "1216012622947824"             # text  — GL department (e.g. "000")
+ASANA_FIELD_ACC: Final = "1215966596882527"              # number — GL account (e.g. 63015)
+ASANA_FIELD_CAPEX_ID: Final = "1215966596882529"         # text  — CapEx project id == Tableau Project ID
+
 # Writable custom fields — ONLY these five may have their VALUES written.
 # Structural changes to any field (rename / delete / option-edit) are forbidden
 # regardless of guardrail mode.
@@ -99,6 +106,9 @@ ASANA_EXPECTED_READ_FIELDS: Final = {
     "PM Email": {"gid": ASANA_FIELD_PM_EMAIL, "type": "text"},
     "Contract Reason Text": {"gid": ASANA_FIELD_CONTRACT_REASON_TEXT, "type": "text"},
     "Created Date": {"gid": ASANA_FIELD_CREATED_DATE, "type": "date"},
+    "Dept": {"gid": ASANA_FIELD_DEPT, "type": "text"},
+    "Acc": {"gid": ASANA_FIELD_ACC, "type": "number"},
+    "CapEx ID": {"gid": ASANA_FIELD_CAPEX_ID, "type": "text"},
 }
 
 ASANA_EXPECTED_WRITE_FIELDS: Final = {
@@ -125,14 +135,18 @@ ASANA_EXPECTED_WRITE_FIELDS: Final = {
 # Account numbers in scope. Strings to preserve any leading zeros and to make
 # membership checks robust against pandas dtype inference.
 #
-# 63015 (Capital Projects) was REMOVED from scope on 2026-06-16 — those rows
-# represent CapEx that this engine no longer tracks. Tableau exports may
-# still include them; they'll be filtered to the out-of-scope bucket and
-# show up in Run Log's "Rows Out Of Scope" total for visibility.
-ACCOUNTS_IN_SCOPE: Final = frozenset({"63020", "63040", "63080", "63090"})
+# 63015 (Capital Projects) is back IN scope as of 2026-06-24 — it is the CapEx
+# tier, matched by CapEx ID instead of fuzzy vendor (see CAPEX_ACCOUNT_NO).
+# 63020 was REMOVED the same day (no longer tracked).
+ACCOUNTS_IN_SCOPE: Final = frozenset({"63015", "63040", "63080", "63090"})
 
 # Departments in scope. Strings — "000" must keep its zero-padding.
-DEPTS_IN_SCOPE: Final = frozenset({"000", "107"})
+DEPTS_IN_SCOPE: Final = frozenset({"000", "107", "110"})
+
+# The CapEx account. Rows coded to this account attribute by CapEx ID ↔ Tableau
+# Project ID (not fuzzy vendor), aggregate per project, and compute against an
+# operator-entered budget with NO term window. Everything else is the opex tier.
+CAPEX_ACCOUNT_NO: Final = "63015"
 
 
 # ---------------------------------------------------------------------------

@@ -86,6 +86,10 @@ class DashboardRow:
     # through from Asana so the Vendor Conflicts UI can show it alongside
     # the Tableau Record Description for operator comparison.
     contract_reason_text: str | None = None
+    # True for CapEx (63015) rows: % is vs. the operator-entered project budget,
+    # spend is the aggregate broadcast across every contract under the CapEx ID,
+    # and there is NO pace — the writer leaves Asana's Spending Rate untouched.
+    is_capex: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +335,7 @@ def compute_dashboard(
     run: AttributionRun,
     contracts: Iterable[Contract],
     today: date,
+    amendment_budgets: dict[str, float] | None = None,
 ) -> tuple[list[DashboardRow], dict[str, int]]:
     """Compute one DashboardRow per live contract.
 
@@ -338,7 +343,17 @@ def compute_dashboard(
     non-live contracts were skipped, for operator-visible Run Log notes:
         {"not_active": N, "expired": N, "future_start": N, "past_due": N,
          "no_start_data": N}
+
+    amendment_budgets maps a PARENT contract gid to the extra budget its
+    operator-linked amendment(s) add. An amendment exists to raise the
+    parent's budget ceiling, and all the group's transactions route to the
+    parent (the amendment's own row shows $0 spent). So the parent's
+    effective budget = its own Contract Amount + the linked amendments'
+    amounts; % Spent / band / Alarms (which get written to Asana) are
+    computed against that combined budget, and the combined figure is what
+    the row reports as Contract Amount so the row reads consistently.
     """
+    amendment_budgets = amendment_budgets or {}
     annotated = annotate_with_contract(in_scope_df, run)
     rows: list[DashboardRow] = []
     skip_counts: dict[str, int] = {
@@ -361,8 +376,15 @@ def compute_dashboard(
         term_days = compute_term_days(start, c.due_on)
         end = c.due_on if c.due_on is not None and c.due_on < today else today
 
+        # Amendment-adjusted budget: fold any linked amendments' amounts into
+        # the parent's effective ceiling before the % / band / alarm math.
+        extra_budget = amendment_budgets.get(c.gid, 0.0)
+        effective_amount = c.contract_amount
+        if extra_budget:
+            effective_amount = (c.contract_amount or 0.0) + extra_budget
+
         spent = compute_spent_in_term(annotated, c.gid, start, end)
-        pct_spent = compute_pct_spent(spent, c.contract_amount)
+        pct_spent = compute_pct_spent(spent, effective_amount)
         spending_rate = compute_spending_rate(pct_spent, start, today, term_days)
         band = compute_alarm_band(pct_spent)
         alarms = compute_alarms(pct_spent, spending_rate, spent)
@@ -371,7 +393,7 @@ def compute_dashboard(
             contract_name=c.name,
             asana_task_gid=c.gid,
             campus_set=", ".join(sorted(c.campus_options)),
-            contract_amount=c.contract_amount,
+            contract_amount=effective_amount,
             spent_so_far=round(spent, 2),
             pct_spent=pct_spent,
             spending_rate=spending_rate,
@@ -392,8 +414,88 @@ def compute_dashboard(
     return rows, skip_counts
 
 
+# ---------------------------------------------------------------------------
+# Attributed-line drill-down (Dashboard → which Tableau entries landed here)
+# ---------------------------------------------------------------------------
+
+def line_dict(gid: str, row, in_term: bool, tier: str) -> dict:
+    """Shape one persisted Attributed-Lines row from a transaction df row.
+
+    Shared by the opex (compute) and capex tiers so the stored columns stay
+    identical. NaN/None text cells degrade to ''; Date → ISO string."""
+    def _txt(col: str) -> str:
+        v = row.get(col)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        return str(v)
+
+    d = row.get("Date")
+    date_iso = ""
+    if d is not None and not (isinstance(d, float) and pd.isna(d)):
+        try:
+            date_iso = pd.Timestamp(d).date().isoformat()
+        except (ValueError, TypeError):
+            date_iso = ""
+    amt = row.get("Amount")
+    try:
+        amt = float(amt)
+    except (ValueError, TypeError):
+        amt = 0.0
+    return {
+        "gid": gid, "date": date_iso, "campus": _txt("Campus"),
+        "account_no": _txt("Account No"), "vendor": _txt("Vendor"),
+        "description": _txt("Record Description"), "reference": _txt("Reference"),
+        "amount": round(amt, 2), "in_term": bool(in_term), "tier": tier,
+    }
+
+
+def attributed_lines(
+    in_scope_df: pd.DataFrame,
+    run: AttributionRun,
+    contracts: Iterable[Contract],
+    today: date,
+) -> list[dict]:
+    """One line dict per OPEX transaction attributed to a LIVE contract.
+
+    Reuses annotate_with_contract for the positional row→gid map and the
+    SAME [start, min(today, due)] window compute_dashboard uses, so a line's
+    `in_term` matches whether it counted toward that contract's Spent so far.
+    Rows whose group didn't attribute cleanly (gid None) are omitted — they
+    belong to Needs Tagging, not a contract.
+    """
+    annotated = annotate_with_contract(in_scope_df, run)
+    if len(annotated) == 0:
+        return []
+    windows: dict[str, tuple[date, date]] = {}
+    for c in contracts:
+        passes, _ = passes_live_gate(c, today)
+        if not passes:
+            continue
+        start = compute_start(c)
+        if start is None:
+            continue
+        end = c.due_on if c.due_on is not None and c.due_on < today else today
+        windows[c.gid] = (start, end)
+
+    lines: list[dict] = []
+    # ponytail: iterrows over the attributed subset only — once-per-ingest path,
+    # subset is small (clean-attributed rows, not all 16k). Vectorize if it bites.
+    attributed = annotated[annotated["_contract_gid"].isin(windows.keys())]
+    for _, row in attributed.iterrows():
+        gid = row["_contract_gid"]
+        start, end = windows[gid]
+        d = row.get("Date")
+        in_term = False
+        if d is not None and not pd.isna(d):
+            in_term = start <= pd.Timestamp(d).date() <= end
+        lines.append(line_dict(gid, row, in_term, "opex"))
+    return lines
+
+
 __all__ = [
     "DashboardRow",
+    "line_dict",
+    "attributed_lines",
     "passes_live_gate",
     "compute_start",
     "compute_term_days",

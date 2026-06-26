@@ -21,7 +21,7 @@ const OUT = path.join(
   process.env.USERPROFILE || "C:\\Users\\philip.seabrook",
   "Downloads", "Contract Engine Bookmarks.docx",
 );
-const BASE = "http://127.0.0.1:5000";
+const BASE = "http://127.0.0.1:8080";
 // Click-to-launch the bundled engine UI. Word renders file:/// URLs as
 // real hyperlinks; the operator clicks once and run-ui.bat boots
 // EngineApp.exe in UI mode in a new console window.
@@ -42,37 +42,29 @@ const OPEN_INBOX =
   "dist/ContractEngine/data/inbox";
 
 const LAST_REFRESHED =
-  "Ingests now run the moment you drop a Tableau export into data\\inbox " +
-  "(an inbox watcher replaces the old fixed-time daily run) — usually " +
-  "within ~10-15 seconds. Asana write-back of the five spend custom fields " +
-  "(Spent so far, % Spent, Spending Rate, Spending Rate Alarm, Alarms) is " +
-  "currently PAUSED (DRY_RUN_ASANA=true) while contract attribution coverage " +
-  "is improved — most contracts are still in the Needs Tagging backlog, so a " +
-  "broad write would push $0 to the un-tagged ones. A new zero-overwrite " +
-  "guard now prevents an un-attributed contract from ever being written back " +
-  "to $0 over real spend. Re-enable write-back (DRY_RUN_ASANA=false) once " +
-  "attribution covers your contracts. Earlier: " +
-  "Vendor Conflicts no longer confuses scopes that merely share the word " +
-  "“removal”: a tree-removal contract can no longer be auto-matched to " +
-  "a snow/ice record — the subject (snow vs tree) decides the match, not the " +
-  "generic action word. Earlier: refreshed after a full code-review " +
-  "hardening pass (15 findings " +
-  "fixed). Spend attribution is now exact: per-row contract gids are " +
-  "tracked POSITIONALLY (duplicate / blank Record No can no longer " +
-  "collapse or drop a row's spend), and an ambiguous group no longer " +
-  "leaks its already-attributed rows onto the Dashboard before you " +
-  "resolve it. Out-of-term detection is per-bucket, so a MIXED group " +
-  "(some months in-term, some pre-dating the contract) is correctly " +
-  "routed to Vendor Conflicts instead of being stranded. Pinning a " +
-  "contract whose term does not cover the transactions is now REFUSED " +
-  "with guidance (it used to loop forever); per-description picks store " +
-  "a normalized pattern so they keep matching across invoice numbers; " +
-  "and answering by name in Needs Tagging now clears any stale pin. " +
-  "OneDrive sync is safer: the UI no longer overwrites unsynced local " +
-  "edits, backs up after every change, and refuses to restore an empty/" +
-  "truncated cloud copy. Page 2 still documents the OneDrive operator-" +
-  "handoff process. \"Run an ingest now\" points at " +
-  "run-ingest-interactive.bat with live progress.";
+  "MAJOR REBUILD (2026-06-24): the engine now tracks Capital Projects " +
+  "(account 63015) as a dedicated CapEx tier. CapEx transactions match an " +
+  "Asana contract by an EXACT CapEx ID = Tableau Project ID join (no fuzzy " +
+  "guessing); each project's spend is summed across ALL its transactions and " +
+  "compared to a total budget you enter once on the new CapEx Budgets page, " +
+  "and the resulting % / band / alarm is broadcast to EVERY contract sharing " +
+  "that CapEx ID. Scope changed: 63015 is tracked again, 63020 is no longer " +
+  "tracked, and department 110 was added. Opex (everything else) now narrows " +
+  "candidates by the Campus + Dept + Acc coding Asana mirrors from Tableau " +
+  "before fuzzy vendor matching, and campus is matched EXACTLY — an " +
+  "unrecognized campus (e.g. YVN, ZNR with no Asana option yet) goes to Needs " +
+  "Tagging for you rather than being auto-guessed. Learned mappings were reset " +
+  "to a clean slate; rebuild them by answering Needs Tagging exactly as " +
+  "before. Asana write-back of the five spend custom fields (Spent so far, % " +
+  "Spent, Spending Rate, Spending Rate Alarm, Alarms) is PAUSED " +
+  "(DRY_RUN_ASANA=true): validate the dry-run Dashboard — especially the CapEx " +
+  "broadcast and your re-taught mappings — then set DRY_RUN_ASANA=false in " +
+  "config\\secrets.env to go live. CapEx contracts deliberately leave Spending " +
+  "Rate untouched (a multi-year project has no annual pace). The zero-" +
+  "overwrite guard still prevents an un-attributed contract being written back " +
+  "to $0 over real spend. Ingests still run automatically within ~10-15s of " +
+  "dropping an export into data\\inbox. Page 2 documents the OneDrive " +
+  "operator-handoff process.";
 
 function p(text, opts = {}) {
   return new Paragraph({
@@ -147,7 +139,7 @@ const doc = new Document({
 
       h("Launch the engine", HeadingLevel.HEADING_2),
       linkWithBlurb("Start the local web UI", LAUNCH_UI,
-        "runs scripts/run-ui.bat; opens the engine UI on http://127.0.0.1:5000"),
+        "runs scripts/run-ui.bat; opens the engine UI on http://127.0.0.1:8080"),
       linkWithBlurb("Run an ingest now (one-shot)", LAUNCH_INGEST,
         "runs scripts/run-ingest-interactive.bat; window stays open and shows live progress, full log saved to logs\\ingest-<date>.log"),
       linkWithBlurb("Open the inbox folder", OPEN_INBOX,
@@ -155,7 +147,9 @@ const doc = new Document({
 
       h("Local Web UI", HeadingLevel.HEADING_2),
       linkWithBlurb("Dashboard", BASE + "/",
-        "live contracts, spend, alarm bands; amendments show cross-reference"),
+        "live contracts (opex + CapEx), spend, alarm bands; amendments show cross-reference"),
+      linkWithBlurb("CapEx Budgets", BASE + "/capex-budgets",
+        "enter total budget per CapEx ID (account 63015 projects); shows the Needs-Budget queue + a bulk paste box for the Google-Doc figures"),
       linkWithBlurb("Vendor Conflicts", BASE + "/vendor-conflicts",
         "pick which Asana task a same-vendor group belongs to; declare amendment links"),
       linkWithBlurb("Needs Tagging — Open", BASE + "/needs-tagging?show=open",
@@ -263,7 +257,7 @@ const doc = new Document({
         "this document. The engine boots, auto-pulls engine.db from " +
         "OneDrive (you'll see \"Pulled engine.db from OneDrive\" or " +
         "\"Restored engine.db from OneDrive\" in the console), and " +
-        "opens the UI on http://127.0.0.1:5000.",
+        "opens the UI on http://127.0.0.1:8080.",
         { paragraph: { spacing: { after: 120 } } }),
       p("5. Open Settings. The \"OneDrive sync state\" panel should " +
         "show \"Pulled from OneDrive (first run on this machine)\" or " +

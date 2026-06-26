@@ -490,6 +490,60 @@ def test_upsert_needs_tagging_handles_vendor_with_apostrophe(conn):
     assert rows[0]["$ in group"] == 20.0
 
 
+def test_upsert_once_off_resurfaces_when_newly_miscoded(conn):
+    """A once-off'd group the engine now recognizes as a coding mismatch (a
+    matching contract exists, e.g. a Vendor Alias was just added) resurfaces —
+    Once Off cleared, Coding Mismatch set — even on a same-date re-ingest, so a
+    stale once-off can't shadow the Miscoded? decision."""
+    upsert_needs_tagging_group(
+        conn, group_key="HNV|000|63040|Milosi",
+        campus="HNV", dept="000", account_no="63040", vendor="Milosi",
+        sample_description="irrigation", amount=1409.90,
+        candidate_names=[], created_at_iso_date="2026-06-01", last_date="2026-06-01",
+    )
+    rid = conn.execute('SELECT id FROM "Needs Tagging"').fetchone()[0]
+    conn.execute('UPDATE "Needs Tagging" SET "Once Off"=1, "Once Off Anchor"=? WHERE id=?',
+                 ("2026-06-01", rid))
+    conn.commit()
+    upsert_needs_tagging_group(
+        conn, group_key="HNV|000|63040|Milosi",
+        campus="HNV", dept="000", account_no="63040", vendor="Milosi",
+        sample_description="irrigation", amount=1409.90,
+        candidate_names=["Milosi, Inc."], candidate_gids=["g_milosi"],
+        created_at_iso_date="2026-06-01", last_date="2026-06-01",
+        coding_mismatch=True,
+    )
+    row = conn.execute(
+        'SELECT "Once Off", "Coding Mismatch" FROM "Needs Tagging" WHERE id=?',
+        (rid,)).fetchone()
+    assert row[0] == 0   # Once Off cleared
+    assert row[1] == 1   # Coding Mismatch set
+
+
+def test_upsert_once_off_not_miscoded_stays_parked(conn):
+    """Control: a once-off'd group that is NOT miscoded stays parked on a
+    same-date re-ingest (no spurious resurface)."""
+    upsert_needs_tagging_group(
+        conn, group_key="CEN|000|63040|Quiet Vendor",
+        campus="CEN", dept="000", account_no="63040", vendor="Quiet Vendor",
+        sample_description="x", amount=100.0,
+        candidate_names=[], created_at_iso_date="2026-06-01", last_date="2026-06-01",
+    )
+    rid = conn.execute('SELECT id FROM "Needs Tagging"').fetchone()[0]
+    conn.execute('UPDATE "Needs Tagging" SET "Once Off"=1, "Once Off Anchor"=? WHERE id=?',
+                 ("2026-06-01", rid))
+    conn.commit()
+    upsert_needs_tagging_group(
+        conn, group_key="CEN|000|63040|Quiet Vendor",
+        campus="CEN", dept="000", account_no="63040", vendor="Quiet Vendor",
+        sample_description="x", amount=100.0,
+        candidate_names=[], created_at_iso_date="2026-06-01", last_date="2026-06-01",
+        coding_mismatch=False,
+    )
+    assert conn.execute(
+        'SELECT "Once Off" FROM "Needs Tagging" WHERE id=?', (rid,)).fetchone()[0] == 1
+
+
 # ---------------------------------------------------------------------------
 # promote_filled_needs_tagging
 # ---------------------------------------------------------------------------

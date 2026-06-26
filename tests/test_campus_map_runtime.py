@@ -18,14 +18,20 @@ def test_default_crosswalk_handles_identity():
     assert cw.lookup("DAL") == frozenset({"DAL"})
 
 
-def test_default_crosswalk_cen_includes_cen_edm():
+def test_default_crosswalk_cen_is_identity():
+    # Exact-match (2026-06-24): CEN matches only Asana "CEN" — the old
+    # CEN→{CEN,CEN/EDM} forward guess is retired.
     cw = campus_map.build()
-    assert cw.lookup("CEN") == frozenset({"CEN", "CEN/EDM"})
+    assert cw.lookup("CEN") == frozenset({"CEN"})
 
 
-def test_default_crosswalk_yvn_maps_to_cen_bundle():
+def test_default_crosswalk_yvn_is_identity_not_cen():
+    # YVN is its own campus now — it falls back to identity and does NOT
+    # auto-map to CEN/EDM. With no Asana "YVN" option yet, YVN rows go to
+    # Needs-Tagging for the operator.
     cw = campus_map.build()
-    assert cw.lookup("YVN") == frozenset({"CEN", "CEN/EDM"})
+    assert cw.lookup("YVN") == frozenset({"YVN"})
+    assert not cw.contract_matches_tableau_campus(frozenset({"CEN"}), "YVN")
 
 
 def test_default_crosswalk_omh_includes_nor_override():
@@ -60,13 +66,14 @@ def test_all_campuses_is_wildcard_for_any_code():
     assert not cw.contract_matches_tableau_campus(contract_opts, "INT")
 
 
-def test_contract_matches_when_options_intersect_crosswalk():
+def test_contract_matches_on_exact_campus():
     cw = campus_map.build()
-    # Contract with Asana option "CEN" should match Tableau YVN (which
-    # crosswalks to {CEN, CEN/EDM}).
-    assert cw.contract_matches_tableau_campus(frozenset({"CEN"}), "YVN")
-    # And not match Tableau OMH.
+    # Exact-match: a contract tagged "CEN" matches Tableau CEN, not YVN/OMH.
+    assert cw.contract_matches_tableau_campus(frozenset({"CEN"}), "CEN")
+    assert not cw.contract_matches_tableau_campus(frozenset({"CEN"}), "YVN")
     assert not cw.contract_matches_tableau_campus(frozenset({"CEN"}), "OMH")
+    # Once a contract is coded with the new campus, identity matches it.
+    assert cw.contract_matches_tableau_campus(frozenset({"YVN"}), "YVN")
 
 
 def test_contract_matches_via_nor_override():
@@ -85,8 +92,7 @@ def test_forward_overrides_replace_config_per_code():
         forward_overrides={"CEN": frozenset({"CEN", "EDM_NEW"})},
     )
     assert cw.lookup("CEN") == frozenset({"CEN", "EDM_NEW"})
-    # Codes not in overrides still get config defaults.
-    assert "CEN/EDM" not in cw.lookup("CEN")  # was in the default
+    # Codes not in overrides keep the reverse-encoded Asana-side specials.
     assert "***NOR (contract is for OMH)" in cw.lookup("OMH")  # default kept
 
 

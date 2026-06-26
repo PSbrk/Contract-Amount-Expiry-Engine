@@ -35,7 +35,8 @@
     {% set xref = amendment_xref.get(r["Asana Task GID"]) %}
     <tr>
       <td>
-        {{ r["Contract"] }}
+        <a href="{{ url_for('dashboard_detail', gid=r['Asana Task GID']) }}"
+           title="Show the Tableau entries assigned to this contract">{{ r["Contract"] }}</a>
         {% if xref %}
         <br>
         {% if xref.is_amendment_of %}
@@ -43,8 +44,9 @@
           <small style="color: var(--pico-muted-color);">
             ↳ amendment of <strong>{{ p.name }}</strong>
             {% if p.in_dashboard %}
-              (${{ "{:,.2f}".format(p.contract_amount or 0) }} budget,
-              ${{ "{:,.2f}".format(p.spent_so_far or 0) }} spent)
+              (${{ "{:,.2f}".format(p.contract_amount or 0) }} combined budget,
+              ${{ "{:,.2f}".format(p.spent_so_far or 0) }} spent) —
+              this row's spend is counted on the parent
             {% else %}
               <em>(not in current dashboard)</em>
             {% endif %}
@@ -54,8 +56,8 @@
           <small style="color: var(--pico-muted-color);">
             + amendment <strong>{{ a.name }}</strong>
             {% if a.in_dashboard %}
-              (${{ "{:,.2f}".format(a.contract_amount or 0) }} budget,
-              ${{ "{:,.2f}".format(a.spent_so_far or 0) }} spent)
+              (${{ "{:,.2f}".format(a.contract_amount or 0) }} added — included in
+              the budget above; spend is tracked here on the parent)
             {% else %}
               <em>(not in current dashboard)</em>
             {% endif %}
@@ -75,6 +77,7 @@
       </td>
       <td class="{{ 'alarm-on' if r['Alarms'] == 'ALARM' else 'alarm-off' }}">
         {{ r["Alarms"] }}
+        {% if r["Asana Task GID"] in resolved_gids %}<br><span class="pill" title="Alarm writes muted — Spent/%/Rate still update">resolved</span>{% endif %}
       </td>
       <td>{{ r["Due"] or "" }}</td>
     </tr>

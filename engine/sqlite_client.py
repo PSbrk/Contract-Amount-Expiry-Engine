@@ -136,11 +136,14 @@ _UNIQUE_FIELDS: dict[str, str] = {
     "State": "Asana Task GID",
     "Run Log": "Run ID",
     "Campus Map": "Tableau Code",
+    "CapEx Budgets": "CapEx ID",
     "Inbox": "File Hash",
     # One amendment task has at most one parent -- the column is the
     # natural identity for upserts. Multiple amendments per parent are
     # allowed (no unique index on Parent Gid).
     "Amendment Links": "Amendment Gid",
+    # One row per resolved contract; the GID is its identity for upserts.
+    "Resolved Contracts": "Asana Task GID",
 }
 
 # Legacy indexes that ensure_schema actively drops on existing databases
@@ -536,6 +539,69 @@ def load_learned_mappings(
     return out
 
 
+def load_capex_budgets(conn: sqlite3.Connection) -> dict[str, float]:
+    """Return {normalized CapEx ID: budget} from the CapEx Budgets table.
+
+    Re-normalizes the stored key defensively so a hand-edited row with stray
+    whitespace still joins. Rows with a blank id or non-numeric budget are
+    skipped (a half-typed row shouldn't poison the project's %)."""
+    from engine.asana_contracts import normalize_capex_id
+
+    out: dict[str, float] = {}
+    for row in conn.execute('SELECT "CapEx ID", "Budget" FROM "CapEx Budgets"'):
+        cid = normalize_capex_id(row["CapEx ID"])
+        budget = row["Budget"]
+        if not cid or budget is None:
+            continue
+        try:
+            out[cid] = float(budget)
+        except (TypeError, ValueError):
+            log.warning("CapEx Budgets row %r has non-numeric budget %r; skipping.",
+                        cid, budget)
+    return out
+
+
+def upsert_capex_budget(
+    conn: sqlite3.Connection,
+    *,
+    capex_id: str,
+    budget: float,
+    entered_at: str,
+    notes: str = "",
+    commit: bool = True,
+) -> dict:
+    """Insert or update one project budget, keyed by normalized CapEx ID.
+
+    Used by the Needs-Budget UI (single-ID save and bulk paste-grid). The id
+    is normalized here so the operator can paste it however the Google Doc has
+    it and the join still lands."""
+    from engine.asana_contracts import normalize_capex_id
+
+    cid = normalize_capex_id(capex_id)
+    if not cid:
+        raise ValueError("upsert_capex_budget: blank CapEx ID")
+    conn.execute(
+        '''INSERT INTO "CapEx Budgets" ("CapEx ID", "Budget", "Entered At", "Notes")
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT("CapEx ID") DO UPDATE SET
+             "Budget" = excluded."Budget",
+             "Entered At" = excluded."Entered At",
+             "Notes" = excluded."Notes"''',
+        (cid, float(budget), entered_at, notes),
+    )
+    if commit:
+        conn.commit()
+    return _fetch_by_field(conn, "CapEx Budgets", "CapEx ID", cid)
+
+
+def delete_capex_budget(conn: sqlite3.Connection, *, capex_id: str) -> None:
+    """Remove a project budget. Idempotent."""
+    from engine.asana_contracts import normalize_capex_id
+    cid = normalize_capex_id(capex_id) or capex_id
+    conn.execute('DELETE FROM "CapEx Budgets" WHERE "CapEx ID" = ?', (cid,))
+    conn.commit()
+
+
 def upsert_plain_learned_mapping(
     conn: sqlite3.Connection,
     *,
@@ -548,9 +614,16 @@ def upsert_plain_learned_mapping(
     contract_gid: str = "",
     learned_at: str,
     notes: str = "",
+    ignore_coding: bool = False,
     commit: bool = True,
 ) -> None:
     """Insert or update the PLAIN (no-pattern) Learned Mapping for `key`.
+
+    ignore_coding=True marks the mapping as a Miscoded? 'Accept' override
+    (the gid-pinned learned path already bypasses the coding-narrow; this
+    flag is the MARKER so the Miscoded? 'Accepted' view can list it). The
+    UPDATE path ALWAYS writes it, so a later plain name-promotion clears a
+    stale override flag — same discipline as Contract Gid.
 
     Single owner of the SELECT-then-UPDATE/INSERT dance for the catch-all
     LM, shared by promote_filled_needs_tagging and the Vendor Conflicts
@@ -564,6 +637,7 @@ def upsert_plain_learned_mapping(
     operator's freshly-chosen name instead of the leftover pin.
     """
     gid_val = (contract_gid or "").strip()
+    ic_val = 1 if ignore_coding else 0
     existing = conn.execute(
         '''SELECT id FROM "Learned Mappings"
            WHERE "Key" = ?
@@ -575,19 +649,20 @@ def upsert_plain_learned_mapping(
             '''UPDATE "Learned Mappings"
                SET "Campus" = ?, "Dept" = ?, "Account No" = ?,
                    "Vendor" = ?, "Contract Name" = ?, "Contract Gid" = ?,
-                   "Learned At" = ?, "Notes" = ?
+                   "Ignore Coding" = ?, "Learned At" = ?, "Notes" = ?
                WHERE id = ?''',
             (campus, dept, account_no, vendor, contract_name, gid_val,
-             learned_at, notes, existing["id"]),
+             ic_val, learned_at, notes, existing["id"]),
         )
     else:
         conn.execute(
             '''INSERT INTO "Learned Mappings"
                  ("Key", "Campus", "Dept", "Account No", "Vendor",
-                  "Contract Name", "Contract Gid", "Learned At", "Notes")
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  "Contract Name", "Contract Gid", "Ignore Coding",
+                  "Learned At", "Notes")
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (key, campus, dept, account_no, vendor, contract_name, gid_val,
-             learned_at, notes),
+             ic_val, learned_at, notes),
         )
     if commit:
         conn.commit()
@@ -630,6 +705,8 @@ def upsert_needs_tagging_group(
         | None
     ) = None,
     out_of_term: bool = False,
+    coding_mismatch: bool = False,
+    cross_tier_hint: str = "",
 ) -> dict:
     """Idempotent upsert keyed by Group Key.
 
@@ -652,6 +729,13 @@ def upsert_needs_tagging_group(
     else:
         candidate_lines.append("No vendor candidates found.")
     engine_candidates = "\n".join(candidate_lines)
+    # Cross-tier coding-mismatch hint (engine-managed): an opex charge whose
+    # vendor matches a CapEx-coded contract (excluded from the opex pool) lands
+    # here as "no candidates". Lead the Engine Candidates text with the hint so
+    # the operator sees WHY and that it can't be tagged here — the UI keys off
+    # the "Coding mismatch:" marker to surface it prominently.
+    if cross_tier_hint:
+        engine_candidates = cross_tier_hint + "\n" + engine_candidates
     engine_candidate_gids = "\n".join(candidate_gids or [])
     # distinct_descriptions is a list of (desc, rows, amount) or, since
     # Phase 13, (desc, rows, amount, min_date_iso, max_date_iso) tuples.
@@ -725,7 +809,12 @@ def upsert_needs_tagging_group(
             # activity so the group can't be suppressed forever once real
             # dates show up.
             new_activity = bool(last_date) and (not anchor or last_date > anchor)
-            if new_activity:
+            # A group NEWLY recognized as a coding mismatch (a matching live
+            # contract now exists — e.g. a Vendor Alias was just added) is
+            # materially different from the "one-time, ignore" the operator
+            # parked. Surface it in Miscoded? even without new dated activity,
+            # so a stale once-off flag can't shadow the new decision.
+            if new_activity or coding_mismatch:
                 # Resurface: clear the once-off flag and refresh the row
                 # normally so the operator sees the new state.
                 conn.execute(
@@ -739,6 +828,7 @@ def upsert_needs_tagging_group(
                            "Distinct Descriptions JSON" = ?,
                            "Is P-Card" = ?,
                            "Out Of Term" = ?,
+                           "Coding Mismatch" = ?,
                            "Once Off" = 0,
                            "Once Off Anchor" = NULL
                        WHERE id = ?''',
@@ -746,6 +836,7 @@ def upsert_needs_tagging_group(
                      engine_candidates, engine_candidate_gids,
                      distinct_descriptions_json, effective_is_p_card,
                      1 if out_of_term else 0,
+                     1 if coding_mismatch else 0,
                      existing["id"]),
                 )
                 conn.commit()
@@ -762,12 +853,14 @@ def upsert_needs_tagging_group(
                    "Engine Candidate Gids" = ?,
                    "Distinct Descriptions JSON" = ?,
                    "Is P-Card" = ?,
-                   "Out Of Term" = ?
+                   "Out Of Term" = ?,
+                   "Coding Mismatch" = ?
                WHERE id = ?''',
             (sample_description, amount, first_date, last_date,
              engine_candidates, engine_candidate_gids,
              distinct_descriptions_json, effective_is_p_card,
-             1 if out_of_term else 0, existing["id"]),
+             1 if out_of_term else 0, 1 if coding_mismatch else 0,
+             existing["id"]),
         )
         conn.commit()
         return _fetch_by_id(conn, "Needs Tagging", existing["id"])
@@ -778,13 +871,14 @@ def upsert_needs_tagging_group(
               "Sample Record Description", "$ in group",
               "First Date", "Last Date",
               "Created At", "Engine Candidates", "Engine Candidate Gids",
-              "Distinct Descriptions JSON", "Is P-Card", "Out Of Term")
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              "Distinct Descriptions JSON", "Is P-Card", "Out Of Term",
+              "Coding Mismatch")
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
         (group_key, campus, dept, account_no, vendor,
          sample_description, amount, first_date, last_date,
          created_at_iso_date, engine_candidates, engine_candidate_gids,
          distinct_descriptions_json, is_p_card_flag,
-         1 if out_of_term else 0),
+         1 if out_of_term else 0, 1 if coding_mismatch else 0),
     )
     conn.commit()
     return _fetch_by_id(conn, "Needs Tagging", cur.lastrowid)
@@ -1117,6 +1211,71 @@ def delete_amendment_link(
     conn.commit()
 
 
+def load_resolved_contracts(conn: sqlite3.Connection) -> dict[str, dict]:
+    """Return {gid: {"contract_name", "baseline_band", "resolved_at"}} for
+    every operator-resolved contract. Used by Step 5 (alarm suppression +
+    re-arm baseline) and by the UI to show the resolved state."""
+    out: dict[str, dict] = {}
+    for row in conn.execute(
+        '''SELECT "Asana Task GID", "Contract Name", "Baseline Band", "Resolved At"
+           FROM "Resolved Contracts"'''
+    ):
+        gid = (row["Asana Task GID"] or "").strip()
+        if not gid:
+            continue
+        out[gid] = {
+            "contract_name": (row["Contract Name"] or "").strip(),
+            "baseline_band": (row["Baseline Band"] or "").strip(),
+            "resolved_at": (row["Resolved At"] or "").strip(),
+        }
+    return out
+
+
+def set_contract_resolved(
+    conn: sqlite3.Connection,
+    *,
+    gid: str,
+    contract_name: str = "",
+    baseline_band: str = "",
+    resolved_at: str = "",
+) -> None:
+    """Mark a contract resolved (mute its alarm writes). UNIQUE on GID --
+    re-resolving an already-resolved contract refreshes the baseline band."""
+    if not gid:
+        raise ValueError("gid is required.")
+    conn.execute(
+        '''INSERT INTO "Resolved Contracts"
+             ("Asana Task GID", "Contract Name", "Baseline Band", "Resolved At")
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT("Asana Task GID") DO UPDATE SET
+             "Contract Name" = excluded."Contract Name",
+             "Baseline Band" = excluded."Baseline Band",
+             "Resolved At" = excluded."Resolved At"''',
+        (gid, contract_name, baseline_band or "", resolved_at),
+    )
+    conn.commit()
+
+
+def update_resolved_baseline(
+    conn: sqlite3.Connection, *, gid: str, baseline_band: str
+) -> None:
+    """Raise a resolved contract's baseline band after a re-arm. No-op if the
+    contract isn't resolved."""
+    conn.execute(
+        'UPDATE "Resolved Contracts" SET "Baseline Band" = ? WHERE "Asana Task GID" = ?',
+        (baseline_band or "", gid),
+    )
+    conn.commit()
+
+
+def unresolve_contract(conn: sqlite3.Connection, *, gid: str) -> None:
+    """Clear the resolved flag (resume normal alarm writes). Idempotent."""
+    conn.execute(
+        'DELETE FROM "Resolved Contracts" WHERE "Asana Task GID" = ?', (gid,)
+    )
+    conn.commit()
+
+
 def set_needs_tagging_dismissed(
     conn: sqlite3.Connection,
     *,
@@ -1360,6 +1519,45 @@ def upsert_dashboard_row(conn: sqlite3.Connection, row) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Attributed Lines — Dashboard drill-down snapshot (latest ingest only)
+# ---------------------------------------------------------------------------
+
+def replace_attributed_lines(
+    conn: sqlite3.Connection, lines: list[dict],
+) -> int:
+    """Wholesale-replace the Attributed Lines table with this run's lines.
+
+    A snapshot, not an audit log — the drill-down only ever wants the latest
+    ingest's attribution. Each line dict is the shape produced by
+    engine.compute.line_dict. Returns the count written.
+    """
+    conn.execute('DELETE FROM "Attributed Lines"')
+    if lines:
+        conn.executemany(
+            '''INSERT INTO "Attributed Lines"
+                 ("Asana Task GID", "Date", "Campus", "Account No", "Vendor",
+                  "Record Description", "Reference", "Amount", "In Term", "Tier")
+               VALUES (:gid, :date, :campus, :account_no, :vendor,
+                       :description, :reference, :amount, :in_term_i, :tier)''',
+            [{**l, "in_term_i": 1 if l["in_term"] else 0} for l in lines],
+        )
+    conn.commit()
+    return len(lines)
+
+
+def load_attributed_lines(
+    conn: sqlite3.Connection, gid: str,
+) -> list[sqlite3.Row]:
+    """Attributed Tableau lines for one contract gid, in-term first then by
+    date. Empty list when nothing attributed here (the $0 / unmatched case)."""
+    return conn.execute(
+        'SELECT * FROM "Attributed Lines" WHERE "Asana Task GID" = ? '
+        'ORDER BY "In Term" DESC, "Date"',
+        (gid,),
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
 # State table I/O
 # ---------------------------------------------------------------------------
 #
@@ -1525,6 +1723,9 @@ __all__ = [
     "load_vendor_aliases",
     "load_campus_map_overrides",
     "load_learned_mappings",
+    "load_capex_budgets",
+    "upsert_capex_budget",
+    "delete_capex_budget",
     "upsert_plain_learned_mapping",
     "upsert_needs_tagging_group",
     "set_needs_tagging_assign_contract",
@@ -1546,7 +1747,13 @@ __all__ = [
     "load_amendment_links",
     "insert_amendment_link",
     "delete_amendment_link",
+    "load_resolved_contracts",
+    "set_contract_resolved",
+    "update_resolved_baseline",
+    "unresolve_contract",
     "upsert_dashboard_row",
+    "replace_attributed_lines",
+    "load_attributed_lines",
     "load_state_priors",
     "upsert_state_for_contract",
     "cleanup_stale_state",

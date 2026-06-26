@@ -55,6 +55,13 @@ class Contract:
     # against the Tableau row's Record Description. Empty for older tasks
     # that pre-date the field.
     contract_reason_text: str | None = None
+    # Coding mirrored from Tableau (added to Asana 2026-06). dept/acc narrow the
+    # opex candidate set by (Campus, Dept, Acc); capex_id is the exact key for
+    # 63015 contracts (normalized via normalize_capex_id). All optional — rollout
+    # is gradual, so an uncoded contract is treated as a wildcard, never excluded.
+    dept: str | None = None
+    acc: str | None = None
+    capex_id: str | None = None
     # Current values of the five writable fields (Step 5 idempotent diff).
     current_spent_so_far: float | None = None
     current_pct_spent: float | None = None
@@ -67,6 +74,32 @@ def _parse_iso_date(s: str | None) -> date | None:
     if not s:
         return None
     return date.fromisoformat(s[:10])
+
+
+def normalize_capex_id(raw: object) -> str | None:
+    """Canonical CapEx ID for joining Asana ↔ Tableau. Strip + upper-case.
+
+    Operator-entered Asana CapEx IDs carry stray leading spaces (' FFE001428')
+    while Tableau Project IDs are clean ('FFE001428'); both MUST normalize the
+    same way or the deterministic CapEx join silently fragments. None when empty.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().upper()
+    return s or None
+
+
+def _acc_to_str(n: object) -> str | None:
+    """Asana stores Acc as a number (63015.0); Tableau Account No is text
+    ("63015"). Normalize the Asana side to a plain integer string so the
+    (Dept, Acc) narrow compares like-for-like. None when missing."""
+    if n is None:
+        return None
+    try:
+        return str(int(round(float(n))))
+    except (TypeError, ValueError):
+        s = str(n).strip()
+        return s or None
 
 
 def _custom_fields_by_gid(task: dict) -> dict[str, dict]:
@@ -137,6 +170,21 @@ def task_to_contract(task: dict, project_gid: str = settings.ASANA_PROJECT_GID) 
     if crt is not None:
         contract_reason_text = crt.get("text_value") or None
 
+    dept = None
+    d = cf.get(settings.ASANA_FIELD_DEPT)
+    if d is not None:
+        dept = (d.get("text_value") or "").strip() or None
+
+    acc = None
+    a = cf.get(settings.ASANA_FIELD_ACC)
+    if a is not None:
+        acc = _acc_to_str(a.get("number_value"))
+
+    capex_id = None
+    cap = cf.get(settings.ASANA_FIELD_CAPEX_ID)
+    if cap is not None:
+        capex_id = normalize_capex_id(cap.get("text_value"))
+
     # Current values of the writable fields — Step 5 diffs against these.
     def _number(field_gid: str) -> float | None:
         f = cf.get(field_gid)
@@ -154,6 +202,9 @@ def task_to_contract(task: dict, project_gid: str = settings.ASANA_PROJECT_GID) 
         pm_email=pm_email,
         section_name=_section_name_for_project(task, project_gid),
         contract_reason_text=contract_reason_text,
+        dept=dept,
+        acc=acc,
+        capex_id=capex_id,
         current_spent_so_far=_number(settings.ASANA_FIELD_SPENT_SO_FAR),
         current_pct_spent=_number(settings.ASANA_FIELD_PCT_SPENT),
         current_spending_rate=_number(settings.ASANA_FIELD_SPENDING_RATE),
@@ -178,6 +229,7 @@ def load_open_contracts(api_client) -> list[Contract]:
 
 __all__ = [
     "Contract",
+    "normalize_capex_id",
     "task_to_contract",
     "load_open_contracts",
 ]

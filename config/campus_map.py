@@ -17,14 +17,14 @@ TABLEAU_DROP_CODES: Final = frozenset({"INT"})
 ASANA_WILDCARD_OPTIONS: Final = frozenset({"All Campuses"})
 
 # Tableau code → set of Asana option names it should match.
-# Identity mapping for codes shared by both systems is implicit (handled in the
-# matcher) — you only list overrides here.
-TABLEAU_TO_ASANA: Final = {
-    # CEN matches both CEN and CEN/EDM (presently equivalent; will diverge later).
-    "CEN": frozenset({"CEN", "CEN/EDM"}),
-    # YVN currently treated as CEN/CEN-EDM. Configurable — flip when it gets its own contracts.
-    "YVN": frozenset({"CEN", "CEN/EDM"}),
-}
+# EXACT-MATCH (2026-06-24): Asana now mirrors Tableau campus codes, so matching
+# is pure identity ("CEN" → {"CEN"}) handled implicitly by the matcher. The old
+# forward guesses (CEN→{CEN,CEN/EDM}, YVN→{CEN,EDM}) are retired: YVN, ZNR, and
+# any future campus with no Asana option fall to Needs-Tagging for the operator
+# rather than being auto-attributed to a guessed campus. As the operator codes
+# the campus in Asana, the identity match starts working with zero config change.
+# ponytail: empty by design — re-add a code here only for a genuine non-identity alias.
+TABLEAU_TO_ASANA: Final = {}
 
 # Asana option NAME → Tableau code that should hit it (for the starred overrides).
 # These are the inverse direction: a Tableau code can match many Asana options;

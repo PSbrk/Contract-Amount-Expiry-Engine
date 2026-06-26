@@ -46,7 +46,7 @@
 
 {% if rows %}
 <datalist id="contract-names">
-  {% for n in contract_names %}<option value="{{ n }}">{% endfor %}
+  {% for c in contract_names %}<option value="{{ c.name }}">{% if c.campuses %}{{ c.campuses }}{% endif %}</option>{% endfor %}
 </datalist>
 
 <figure>
@@ -58,7 +58,7 @@
       <th>Dates</th>
       <th>Sample description</th>
       <th>Engine candidates</th>
-      <th style="min-width: 20rem;">Action</th>
+      <th style="min-width: 26rem; width: 30rem;">Action</th>
     </tr>
   </thead>
   <tbody>
@@ -67,6 +67,8 @@
     {% set dismissed = (r["Dismissed"] or 0) == 1 %}
     {% set once_off = (r["Once Off"] or 0) == 1 and not dismissed %}
     {% set conflict_other = (r["Conflict Other"] or 0) == 1 and not (dismissed or once_off) %}
+    {% set out_of_term = (r["Out Of Term"] or 0) == 1 and not (dismissed or once_off) %}
+    {% set is_cross_tier = ('Coding mismatch:' in (r["Engine Candidates"] or '')) and not (dismissed or once_off) %}
     <tr class="{{ '' if (filled or dismissed or once_off) else 'row-unfilled' }}"
         style="{{ 'opacity: 0.55;' if (dismissed or once_off) else '' }}">
       <td>
@@ -74,6 +76,8 @@
         {% if dismissed %}<span class="pill">dismissed</span>{% endif %}
         {% if once_off %}<span class="pill">once-off</span>{% endif %}
         {% if conflict_other %}<span class="pill">other (hidden from conflicts)</span>{% endif %}
+        {% if out_of_term %}<span class="pill alarm-on">pre-dates contract</span>{% endif %}
+        {% if is_cross_tier %}<span class="pill alarm-on">coding mismatch</span>{% endif %}
         <br>
         <small>{{ r["Campus"] or "" }} &middot; {{ r["Dept"] or "" }} &middot; acct {{ r["Account No"] or "" }}</small>
         {% if once_off and r["Once Off Anchor"] %}
@@ -117,15 +121,36 @@
             <button type="submit" class="secondary" style="margin: 0;">Restore</button>
           </form>
         {% else %}
+          {% if is_cross_tier %}
+          <p style="margin:0 0 0.5rem 0; padding:0.4rem 0.6rem; border-left:3px solid var(--pico-del-color, #b00);">
+            <small><strong>&#9888; {{ (r["Engine Candidates"] or '')|replace('No vendor candidates found.','')|trim }}</strong></small>
+          </p>
+          {% endif %}
+          {% if out_of_term %}
+          <p style="margin:0 0 0.5rem 0; padding:0.4rem 0.6rem; border-left:3px solid var(--pico-del-color, #b00);">
+            <small><strong>Pre-dates the contract.</strong> This spend is dated before the
+            contract's start date, so the engine will <em>not</em> count it &mdash; and
+            assigning a contract here will <em>not</em> clear it. <strong>Park</strong> it
+            (recommended): it stays hidden unless newer-dated activity appears. Only assign a
+            contract if you first extend that contract's Target Start Date in Asana to cover
+            these dates.</small>
+          </p>
+          <form method="post"
+                action="{{ url_for('needs_tagging_mark_once_off', record_id=r['id']) }}"
+                style="margin:0 0 0.5rem 0;">
+            <input type="hidden" name="show" value="{{ show }}">
+            <button type="submit" style="margin:0;">Park (pre-dates contract)</button>
+          </form>
+          {% endif %}
           <form method="post"
                 action="{{ url_for('needs_tagging_save', record_id=r['id']) }}"
-                style="display:flex; gap:0.4rem; margin:0 0 0.4rem 0;">
+                style="display:flex; gap:0.4rem; margin:0 0 0.4rem 0; align-items:center;">
             <input type="text" name="assign_contract"
                    value="{{ r['Assign Contract'] or '' }}"
                    list="contract-names"
                    placeholder="Contract name (Asana task)"
-                   style="margin:0; flex:1;">
-            <button type="submit" style="margin:0;">Save</button>
+                   style="margin:0; flex:1 1 auto; min-width:16rem;">
+            <button type="submit" style="margin:0; flex:0 0 auto; width:auto;">Save</button>
           </form>
           <div style="display: flex; gap: 0.4rem; margin: 0; flex-wrap: wrap;">
             <form method="post"

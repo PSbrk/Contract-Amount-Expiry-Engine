@@ -55,6 +55,23 @@ _WRITABLE_FIELDS: tuple[tuple[str, str], ...] = (
 
 _FIELD_NAME_TO_GID: dict[str, str] = dict(_WRITABLE_FIELDS)
 
+# The two alarm enums a "Resolved" contract suppresses. The three numeric
+# fields (Spent so far, % Spent, Spending Rate) keep writing so the operator
+# still sees live spend; only these two stop, which is what silences the
+# email-on-ALARM Asana rule.
+ALARM_FIELDS: frozenset[str] = frozenset({"Alarms", "Spending Rate Alarm"})
+
+# Spending Rate Alarm band severity, for the re-arm decision (a resolved
+# contract breaks silence only when its band climbs ABOVE the stored
+# baseline). Blank/None = no band = 0.
+_BAND_SEVERITY: dict[str, int] = {"": 0, "75%": 1, "90%": 2, "100%": 3, "Over": 4}
+
+
+def band_severity(band: str | None) -> int:
+    """Rank a Spending Rate Alarm band so re-arm can compare 'worse'.
+    Unknown/blank ranks 0 (no alarm)."""
+    return _BAND_SEVERITY.get((band or "").strip(), 0)
+
 # Enum option-name → option-gid lookups, used to translate the human-readable
 # band/alarm strings into the GIDs Asana's API expects.
 _ENUM_OPTIONS: dict[str, dict[str, str]] = {
@@ -103,7 +120,9 @@ def diff_dashboard_vs_current(
         deltas.append(FieldDelta("% Spent",
                                    contract.current_pct_spent,
                                    dash.pct_spent))
-    if _numbers_differ(contract.current_spending_rate, dash.spending_rate):
+    # CapEx (63015) has no annualized pace — leave Asana's Spending Rate
+    # untouched (never even diff it). Opex behaves exactly as before.
+    if not dash.is_capex and _numbers_differ(contract.current_spending_rate, dash.spending_rate):
         deltas.append(FieldDelta("Spending Rate",
                                    contract.current_spending_rate,
                                    dash.spending_rate))
@@ -172,6 +191,7 @@ def apply_writes(
     *,
     dry_run: bool,
     test_contract_gid: str | None = None,
+    suppress_fields: frozenset[str] = frozenset(),
 ) -> WriteResult:
     """Compute the diff and (if non-empty AND not dry-run AND scope allows)
     write the changed fields to the Asana task.
@@ -182,6 +202,10 @@ def apply_writes(
     test_contract_gid, when non-empty, restricts writes to that one task
     GID. Other contracts are reported as skipped with reason
     'test_contract_filter' (no diff or write performed for them).
+
+    suppress_fields drops named fields from the diff before writing — the
+    "Resolved" mute uses it to skip the two alarm enums so the operator's
+    email-on-ALARM rule stops firing while spend keeps updating.
     """
     # Scope filter — applied BEFORE diff. A non-test contract is skipped
     # entirely; we don't even bother computing the diff so the operator's
@@ -214,6 +238,15 @@ def apply_writes(
         )
 
     deltas = diff_dashboard_vs_current(dash, contract)
+    if suppress_fields:
+        kept = [d for d in deltas if d.field_name not in suppress_fields]
+        if kept != deltas:
+            dropped = [d.field_name for d in deltas if d.field_name in suppress_fields]
+            log.info(
+                "resolved-mute: suppressing %s for %s (%s)",
+                ", ".join(dropped), contract.gid, contract.name,
+            )
+        deltas = kept
     if not deltas:
         return WriteResult(
             contract_gid=contract.gid,
@@ -317,6 +350,8 @@ __all__ = [
     "FieldDelta",
     "WriteResult",
     "WriteRunSummary",
+    "ALARM_FIELDS",
+    "band_severity",
     "diff_dashboard_vs_current",
     "build_custom_fields_payload",
     "apply_writes",

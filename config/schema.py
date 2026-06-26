@@ -203,6 +203,28 @@ TABLES_SCHEMA: Final = [
                  "option or extend the contract's term in Asana. "
                  "Recomputed by the engine on every upsert."
              )},
+            {"name": "Coding Mismatch", "type": "checkbox",
+             "description": (
+                 "Engine-set: 1 = the vendor matches a LIVE contract that "
+                 "aligns on campus + term, and the ONLY difference is "
+                 "Dept/Acct coding. Routes the row to the /miscoded tab "
+                 "instead of Needs Tagging Open / Vendor Conflicts, where "
+                 "the operator decides 'Miscoded' (attribute anyway, via a "
+                 "coding-bypassing pinned Learned Mapping) or 'Correctly "
+                 "coded' (Coding Confirmed below). Engine Candidate Gids "
+                 "holds the campus+term-aligned candidate(s). Recomputed "
+                 "by the engine on every upsert."
+             )},
+            {"name": "Coding Confirmed", "type": "checkbox",
+             "description": (
+                 "Operator-set: 1 = operator reviewed the Coding Mismatch "
+                 "and confirmed the Dept/Acct difference is legitimate — "
+                 "these dollars genuinely don't belong to that contract. "
+                 "Stays unattributed, moves to the 'Confirmed correct' view "
+                 "of /miscoded, and is genuinely-separate spend (shows in "
+                 "the no-contract export). Operator-owned: never touched by "
+                 "the engine upsert."
+             )},
             {"name": "Created At", "type": "date"},
             {"name": "Engine Candidates", "type": "multilineText",
              "description": (
@@ -301,8 +323,41 @@ TABLES_SCHEMA: Final = [
                  "(legacy behavior). Pattern-bearing LMs are matched FIRST; "
                  "if none hit, the group-level LM (if any) is used."
              )},
+            {"name": "Ignore Coding", "type": "checkbox",
+             "description": (
+                 "1 = this mapping was created from the Miscoded? tab "
+                 "('Accept as miscoded'): the operator declared that the "
+                 "Dept/Acct coding differs but the spend belongs to this "
+                 "contract anyway. The gid-pinned learned path already "
+                 "bypasses the coding-narrow, so this flag is the MARKER "
+                 "that lets the Miscoded? 'Accepted' view list these "
+                 "coding-overrides distinctly from ordinary name/conflict "
+                 "mappings. Blank for all normal Learned Mappings."
+             )},
             {"name": "Learned At", "type": "date"},
             {"name": "Notes", "type": "multilineText"},
+        ],
+    },
+    {
+        "name": "CapEx Budgets",
+        "description": (
+            "Operator-entered total budget per CapEx ID (Project ID). The "
+            "budget lives in a Google Doc; the operator types it once here "
+            "(bulk paste-grid or per-ID prompt) and it's the denominator for "
+            "that project's % Spent across EVERY contract carrying the ID. "
+            "CapEx is cumulative-to-date with no term window — see engine.capex."
+        ),
+        "fields": [
+            {"name": "CapEx ID", "type": "singleLineText",
+             "description": (
+                 "Normalized project id (strip + upper), matches Asana CapEx "
+                 "ID and Tableau Project ID. UNIQUE — upsert key."
+             )},
+            {"name": "Budget", "type": "number", "options": {"precision": 2},
+             "description": "Total project budget in dollars."},
+            {"name": "Entered At", "type": "date"},
+            {"name": "Notes", "type": "multilineText",
+             "description": "Operator-editable (e.g. which Google Doc / approval)."},
         ],
     },
     {
@@ -357,6 +412,67 @@ TABLES_SCHEMA: Final = [
              "description": "Snapshot of the amendment's Asana task name at link time."},
             {"name": "Linked At", "type": "date"},
             {"name": "Notes", "type": "multilineText"},
+        ],
+    },
+    {
+        "name": "Resolved Contracts",
+        "description": (
+            "Operator-set: contracts the operator has acknowledged and no "
+            "longer wants alarm churn for. While a contract's GID is here, "
+            "Step 5 writes ONLY the numeric fields (Spent so far, % Spent, "
+            "Spending Rate) and SUPPRESSES the two alarm enums (Alarms, "
+            "Spending Rate Alarm), so the operator's email-on-ALARM Asana rule "
+            "stops firing. Re-arm: if a later ingest computes a Spending Rate "
+            "Alarm band WORSE than 'Baseline Band' (the band at resolve time, "
+            "raised each time it re-fires), the engine lets the alarm fields "
+            "write once and bumps the baseline so it goes quiet again at the "
+            "new level. Operator-owned: delete the row (un-resolve) to resume "
+            "normal alarm writes. The engine never writes here."
+        ),
+        "fields": [
+            {"name": "Asana Task GID", "type": "singleLineText",
+             "description": "Contract the operator resolved. UNIQUE -- upsert key."},
+            {"name": "Contract Name", "type": "singleLineText",
+             "description": "Snapshot of the task name at resolve time, for display."},
+            {"name": "Baseline Band", "type": "singleLineText",
+             "description": (
+                 "Spending Rate Alarm band at resolve time (one of 75%/90%/"
+                 "100%/Over, or blank for none) -- raised to the worst band "
+                 "seen since. The engine re-arms only when a new ingest's band "
+                 "exceeds this."
+             )},
+            {"name": "Resolved At", "type": "date"},
+            {"name": "Notes", "type": "multilineText",
+             "description": "Operator-editable."},
+        ],
+    },
+    {
+        "name": "Attributed Lines",
+        "description": (
+            "One row per Tableau transaction the LAST ingest attributed to a "
+            "specific Asana contract (by GID). Powers the Dashboard drill-down: "
+            "click a contract name to see exactly which Tableau entries landed "
+            "on it. Rewritten wholesale on every --ingest (a snapshot of the "
+            "latest run, NOT a rolling audit log). Only attributed rows are "
+            "stored — unmatched spend lives in Needs Tagging. 'In Term' marks "
+            "whether the row counted toward Spent so far (opex term window); "
+            "CapEx lines are always in-term and broadcast to every contract "
+            "sharing the CapEx ID."
+        ),
+        "fields": [
+            {"name": "Asana Task GID", "type": "singleLineText",
+             "description": "Contract the row attributed to. Drill-down lookup key (not unique)."},
+            {"name": "Date", "type": "date"},
+            {"name": "Campus", "type": "singleLineText"},
+            {"name": "Account No", "type": "singleLineText"},
+            {"name": "Vendor", "type": "singleLineText"},
+            {"name": "Record Description", "type": "multilineText"},
+            {"name": "Reference", "type": "singleLineText"},
+            {"name": "Amount", "type": "number", "options": {"precision": 2}},
+            {"name": "In Term", "type": "checkbox",
+             "description": "1 = counted toward Spent so far; 0 = attributed but excluded by the term window."},
+            {"name": "Tier", "type": "singleLineText",
+             "description": "'opex' or 'capex'."},
         ],
     },
     {

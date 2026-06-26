@@ -284,6 +284,47 @@ def _suggest_candidate_per_description(
     return out
 
 
+_MONEY_CLEAN = _re.compile(r"[,$\s]")
+# A CapEx ID is a leading run of alphanumerics (no spaces, commas, or $); the
+# amount is everything after the first separator. Splitting this way is immune
+# to thousands-commas in the amount ('$800,000.00') — the old first-comma split
+# mangled space-separated lines whose amount carried a comma.
+_BUDGET_LINE_RE = _re.compile(r"^([A-Za-z0-9_-]+)[\s,]+(.+)$")
+
+
+def _parse_capex_budget_lines(text: str):
+    """Parse a bulk paste of 'CapEx ID  amount' lines for the Needs-Budget grid.
+
+    One project per line; the id and amount may be tab-, comma-, or
+    whitespace-separated (a Google-Doc paste is usually tabs). Amounts tolerate
+    $ and thousands commas ('$800,000.00'). Blank lines and #comments skip.
+    Returns (parsed, errors) where parsed is [(normalized_capex_id, amount)].
+    """
+    from engine.asana_contracts import normalize_capex_id
+
+    parsed: list[tuple[str, float]] = []
+    errors: list[str] = []
+    for i, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _BUDGET_LINE_RE.match(line)
+        if not m:
+            errors.append(f"line {i}: need 'CapEx ID  amount' — got {raw!r}")
+            continue
+        cid = normalize_capex_id(m.group(1))
+        if not cid:
+            errors.append(f"line {i}: blank CapEx ID")
+            continue
+        try:
+            amt = float(_MONEY_CLEAN.sub("", m.group(2)))
+        except ValueError:
+            errors.append(f"line {i}: amount {m.group(2).strip()!r} is not a number")
+            continue
+        parsed.append((cid, amt))
+    return parsed, errors
+
+
 def _form_kwargs(spec: dict) -> dict:
     """Pull the right kwargs out of request.form for a given admin spec.
 
@@ -373,12 +414,14 @@ def register_routes(app: Flask) -> None:
             if entry["is_amendment_of"] or entry["has_amendments"]:
                 amendment_xref[gid] = entry
 
+        resolved_gids = set(sqlite_client.load_resolved_contracts(g.conn))
         return render_template(
             "dashboard.html",
             rows=rows,
             alarm_count=alarm_count,
             over_count=over_count,
             amendment_xref=amendment_xref,
+            resolved_gids=resolved_gids,
         )
 
     @app.route("/needs-tagging")
@@ -389,9 +432,12 @@ def register_routes(app: Flask) -> None:
         #   dismissed   — Dismissed=1 (operator-killed; never resurfaces)
         #   all         — every row regardless of state
         show = request.args.get("show", "open").lower()
-        # Phase 11: p-card rows live on /p-card-spend; never surface them
-        # in Needs Tagging views (open/once_off/dismissed/all).
-        p_card_filter = 'COALESCE("Is P-Card", 0) = 0'
+        # Rows that belong on their own dedicated tabs must never surface in any
+        # Needs Tagging view: p-card rows live on /p-card-spend, and Coding
+        # Mismatch rows (vendor+campus+term align, only Dept/Acct differs) live
+        # on /miscoded. (Name kept for history; it now hides both categories.)
+        p_card_filter = ('COALESCE("Is P-Card", 0) = 0 '
+                         'AND COALESCE("Coding Mismatch", 0) = 0')
         if show == "dismissed":
             where = f'WHERE COALESCE("Dismissed", 0) = 1 AND {p_card_filter}'
         elif show == "once_off":
@@ -419,11 +465,16 @@ def register_routes(app: Flask) -> None:
         # without a separate Asana call. Empty Dashboard → empty
         # datalist (operator can still type freely; validation happens
         # at promote_filled_needs_tagging time).
+        # Campuses are aggregated per name so near-identical task names
+        # (e.g. "Marmic Fire & Safety" vs "...and Safety") are
+        # distinguishable in the dropdown — the operator picks the one
+        # whose campus list covers their row.
         contract_names = [
-            r["Contract"]
+            {"name": r["Contract"], "campuses": r["campuses"] or ""}
             for r in g.conn.execute(
-                'SELECT DISTINCT "Contract" FROM "Dashboard" '
-                'WHERE "Contract" IS NOT NULL ORDER BY "Contract"'
+                'SELECT "Contract", GROUP_CONCAT(DISTINCT "Campus Set") AS campuses '
+                'FROM "Dashboard" WHERE "Contract" IS NOT NULL '
+                'GROUP BY "Contract" ORDER BY "Contract"'
             ).fetchall()
         ]
         unfilled = sum(
@@ -560,7 +611,9 @@ def register_routes(app: Flask) -> None:
             '''SELECT * FROM "Needs Tagging"
                WHERE COALESCE("Dismissed", 0) = 0
                  AND COALESCE("Conflict Other", 0) = 0
+                 AND COALESCE("Once Off", 0) = 0
                  AND COALESCE("Is P-Card", 0) = 0
+                 AND COALESCE("Coding Mismatch", 0) = 0
                  AND COALESCE("Engine Candidate Gids", '') != ''
                ORDER BY COALESCE("$ in group", 0) DESC, "Group Key"'''
         ).fetchall()
@@ -571,6 +624,12 @@ def register_routes(app: Flask) -> None:
         dash_by_gid: dict[str, dict] = {}
         for d in g.conn.execute('SELECT * FROM "Dashboard"').fetchall():
             dash_by_gid[d["Asana Task GID"]] = dict(d)
+
+        # Same campus crosswalk attribution uses — to keep only campus-
+        # COMPATIBLE candidates pinnable below.
+        from engine import campus_map
+        _fo, _do = sqlite_client.load_campus_map_overrides(g.conn)
+        _crosswalk = campus_map.build(_fo, _do)
 
         import json as _json
         conflicts: list[dict] = []
@@ -588,6 +647,20 @@ def register_routes(app: Flask) -> None:
             # this exception, single-candidate-out-of-term rows would be
             # stranded on Needs Tagging Open with no picker UI.
             candidates = [dash_by_gid[gid] for gid in cand_gids if gid in dash_by_gid]
+            # Only campus-COMPATIBLE candidates are real pin targets. A TUL
+            # transaction must not be offered BAO/CEN/OKC-only tasks; an
+            # unmatched group (vendor matched, but NO campus-matching contract)
+            # then drops out of Vendor Conflicts and is resolved via Assign
+            # Contract on Needs Tagging Open instead. A multi-campus / All-
+            # Campuses task still matches, so genuine same-campus conflicts stay.
+            _group_campus = (r["Campus"] or "").strip()
+            candidates = [
+                c for c in candidates
+                if _crosswalk.contract_matches_tableau_campus(
+                    frozenset(s for s in (c.get("Campus Set") or "").split(", ") if s),
+                    _group_campus,
+                )
+            ]
             is_out_of_term = bool(r["Out Of Term"]) if "Out Of Term" in r.keys() else False
             if len(candidates) < 2 and not (is_out_of_term and len(candidates) == 1):
                 continue
@@ -937,6 +1010,192 @@ def register_routes(app: Flask) -> None:
         show = request.form.get("show", "open")
         return redirect(url_for("needs_tagging", show=show))
 
+    # ------------------------------------------------------------------
+    # Miscoded? — vendor+campus+term align, only Dept/Acct differs.
+    # ------------------------------------------------------------------
+    @app.route("/miscoded")
+    def miscoded():
+        """Groups where the vendor matches a live contract aligning on campus +
+        term, and ONLY the Dept/Acct coding differs. Operator either ACCEPTS
+        (attribute anyway, via a coding-bypassing pinned Learned Mapping) or
+        confirms the coding is CORRECT (leave it unattributed)."""
+        show = request.args.get("show", "open").lower()
+        name_by_gid = {
+            r["Asana Task GID"]: r["Contract"]
+            for r in g.conn.execute(
+                'SELECT "Asana Task GID", "Contract" FROM "Dashboard"'
+            ).fetchall()
+        }
+
+        def with_candidates(rows):
+            out = []
+            for r in rows:
+                gids = [x.strip() for x in
+                        (r["Engine Candidate Gids"] or "").splitlines() if x.strip()]
+                out.append({
+                    "row": r,
+                    "candidates": [
+                        {"gid": gid, "name": name_by_gid.get(gid, gid)}
+                        for gid in gids
+                    ],
+                })
+            return out
+
+        base = ('FROM "Needs Tagging" WHERE COALESCE("Coding Mismatch", 0) = 1 '
+                'AND COALESCE("Dismissed", 0) = 0 '
+                'AND COALESCE("Once Off", 0) = 0 '
+                'AND COALESCE("Is P-Card", 0) = 0')
+        accepted = []
+        items = []
+        if show == "confirmed":
+            items = with_candidates(g.conn.execute(
+                f'SELECT * {base} AND COALESCE("Coding Confirmed", 0) = 1 '
+                'ORDER BY COALESCE("$ in group", 0) DESC, "Group Key"'
+            ).fetchall())
+        elif show == "accepted":
+            accepted = g.conn.execute(
+                '''SELECT * FROM "Learned Mappings"
+                   WHERE COALESCE("Ignore Coding", 0) = 1
+                   ORDER BY "Vendor", "Campus"'''
+            ).fetchall()
+        else:
+            show = "open"
+            items = with_candidates(g.conn.execute(
+                f'SELECT * {base} AND COALESCE("Coding Confirmed", 0) = 0 '
+                'ORDER BY COALESCE("$ in group", 0) DESC, "Group Key"'
+            ).fetchall())
+
+        open_count = g.conn.execute(
+            f'SELECT COUNT(*) {base} AND COALESCE("Coding Confirmed", 0) = 0'
+        ).fetchone()[0]
+        confirmed_count = g.conn.execute(
+            f'SELECT COUNT(*) {base} AND COALESCE("Coding Confirmed", 0) = 1'
+        ).fetchone()[0]
+        accepted_count = g.conn.execute(
+            'SELECT COUNT(*) FROM "Learned Mappings" '
+            'WHERE COALESCE("Ignore Coding", 0) = 1'
+        ).fetchone()[0]
+        return render_template(
+            "miscoded.html",
+            show=show, items=items, accepted=accepted,
+            open_count=open_count, accepted_count=accepted_count,
+            confirmed_count=confirmed_count,
+        )
+
+    @app.route("/miscoded/<int:record_id>/accept", methods=["POST"])
+    def miscoded_accept(record_id: int):
+        """Attribute this miscoded group to the chosen contract anyway. Writes
+        a gid-pinned, Ignore-Coding Learned Mapping (the learned path already
+        bypasses the coding-narrow) and deletes the NT row. Next ingest
+        attributes it; it then shows in the Accepted view (from the LM)."""
+        nt = g.conn.execute(
+            'SELECT * FROM "Needs Tagging" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if nt is None:
+            abort(404)
+        contract_gid = (request.form.get("contract_gid") or "").strip()
+        contract_name = (request.form.get("contract_name") or "").strip()
+        cand_gids = {
+            x.strip() for x in (nt["Engine Candidate Gids"] or "").splitlines()
+            if x.strip()
+        }
+        if not contract_gid or contract_gid not in cand_gids:
+            flash("Pick one of this row's candidate contracts to accept.", "error")
+            return redirect(url_for("miscoded"))
+        from datetime import datetime, timezone
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        sqlite_client.upsert_plain_learned_mapping(
+            g.conn,
+            key=(nt["Group Key"] or "").strip(),
+            campus=(nt["Campus"] or "").strip(),
+            dept=(nt["Dept"] or "").strip(),
+            account_no=(nt["Account No"] or "").strip(),
+            vendor=(nt["Vendor"] or "").strip(),
+            contract_name=contract_name, contract_gid=contract_gid,
+            ignore_coding=True, learned_at=today_iso,
+            notes=(f"Accepted as miscoded on {today_iso}: Dept/Acct coding "
+                   f"differs but spend belongs to gid {contract_gid} "
+                   f"({contract_name})."),
+            commit=False,
+        )
+        g.conn.execute('DELETE FROM "Needs Tagging" WHERE id = ?', (record_id,))
+        g.conn.commit()
+        flash(
+            f"Accepted {nt['Vendor']} ({nt['Campus']}) as miscoded -> "
+            f"{contract_name}. Next ingest attributes it (coding bypassed).",
+            "success",
+        )
+        return redirect(url_for("miscoded"))
+
+    @app.route("/miscoded/<int:record_id>/confirm-correct", methods=["POST"])
+    def miscoded_confirm_correct(record_id: int):
+        """The Dept/Acct difference is legitimate — leave unattributed. Sets
+        Coding Confirmed=1; the row moves to the Confirmed-correct view."""
+        existing = g.conn.execute(
+            'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if existing is None:
+            abort(404)
+        g.conn.execute(
+            'UPDATE "Needs Tagging" SET "Coding Confirmed" = 1 WHERE id = ?',
+            (record_id,),
+        )
+        g.conn.commit()
+        flash("Marked coding correct — left unattributed.", "success")
+        return redirect(url_for("miscoded"))
+
+    @app.route("/miscoded/<int:record_id>/unconfirm", methods=["POST"])
+    def miscoded_unconfirm(record_id: int):
+        """Undo Correctly-coded -> back to the open Miscoded? queue."""
+        existing = g.conn.execute(
+            'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if existing is None:
+            abort(404)
+        g.conn.execute(
+            'UPDATE "Needs Tagging" SET "Coding Confirmed" = 0 WHERE id = ?',
+            (record_id,),
+        )
+        g.conn.commit()
+        flash("Reopened in Miscoded?.", "success")
+        return redirect(url_for("miscoded", show="confirmed"))
+
+    @app.route("/miscoded/lm/<int:record_id>/revert", methods=["POST"])
+    def miscoded_revert(record_id: int):
+        """Undo an 'Accepted as miscoded' override — delete the Ignore-Coding
+        Learned Mapping. Next ingest re-surfaces the group in Miscoded? Open."""
+        sqlite_client.delete_learned_mapping(g.conn, record_id=record_id)
+        flash("Reverted miscoded acceptance — it re-surfaces next ingest.",
+              "success")
+        return redirect(url_for("miscoded", show="accepted"))
+
+    @app.route("/vendor-conflicts/<int:record_id>/mark-pre-dates", methods=["POST"])
+    def vendor_conflicts_mark_pre_dates(record_id: int):
+        """Group-level 'Pre-dates Asana Record' escape hatch. The per-
+        description picker's Pre-dates option only renders when the row has
+        Distinct Descriptions JSON; a single-candidate out-of-term group
+        whose JSON is empty reaches Vendor Conflicts (Phase 14a) with NO way
+        to mark it. Pinning is date-futile and re-surfaces forever. This
+        parks the WHOLE group via the existing Once Off mechanism: it leaves
+        Vendor Conflicts AND Needs Tagging Open now, and re-surfaces only when
+        genuinely NEW (later-dated) activity arrives — exactly the semantics
+        of 'this spend pre-dates the contract'."""
+        nt = g.conn.execute(
+            'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if nt is None:
+            abort(404)
+        sqlite_client.set_needs_tagging_once_off(
+            g.conn, record_id=record_id, once_off=True,
+        )
+        flash(
+            "Marked as pre-dating the Asana contract. Parked until NEW "
+            "transactions arrive in this group (any row dated after today's "
+            "Last Date). Find it under Needs Tagging → Once-off to restore.",
+            "success",
+        )
+        return redirect(url_for("vendor_conflicts"))
+
     @app.route("/vendor-conflicts/<int:record_id>/mark-all-out-of-term-as-pre-dates",
                methods=["POST"])
     def vendor_conflicts_mark_all_out_of_term_as_pre_dates(record_id: int):
@@ -1243,6 +1502,94 @@ def register_routes(app: Flask) -> None:
         )
 
     # ------------------------------------------------------------------
+    # /capex-budgets — operator-entered project budgets (the denominator for
+    # the CapEx tier) + the Needs-Budget queue.
+    # ------------------------------------------------------------------
+
+    @app.route("/capex-budgets")
+    def capex_budgets():
+        budgets = sqlite_client.load_capex_budgets(g.conn)   # {cid: amount}
+        budget_rows = g.conn.execute(
+            'SELECT * FROM "CapEx Budgets" ORDER BY "CapEx ID"'
+        ).fetchall()
+
+        # Live Asana pull: which CapEx IDs sit on a live contract right now.
+        # Live (not the persisted Dashboard) because the operator is actively
+        # coding contracts — a fresh pull reflects new CapEx IDs immediately.
+        # Resilient: if Asana is unreachable, fall back to budgets-only.
+        live_counts: dict[str, int] = {}
+        live_names: dict[str, list[str]] = {}
+        asana_error = None
+        try:
+            from engine import asana_client, asana_contracts
+            from engine.capex import _capex_live
+            contracts = asana_contracts.load_open_contracts(
+                asana_client.get_api_client()
+            )
+            for c in contracts:
+                if c.capex_id and _capex_live(c):
+                    live_counts[c.capex_id] = live_counts.get(c.capex_id, 0) + 1
+                    live_names.setdefault(c.capex_id, []).append(c.name or "(unnamed)")
+        except Exception as exc:  # noqa: BLE001 — UI stays usable offline
+            asana_error = f"{type(exc).__name__}: {exc}"
+
+        # Needs-Budget queue: CapEx IDs on live contracts with no budget yet.
+        queue = [
+            {
+                "capex_id": cid,
+                "contracts": sorted(set(live_names.get(cid, []))),
+                "n": live_counts[cid],
+            }
+            for cid in sorted(live_counts)
+            if cid not in budgets
+        ]
+        return render_template(
+            "capex_budgets.html",
+            queue=queue,
+            budget_rows=budget_rows,
+            live_counts=live_counts,
+            asana_error=asana_error,
+        )
+
+    @app.route("/capex-budgets/bulk", methods=["POST"])
+    def capex_budgets_bulk():
+        from datetime import datetime, timezone
+        text = request.form.get("bulk") or ""
+        parsed, errors = _parse_capex_budget_lines(text)
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        saved = 0
+        for cid, amount in parsed:
+            sqlite_client.upsert_capex_budget(
+                g.conn, capex_id=cid, budget=amount,
+                entered_at=today_iso, notes="bulk entry", commit=False,
+            )
+            saved += 1
+        if saved:
+            g.conn.commit()
+        if saved and not errors:
+            flash(f"Saved {saved} budget(s). Next --ingest broadcasts them.", "success")
+        elif saved and errors:
+            flash(
+                f"Saved {saved} budget(s); skipped {len(errors)} bad line(s): "
+                + "; ".join(errors[:5]),
+                "error",
+            )
+        else:
+            flash("No budgets saved. " + ("; ".join(errors[:5]) or "Empty input."), "error")
+        return redirect(url_for("capex_budgets"))
+
+    @app.route("/capex-budgets/<int:record_id>/delete", methods=["POST"])
+    def capex_budgets_delete(record_id: int):
+        row = g.conn.execute(
+            'SELECT "CapEx ID" FROM "CapEx Budgets" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if row is None:
+            abort(404)
+        sqlite_client.delete_capex_budget(g.conn, capex_id=row["CapEx ID"])
+        flash(f"Deleted budget for {row['CapEx ID']}.", "success")
+        return redirect(url_for("capex_budgets"))
+
+    # ------------------------------------------------------------------
     # Drill-in: /dashboard-detail/<gid>
     # ------------------------------------------------------------------
 
@@ -1270,13 +1617,56 @@ def register_routes(app: Flask) -> None:
         state_prior = g.conn.execute(
             'SELECT * FROM "State" WHERE "Asana Task GID" = ?', (gid,)
         ).fetchone()
+        # The actual Tableau entries the last ingest attributed here. Split
+        # into in-term (counted toward Spent so far) vs out-of-term (matched
+        # but excluded by the term window). An empty list is itself the answer
+        # to a $0 contract — the spend is unmatched and lives in Needs Tagging.
+        lines = sqlite_client.load_attributed_lines(g.conn, gid)
+        in_term = [dict(r) for r in lines if r["In Term"]]
+        out_term = [dict(r) for r in lines if not r["In Term"]]
+        resolved = sqlite_client.load_resolved_contracts(g.conn).get(gid)
         return render_template(
             "dashboard_detail.html",
             row=row,
             learned=learned,
             aliases=aliases,
             state_prior=state_prior,
+            in_term=in_term,
+            out_term=out_term,
+            in_total=sum((r["Amount"] or 0.0) for r in in_term),
+            out_total=sum((r["Amount"] or 0.0) for r in out_term),
+            resolved=resolved,
         )
+
+    @app.route("/dashboard-detail/<gid>/resolve", methods=["POST"])
+    def dashboard_detail_resolve(gid: str):
+        """Mute this contract's alarm writes. Snapshots the current Spending
+        Rate Alarm band as the re-arm baseline so a later WORSE band breaks
+        silence once. Engine keeps writing Spent/%/Rate."""
+        row = g.conn.execute(
+            'SELECT "Contract", "Spending Rate Alarm" FROM "Dashboard" '
+            'WHERE "Asana Task GID" = ?', (gid,)
+        ).fetchone()
+        if row is None:
+            abort(404)
+        from datetime import datetime, timezone
+        sqlite_client.set_contract_resolved(
+            g.conn,
+            gid=gid,
+            contract_name=row["Contract"] or "",
+            baseline_band=(row["Spending Rate Alarm"] or ""),
+            resolved_at=datetime.now(timezone.utc).date().isoformat(),
+        )
+        flash("Marked Resolved — alarm emails muted until you un-resolve "
+              "(or the spending-rate band gets worse).")
+        return redirect(url_for("dashboard_detail", gid=gid))
+
+    @app.route("/dashboard-detail/<gid>/unresolve", methods=["POST"])
+    def dashboard_detail_unresolve(gid: str):
+        """Resume normal alarm writes for this contract."""
+        sqlite_client.unresolve_contract(g.conn, gid=gid)
+        flash("Un-resolved — alarm writes resume on the next ingest.")
+        return redirect(url_for("dashboard_detail", gid=gid))
 
     # ------------------------------------------------------------------
     # Admin tables — shared admin_table.html template, three triples of

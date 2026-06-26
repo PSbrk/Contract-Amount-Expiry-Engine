@@ -22,8 +22,14 @@
   details summary { cursor: pointer; }
   .pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 1rem;
           background: var(--pico-muted-background-color); font-size: 0.8rem; }
-  .flash-success { color: var(--pico-color-green-600); }
-  .flash-error   { color: var(--pico-color-red-500); }
+  /* ponytail: flashes pinned + tinted so a refused action is impossible to
+     miss even when the operator is scrolled deep in a long conflict list. */
+  .flashes { position: sticky; top: 0; z-index: 100; margin-bottom: 1rem;
+             padding-top: 0.5rem; }
+  .flashes p { margin: 0 0 0.4rem; padding: 0.6rem 0.9rem; border-radius: 0.4rem;
+               font-weight: 600; }
+  .flash-success { color: #1b7a43; background: #e7f6ec; border: 1px solid #b6e0c4; }
+  .flash-error   { color: #b3261e; background: #fdecea; border: 1px solid #f0a6a0; }
 </style>
 </head>
 <body>
@@ -35,7 +41,9 @@
     <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
     <li><a href="{{ url_for('needs_tagging') }}">Needs Tagging</a></li>
     <li><a href="{{ url_for('vendor_conflicts') }}">Vendor Conflicts</a></li>
+    <li><a href="{{ url_for('miscoded') }}">Miscoded?</a></li>
     <li><a href="{{ url_for('p_card_spend') }}">P-Card Spend</a></li>
+    <li><a href="{{ url_for('capex_budgets') }}">CapEx Budgets</a></li>
     <li>
       <details role="list" dir="rtl">
         <summary aria-haspopup="listbox" role="link">Admin</summary>
@@ -53,9 +61,13 @@
 </nav>
 <main class="container">
   {% with messages = get_flashed_messages(with_categories=true) %}
-    {% for category, msg in messages %}
-      <p class="flash-{{ category }}">{{ msg }}</p>
-    {% endfor %}
+    {% if messages %}
+    <div class="flashes" role="alert">
+      {% for category, msg in messages %}
+        <p class="flash-{{ category }}">{{ msg }}</p>
+      {% endfor %}
+    </div>
+    {% endif %}
   {% endwith %}
   {% block content %}{% endblock %}
 </main>

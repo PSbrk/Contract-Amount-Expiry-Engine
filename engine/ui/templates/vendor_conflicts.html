@@ -215,6 +215,26 @@
       </button>
     </form>
 
+    <h4 style="margin-top: 1.2rem; margin-bottom: 0.4rem;">
+      Or this spend pre-dates the contract
+    </h4>
+    <p><small style="color: var(--pico-muted-color);">
+      Use this when the payment genuinely happened <em>before</em> the only
+      matching Asana contract existed (its term doesn't cover these dates), so
+      there's nothing to attribute it to. Parks the whole group — it leaves
+      this list and stops nagging, and only re-surfaces if <strong>new,
+      later-dated</strong> activity shows up. Restore any time under
+      <em>Needs Tagging → Once-off</em>.
+    </small></p>
+    <form method="post"
+          action="{{ url_for('vendor_conflicts_mark_pre_dates', record_id=nt['id']) }}"
+          style="margin-bottom: 0.6rem;">
+      <button type="submit" class="secondary outline"
+              style="margin: 0; padding: 0.3rem 0.8rem;">
+        Pre-dates Asana Record — park this group
+      </button>
+    </form>
+
     {% if c.candidates|length == 2 %}
     <h4 style="margin-top: 1.2rem; margin-bottom: 0.4rem;">
       Or mark amendment relationship

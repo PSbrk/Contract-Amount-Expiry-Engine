@@ -21,8 +21,8 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "transactions_sample.ts
 def test_in_scope_count_matches_fixture():
     df = parse_tableau_export(FIXTURE)
     kept = in_scope(df)
-    # 4 in-scope rows: R002 (63020), R003 (63040), R004 (63080), R005 (63090).
-    # R001 (63015) MOVED to out-of-scope on 2026-06-16 when CapEx was dropped.
+    # 4 in-scope rows: R001 (63015), R003 (63040), R004 (63080), R005 (63090).
+    # 2026-06-24 scope change: R001 (63015 CapEx) back IN; R002 (63020) now OUT.
     assert len(kept) == 4
     # Every kept row must satisfy BOTH filters.
     assert kept["Account No"].isin(settings.ACCOUNTS_IN_SCOPE).all()
@@ -32,22 +32,25 @@ def test_in_scope_count_matches_fixture():
 def test_in_scope_signed_sum_matches_fixture():
     df = parse_tableau_export(FIXTURE)
     kept = in_scope(df)
-    # 2500 + 750 - 250 + 3000 = 6000 (R001 dropped after CapEx removed).
-    assert signed_sum(kept) == pytest.approx(6000.00)
+    # R001(63015,1000) + R003(750) + R004(-250 credit) + R005(3000) = 4500.
+    # R002(63020,2500) left scope on 2026-06-24; R001(63015) rejoined.
+    assert signed_sum(kept) == pytest.approx(4500.00)
 
 
 def test_out_of_scope_count_matches_fixture():
     df = parse_tableau_export(FIXTURE)
     rejected = out_of_scope(df)
-    # 10 originally + R001 (63015 / now out by account) = 11.
+    # 11 out-of-scope: R001 (63015) rejoined scope, R002 (63020) left it —
+    # a one-for-one swap, so the count is unchanged.
     assert len(rejected) == 11
 
 
 def test_out_of_scope_signed_sum_matches_fixture():
     df = parse_tableau_export(FIXTURE)
     rejected = out_of_scope(df)
-    # 500 + 800 + 1200 + 400 + 600 - 150 + 250 + 900 - 1000 + 0 + 1000 (R001) = 4500.
-    assert signed_sum(rejected) == pytest.approx(4500.00)
+    # R002(63020,2500) now out + 500 + 800 + 1200 + 400 + 600 - 150 + 250
+    # + 900 - 1000 + 0 = 6000. (R001/63015 moved IN on 2026-06-24.)
+    assert signed_sum(rejected) == pytest.approx(6000.00)
 
 
 def test_in_and_out_partition_perfectly():
@@ -79,7 +82,7 @@ def test_is_in_scope_mask_shape_and_count():
     mask = is_in_scope_mask(df)
     assert len(mask) == len(df)
     assert mask.dtype == bool
-    # 4 in-scope after CapEx (63015) was removed from ACCOUNTS_IN_SCOPE.
+    # 4 in-scope under the 2026-06-24 scope (63015 in, 63020 out).
     assert mask.sum() == 4
 
 
