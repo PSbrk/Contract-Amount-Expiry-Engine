@@ -539,6 +539,34 @@ def load_learned_mappings(
     return out
 
 
+def load_capex_redirect_pins(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, str, str, str], str]:
+    """Return {(Campus, Dept, Account No, Vendor): Contract Gid} for the
+    Miscoded? 'Accept' overrides — the Ignore-Coding Learned Mappings that pin a
+    group to a specific gid. The caller decides which pinned gids are CapEx
+    contracts (→ recode the group's rows into the CapEx tier via
+    capex.apply_capex_redirects) vs opex (→ the normal learned path handles
+    them). Plain opex Accepts and name-only LMs are excluded (no gid)."""
+    out: dict[tuple[str, str, str, str], str] = {}
+    for row in conn.execute(
+        '''SELECT "Campus", "Dept", "Account No", "Vendor", "Contract Gid"
+           FROM "Learned Mappings"
+           WHERE COALESCE("Ignore Coding", 0) = 1
+             AND COALESCE("Contract Gid", '') <> '' '''
+    ):
+        key = (
+            (row["Campus"] or "").strip(),
+            (row["Dept"] or "").strip(),
+            (row["Account No"] or "").strip(),
+            (row["Vendor"] or "").strip(),
+        )
+        gid = (row["Contract Gid"] or "").strip()
+        if all(key) and gid:
+            out[key] = gid
+    return out
+
+
 def load_capex_budgets(conn: sqlite3.Connection) -> dict[str, float]:
     """Return {normalized CapEx ID: budget} from the CapEx Budgets table.
 

@@ -104,7 +104,13 @@
           </form>
           {% endfor %}
           <form method="post" action="{{ url_for('miscoded_confirm_correct', record_id=r['id']) }}" style="margin:0.3rem 0 0 0;">
+            {% if item.candidates %}
             <button type="submit" class="secondary outline" style="margin:0; font-size:0.85rem;">Correctly coded (leave unattributed)</button>
+            {% else %}
+            {# Cross-tier (CapEx) miscoding: no opex contract to accept into — the
+               only real fix is upstream in Asana/Tableau. Offer just an acknowledge. #}
+            <button type="submit" class="secondary outline" style="margin:0; font-size:0.85rem;">Acknowledged &mdash; fix coding at source</button>
+            {% endif %}
           </form>
         {% endif %}
       </td>
