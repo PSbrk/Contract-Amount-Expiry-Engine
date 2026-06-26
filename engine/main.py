@@ -779,6 +779,7 @@ def _run_attribution_and_needs_tagging(
         cleanup_stale_needs_tagging,
         load_campus_map_overrides,
         load_learned_mappings,
+        load_pcard_links,
         load_vendor_aliases,
         promote_filled_needs_tagging,
         upsert_needs_tagging_group,
@@ -825,6 +826,30 @@ def _run_attribution_and_needs_tagging(
     forward_overrides, drop_override = load_campus_map_overrides(conn)
     crosswalk = campus_map.build(forward_overrides, drop_override)
     learned = load_learned_mappings(conn)
+
+    # P-Card links: operator said "this blank-vendor spend belongs to contract
+    # X" on the P-Card tab. Stamp X's vendor name onto the matching blank-vendor
+    # rows BEFORE attribution so they split into their own clean vendor group
+    # and attribute normally. Resolve each link's gid to the CURRENT opex
+    # contract name (skip stale/CapEx targets — CapEx isn't in opex_contracts).
+    _opex_by_gid = {c.gid: c for c in opex_contracts}
+    _pcard_links = []
+    for _lk in load_pcard_links(conn):
+        _c = _opex_by_gid.get(_lk["gid"]) if _lk["gid"] else None
+        if _c:
+            _pcard_links.append({**_lk, "name": _c.name})
+    _stamped = attribution.stamp_pcard_links(opex_df, _pcard_links)
+    if _stamped:
+        # Pin each stamped group to its EXACT gid (the operator's pick). The
+        # stamp put the contract NAME on the rows; a plain gid-pinned LM on the
+        # stamped key resolves to the right task even when several contracts
+        # share that name (Summit Fire vs Summit Fire and Security, archived
+        # duplicates, …) — name-only fuzzy would otherwise go ambiguous.
+        for _lk in _pcard_links:
+            _key = (_lk["campus"], _lk["dept"], _lk["account_no"], _lk["name"])
+            learned.setdefault(_key, []).insert(0, (_lk["name"], _lk["gid"], None))
+        print(f"P-Card links: stamped {_stamped} blank-vendor row(s) onto "
+              f"{len({l['gid'] for l in _pcard_links})} linked contract(s).")
 
     # Attribute the OPEX tier only (CapEx is deterministic, handled below).
     run = attribution.attribute(opex_df, opex_contracts, aliases, crosswalk, learned)

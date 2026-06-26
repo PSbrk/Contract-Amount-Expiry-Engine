@@ -358,6 +358,86 @@ def _lm_pattern_matches(pattern: str | None, description: str) -> bool:
     return pat_tokens <= _meaningful_tokens(description)
 
 
+def stamp_pcard_links(df: pd.DataFrame, links: list[dict]) -> int:
+    """Operator P-Card links → pre-attribution vendor stamp. MUTATES df.
+
+    For each link {campus, dept, account_no, name, pattern}, stamp Vendor=name
+    onto every BLANK-vendor row in that (Campus, Dept, Account No) whose Record
+    Description matches the pattern (token-subset). Those rows then split into
+    their own clean vendor group and attribute to the contract via the normal
+    fuzzy path — instead of being one vendor in a big blank-vendor group, which
+    the group-status logic would poison to 'ambiguous'. The unrelated
+    blank-vendor rows (Amazon, Lowes, …) keep their blank Vendor and stay on
+    the P-Card tab. Only touches rows whose Vendor is currently blank, so it
+    can never overwrite a real Tableau vendor. Returns the rows stamped.
+    """
+    if not links or df.empty or "Vendor" not in df.columns:
+        return 0
+    desc_col = "Record Description" if "Record Description" in df.columns else None
+    vendor = df["Vendor"].astype("string")
+    blank = vendor.isna() | (vendor.str.strip() == "")
+    stamped = 0
+    for link in links:
+        grp = (
+            blank
+            & (df["Campus"].astype("string").str.strip() == link["campus"])
+            & (df["Dept"].astype("string").str.strip() == link["dept"])
+            & (df["Account No"].astype("string").str.strip() == link["account_no"])
+        )
+        if not grp.any():
+            continue
+        for idx in df.index[grp]:
+            desc = _safe_str(df.at[idx, desc_col]) if desc_col else ""
+            if _lm_pattern_matches(link["pattern"], desc):
+                df.at[idx, "Vendor"] = link["name"]
+                stamped += 1
+    return stamped
+
+
+def _distinct_buckets(st: dict) -> dict[str, dict]:
+    """Per-distinct-description aggregation for a group: description → {rows,
+    amount, min_dt, max_dt, dates}. Empty description is its own bucket. Shared
+    by the ambiguous and unmatched branches — the unmatched (P-Card) case needs
+    it so the P-Card tab's name matcher can see EVERY description, not just the
+    one Sample Record Description (which is often unrelated noise)."""
+    distinct: dict[str, dict] = {}
+    for desc, amt, dt in zip(
+        st["row_descriptions"], st["row_amounts"], st["row_dates"],
+    ):
+        key_d = (desc or "").strip()
+        bucket = distinct.setdefault(
+            key_d, {"rows": 0, "amount": 0.0, "min_dt": None,
+                    "max_dt": None, "dates": []},
+        )
+        bucket["rows"] += 1
+        bucket["amount"] += amt
+        if dt is not None:
+            bucket["dates"].append(dt)
+            if bucket["min_dt"] is None or dt < bucket["min_dt"]:
+                bucket["min_dt"] = dt
+            if bucket["max_dt"] is None or dt > bucket["max_dt"]:
+                bucket["max_dt"] = dt
+    return distinct
+
+
+def _distinct_descriptions_tuple(distinct: dict[str, dict]) -> tuple:
+    """Serialize _distinct_buckets to the (desc, rows, amount, min, max) tuples
+    the Needs Tagging row persists (Distinct Descriptions JSON), sorted by
+    descending dollar weight."""
+    return tuple(
+        (
+            desc,
+            b["rows"],
+            round(b["amount"], 2),
+            b["min_dt"].isoformat() if b["min_dt"] is not None else "",
+            b["max_dt"].isoformat() if b["max_dt"] is not None else "",
+        )
+        for desc, b in sorted(
+            distinct.items(), key=lambda kv: kv[1]["amount"], reverse=True,
+        )
+    )
+
+
 def _dept_set(raw: str | None) -> frozenset[str]:
     """Asana's Dept is free text and may list MULTIPLE accepted codes
     ('000, 107' means a row coded to either 000 or 107 belongs here). Split on
@@ -997,35 +1077,8 @@ def attribute(
             # reject auto-suggesting a contract whose term doesn't overlap.
             # None dates are skipped — a bucket with no parsable dates ends
             # up with min/max = None and the UI falls back to text-only.
-            distinct: dict[str, dict] = {}
-            for desc, amt, dt in zip(
-                st["row_descriptions"], st["row_amounts"], st["row_dates"],
-            ):
-                key_d = (desc or "").strip()
-                bucket = distinct.setdefault(
-                    key_d, {"rows": 0, "amount": 0.0, "min_dt": None,
-                            "max_dt": None, "dates": []},
-                )
-                bucket["rows"] += 1
-                bucket["amount"] += amt
-                if dt is not None:
-                    bucket["dates"].append(dt)
-                    if bucket["min_dt"] is None or dt < bucket["min_dt"]:
-                        bucket["min_dt"] = dt
-                    if bucket["max_dt"] is None or dt > bucket["max_dt"]:
-                        bucket["max_dt"] = dt
-            distinct_descriptions = tuple(
-                (
-                    desc,
-                    b["rows"],
-                    round(b["amount"], 2),
-                    b["min_dt"].isoformat() if b["min_dt"] is not None else "",
-                    b["max_dt"].isoformat() if b["max_dt"] is not None else "",
-                )
-                for desc, b in sorted(
-                    distinct.items(), key=lambda kv: kv[1]["amount"], reverse=True,
-                )
-            )
+            distinct = _distinct_buckets(st)
+            distinct_descriptions = _distinct_descriptions_tuple(distinct)
             # Phase 14a + #5: flag the group "out of term" when there is at
             # least one DESCRIPTION BUCKET whose every dated row falls outside
             # every candidate's [start, due]. Computed PER BUCKET (not via a
@@ -1074,13 +1127,20 @@ def attribute(
 
         if any_unmatched and not attributed_gids:
             # No rows attributed AND any unmatched → genuine unmatched.
-            # Show the vendor-only matches as hints.
+            # Show the vendor-only matches as hints. Persist the distinct
+            # descriptions too: a blank-vendor (P-Card) group's vendor is named
+            # only in the line-item text, so the P-Card tab's name matcher and
+            # the "Attribute to X" action need EVERY description, not just the
+            # one (often unrelated) Sample Record Description.
             hints = list(st["vendor_only_union"].values())
             results.append(AttributionResult(
                 **base, status="unmatched",
                 contract_name=None, contract_gid=None,
                 candidate_names=tuple(c.name for c in hints),
                 candidate_gids=tuple(c.gid for c in hints),
+                distinct_descriptions=_distinct_descriptions_tuple(
+                    _distinct_buckets(st)
+                ),
             ))
             continue
 

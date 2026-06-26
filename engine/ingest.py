@@ -95,6 +95,21 @@ _BILL_VENDOR_DESC_RE = re.compile(
 # source sign so it nets out against the original charge.
 _REVERSED_PREFIX_RE = re.compile(r"^\s*Reversed\s*--\s*", re.IGNORECASE)
 
+# A genuine purchasing-card transaction carries the CARDHOLDER NAME and a date
+# at the END of the Record Description: "<memo>, <MERCHANT>, <Last>, <First>,
+# MM/DD/YYYY". That signature — Lastname, Firstname (optional middle/initial),
+# then a date — is what distinguishes an employee card buy from a blank-vendor
+# contract invoice that's merely missing its Vendor coding ("Gallivan Snow
+# Contract"). The latter is NOT a P-card and belongs in normal attribution.
+# Anchored on the END: ", <cardholder name>, MM/DD/YYYY". The name is one or
+# more tokens (handles "Hunter, Tami" and the single-name "Mea" alike — the
+# regex just needs the LAST ", name, full-date"). A FULL date (two slashes,
+# with a day) is required: contract memos use "10/2024" / "12/27" / "Dec 2024",
+# never the transaction's MM/DD/YYYY, so the day-bearing date is the tell.
+_PCARD_SIGNATURE_RE = re.compile(
+    r",\s*[A-Za-z][A-Za-z.'\- ]*,\s*\d{1,2}/\d{1,2}/\d{2,4}\s*$"
+)
+
 
 def _parse_amount(raw: object) -> float:
     """Convert one cell from the Amount column to a signed float.
@@ -124,17 +139,17 @@ def _parse_amount(raw: object) -> float:
 
 
 def is_p_card_row(vendor: object, description: object) -> bool:
-    """True for blank-vendor rows whose description doesn't look like an AP
-    bill (i.e. no 'Bill - <X>:' prefix). These are typically purchasing-card
-    transactions or journal entries -- operational supply spend by an
-    employee on a corporate card, NOT contracted spend. Routes such rows to
-    the /p-card-spend audit surface instead of clogging Needs Tagging.
+    """True for a blank-vendor, non-Bill row → routed to the /p-card-spend
+    surface (kept off the Needs Tagging contract-review queue).
 
-    Phase 10 vendor backfill runs FIRST during parse_tableau_export, so any
-    row whose Vendor is still blank by the time this predicate is called
-    has already failed the 'Bill - X:' match. The check here is therefore
-    just on Vendor blankness -- with the regex re-test kept as belt-and-
-    suspenders in case the predicate is called against a pre-backfill df.
+    Note this is a GROUP-level flag keyed off one sample description, but a
+    blank-vendor (Campus, Dept, Account) group is a MIXED bucket: some line
+    items are genuine employee P-card buys ("…, Last, First, MM/DD/YYYY") and
+    some are contract spend missing its Vendor coding ("Gallivan Snow
+    Contract"). So the P-card-vs-contract call is made PER LINE ITEM in the UI
+    via has_cardholder_signature() — not here — and the operator links the
+    contract line items from the P-card tab. This predicate just keeps all
+    blank-vendor spend on that one surface.
     """
     v = str(vendor or "").strip()
     if v:
@@ -143,6 +158,14 @@ def is_p_card_row(vendor: object, description: object) -> bool:
     if _BILL_VENDOR_DESC_RE.match(d):
         return False
     return True
+
+
+def has_cardholder_signature(description: object) -> bool:
+    """True when a description carries the purchasing-card cardholder signature
+    ('…, Name, MM/DD/YYYY'). Per-LINE-ITEM tell that a blank-vendor row is a
+    genuine employee card buy rather than contract spend — used by the P-card
+    tab to label each bucket (and steer the operator to Ignore vs Link)."""
+    return bool(_PCARD_SIGNATURE_RE.search(str(description or "").strip()))
 
 
 def _apply_description_repairs(df: pd.DataFrame) -> pd.DataFrame:
@@ -632,4 +655,5 @@ __all__ = [
     "TableauRestSource",
     "parse_tableau_export",
     "is_p_card_row",
+    "has_cardholder_signature",
 ]

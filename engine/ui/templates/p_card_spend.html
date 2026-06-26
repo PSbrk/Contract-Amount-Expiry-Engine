@@ -1,8 +1,8 @@
 {% extends "base.html" %}
-{% block title %}P-Card Spend — Contract Engine{% endblock %}
+{% block title %}Blank Vendor or P-Card to allocate — Contract Engine{% endblock %}
 {% block content %}
 <header>
-  <h2>P-Card Spend</h2>
+  <h2>Blank Vendor or P-Card to allocate</h2>
   <p>
     <span class="pill">{{ rows|length }} row{{ '' if rows|length == 1 else 's' }} on this tab</span>
     <span class="pill">${{ "{:,.2f}".format(visible_total) }} visible $</span>
@@ -22,6 +22,10 @@
   {% if asana_error %}
   <p><small class="alarm-on">⚠ Asana unreachable ({{ asana_error }}) — contract-name hints unavailable.</small></p>
   {% endif %}
+  {% if show == 'open' and hidden_zero %}
+  <p><small class="alarm-off">{{ hidden_zero }} fully-reversed (net&nbsp;$0) group{{ '' if hidden_zero == 1 else 's' }} hidden &mdash;
+    a charge and its reversal that cancel out. <a href="{{ url_for('p_card_spend', show='all') }}">See All</a> to audit them.</small></p>
+  {% endif %}
   <nav>
     <ul>
       <li><a href="{{ url_for('p_card_spend', show='open') }}"
@@ -35,6 +39,11 @@
 </header>
 
 {% if rows %}
+{% if link_contracts %}
+<datalist id="link-contracts">
+  {% for c in link_contracts %}<option value="{{ c.label }}"></option>{% endfor %}
+</datalist>
+{% endif %}
 <figure>
 <table role="grid">
   <thead>
@@ -69,9 +78,44 @@
       </td>
       <td>
         <small>{{ (r["Sample Record Description"] or "")[:160] }}</small>
+        {% if linked.get(r["id"]) %}
+          {% for lk in linked[r["id"]] %}
+          <br><small>
+            <span class="pill">🔗 linked → {{ lk.name }}</span>
+            <em>desc names “{{ lk.pattern }}”</em>
+            <form method="post"
+                  action="{{ url_for('p_card_spend_unlink', lm_id=lk.lm_id) }}"
+                  style="display:inline; margin:0;">
+              <button type="submit" class="secondary outline"
+                      style="margin:0; padding:0 .4rem; font-size:0.72rem;">unlink</button>
+            </form>
+          </small>
+          {% endfor %}
+        {% endif %}
         {% if hints.get(r["id"]) %}
-        <br><small><span class="pill">⚲ names a contract</span>
-          <strong>{{ hints[r["id"]]|join(", ") }}</strong> — blank vendor, verify &amp; recode at source if it's really them</small>
+          <br><small><span class="pill">⚲ names a contract</span></small>
+          {% for h in hints[r["id"]] %}
+            {% if h.is_capex %}
+              <br><small><strong>{{ h.name }}</strong> — CapEx contract; set its
+                CapEx ID in Asana to link (joined by Project ID, not here)</small>
+            {% else %}
+              <br><small>
+                <form method="post"
+                      action="{{ url_for('p_card_spend_attribute', record_id=r['id']) }}"
+                      style="display:inline; margin:0;">
+                  <input type="hidden" name="gid" value="{{ h.gid }}">
+                  <button type="submit" class="secondary"
+                          style="margin:0; padding:0 .5rem; font-size:0.8rem;">
+                    Attribute to {{ h.name }}
+                  </button>
+                </form>
+                {% if h.cross %}
+                  <span class="pill">different campus</span>
+                {% endif %}
+                <span class="alarm-off">— verify it's really them; in-term rows only</span>
+              </small>
+            {% endif %}
+          {% endfor %}
         {% endif %}
       </td>
       <td>
@@ -84,11 +128,34 @@
         {% else %}
           <form method="post"
                 action="{{ url_for('p_card_spend_ignore_once', record_id=r['id']) }}"
-                style="margin: 0;">
+                style="margin: 0 0 0.4rem 0;">
             <button type="submit" class="secondary outline" style="margin: 0; font-size: 0.85rem;">
               Ignore once
             </button>
           </form>
+          {% if link_buckets.get(r["id"]) %}
+          <details>
+            <summary><small>🔗 Allocate {{ link_buckets[r["id"]]|length }} line item{{ '' if link_buckets[r["id"]]|length == 1 else 's' }} to contracts</small></summary>
+            <p style="margin:.3rem 0;"><small class="alarm-off">These line items have no cardholder name &mdash; likely contract spend. Allocate each to its contract; next ingest attributes the matching rows (in-term only).
+            {% if pcard_counts.get(r["id"]) %}<br>(+ {{ pcard_counts[r["id"]] }} employee P-card line item{{ '' if pcard_counts[r["id"]] == 1 else 's' }} with a cardholder name &mdash; use <em>Ignore once</em> for those.){% endif %}
+            </small></p>
+            {% for b in link_buckets[r["id"]] %}
+            <div style="margin:.35rem 0; padding-bottom:.25rem; border-bottom:1px solid var(--pico-muted-border-color, #333);">
+              <small><span class="pill alarm-on">likely contract</span>
+                {{ b.desc[:64] }} &middot; <strong>${{ "{:,.0f}".format(b.amount or 0) }}</strong></small>
+              <form method="post"
+                    action="{{ url_for('p_card_spend_link_by_description', record_id=r['id']) }}"
+                    style="display:flex; gap:.3rem; margin:.15rem 0 0 0; align-items:center;">
+                <input type="hidden" name="description" value="{{ b.desc }}">
+                <input type="text" name="contract" list="link-contracts"
+                       placeholder="Contract (type to search)"
+                       style="margin:0; flex:1 1 auto; min-width:13rem; font-size:0.8rem;">
+                <button type="submit" style="margin:0; flex:0 0 auto; width:auto; font-size:0.8rem;">Allocate</button>
+              </form>
+            </div>
+            {% endfor %}
+          </details>
+          {% endif %}
         {% endif %}
       </td>
     </tr>

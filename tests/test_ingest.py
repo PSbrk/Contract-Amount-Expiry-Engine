@@ -413,14 +413,15 @@ def test_vendor_backfill_and_sign_flip_compose(tmp_path):
 
 
 def test_is_p_card_row_predicate():
-    """Blank-vendor non-Bill rows are p-card; everything else isn't."""
+    """Blank-vendor non-Bill rows route to the P-card surface; the P-card-vs-
+    contract call is made PER LINE ITEM (has_cardholder_signature), not here."""
     from engine.ingest import is_p_card_row
-    # P-card: blank vendor, p-card-style description.
-    assert is_p_card_row("", "Reflective markers for parking lot, GRAINGER, Hunter, Tami, 01/03/2025")
+    assert is_p_card_row("", "Reflective markers, GRAINGER, Hunter, Tami, 01/03/2025")
     assert is_p_card_row(None, "Carpet square glue, LOWES #01536*, Sanders, Jesse, 01/15/2025")
     assert is_p_card_row("   ", "Office supplies, AMAZON MKTPL*ZP06Y5UV0, Mea, 01/19/2025")
-    # Reversed but no Bill pattern → still classified p-card (the operator
-    # can Ignore once if it's bookkeeping noise).
+    # Blank-vendor with no signature still lands on the P-card surface (the
+    # operator links these contract line items from there).
+    assert is_p_card_row("", "Gallivan Snow Contract")
     assert is_p_card_row("", "Reversed -- MUS Lowe's CAM Charges Accrual")
     # NOT p-card: vendor populated.
     assert not is_p_card_row("The Stewards Company", "Window Cleaning 12/2024")
@@ -428,6 +429,19 @@ def test_is_p_card_row_predicate():
     # NOT p-card: Bill - X: pattern (AP bill row — Phase 10 would backfill).
     assert not is_p_card_row("", "Bill - The Stewards Company: Window Cleaning 12/2024")
     assert not is_p_card_row("", "Reversed -- Bill - Foo Co: bar memo")
+
+
+def test_has_cardholder_signature():
+    """Per-line-item P-card tell: '…, Name, MM/DD/YYYY' at the end."""
+    from engine.ingest import has_cardholder_signature
+    assert has_cardholder_signature("Reflective markers, GRAINGER, Hunter, Tami, 01/03/2025")
+    assert has_cardholder_signature("Office supplies, AMAZON MKTPL*ZP06Y5UV0, Mea, 01/19/2025")
+    assert has_cardholder_signature("Fuel, PHILLIPS 66 - ONCUE, Snyder, Andrew T, 01/13/2025")
+    # Contract/invoice spend — no cardholder signature.
+    assert not has_cardholder_signature("Gallivan Snow Contract")
+    assert not has_cardholder_signature("Snow Removal 10/2024")            # MM/YYYY, no day
+    assert not has_cardholder_signature("OWS Lighting Upgrades LYNTEC RPCR-16")
+    assert not has_cardholder_signature("Snow/ice management 01/23, 01/26")  # no name before date
 
 
 def test_parse_warns_on_extra_columns(tmp_path, caplog):

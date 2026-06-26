@@ -30,6 +30,33 @@ from engine import sqlite_client
 from engine.attribution import normalize_lm_pattern
 
 
+def _link_contract_options(conn) -> list[dict]:
+    """[{label, gid}] of computed contracts for the blank-vendor line-item
+    picker. Label = 'Name — Campus — Reason' so same-name contracts (four
+    'Gallivan Corporation…' tasks split by reason) are distinguishable and map
+    to a SPECIFIC gid. Collisions get a gid-tail suffix. Sourced from the
+    Dashboard (no Asana call); the POST route rebuilds the same map to resolve
+    the operator's pick → gid (anti-tampering: only computed contracts qualify)."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r in conn.execute(
+        'SELECT "Contract", "Campus Set", "Contract Reason Text", "Asana Task GID" '
+        'FROM "Dashboard" WHERE "Asana Task GID" IS NOT NULL ORDER BY "Contract"'
+    ):
+        nm = (r["Contract"] or "").strip()
+        gid = (r["Asana Task GID"] or "").strip()
+        if not nm or not gid:
+            continue
+        camp = (r["Campus Set"] or "").strip()
+        reason = (r["Contract Reason Text"] or "").strip()
+        label = nm + (f" — {camp}" if camp else "") + (f" — {reason}" if reason else "")
+        if label in seen:
+            label = f"{label} #{gid[-4:]}"
+        seen.add(label)
+        out.append({"label": label, "gid": gid})
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Column specs for the shared admin_table.html template.
 #
@@ -530,6 +557,78 @@ def register_routes(app: Flask) -> None:
         )
         return redirect(url_for("needs_tagging"))
 
+    @app.route("/p-card-spend/<int:record_id>/link-by-description", methods=["POST"])
+    def p_card_spend_link_by_description(record_id: int):
+        """Link ONE line-item description of a blank-vendor P-card group to a
+        specific contract. Writes a blank-vendor + Description-Pattern Learned
+        Mapping; the ingest vendor-stamp + gid-pin then attribute the matching
+        rows to the chosen contract (opex). Handles the case the auto
+        name-matcher misses — e.g. 'Gallivan Snow Contract' → 'Gallivan
+        Corporation dba Applied Mulch Soil — Snow Removal'."""
+        nt = g.conn.execute(
+            'SELECT * FROM "Needs Tagging" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if nt is None:
+            abort(404)
+        description = (request.form.get("description") or "").strip()
+        label = (request.form.get("contract") or "").strip()
+        if not description or not label:
+            flash("Pick a contract for the line item before linking.", "error")
+            return redirect(url_for("p_card_spend"))
+        # Resolve the chosen label → a SPECIFIC gid via the same Dashboard map
+        # the picker was built from (rejects anything not computed = anti-tamper).
+        opts = {o["label"]: o["gid"] for o in _link_contract_options(g.conn)}
+        gid = opts.get(label)
+        if not gid:
+            flash(f"“{label}” isn’t a known contract — pick one from the list.", "error")
+            return redirect(url_for("p_card_spend"))
+        name = g.conn.execute(
+            'SELECT "Contract" FROM "Dashboard" WHERE "Asana Task GID" = ?', (gid,)
+        ).fetchone()
+        name = (name["Contract"] if name else "").strip()
+        pattern = normalize_lm_pattern(description)
+        if not pattern:
+            flash("That line item has no matchable words to link on.", "error")
+            return redirect(url_for("p_card_spend"))
+        group_key = (nt["Group Key"] or "").strip()
+        campus = (nt["Campus"] or "").strip()
+        dept = (nt["Dept"] or "").strip()
+        account_no = (nt["Account No"] or "").strip()
+        from datetime import datetime, timezone
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        notes = (f"Blank-vendor line-item link via P-Card tab on {today_iso}. "
+                 f"{group_key!r} desc {description!r} (pattern {pattern!r}) → "
+                 f"gid {gid} ({name}).")
+        existing = g.conn.execute(
+            '''SELECT id FROM "Learned Mappings"
+               WHERE "Key" = ? AND COALESCE("Description Pattern", '') = ?''',
+            (group_key, pattern),
+        ).fetchone()
+        if existing:
+            g.conn.execute(
+                '''UPDATE "Learned Mappings"
+                   SET "Campus" = ?, "Dept" = ?, "Account No" = ?, "Vendor" = '',
+                       "Contract Name" = ?, "Contract Gid" = ?,
+                       "Description Pattern" = ?, "Learned At" = ?, "Notes" = ?
+                   WHERE id = ?''',
+                (campus, dept, account_no, name, gid, pattern, today_iso, notes,
+                 existing["id"]),
+            )
+        else:
+            g.conn.execute(
+                '''INSERT INTO "Learned Mappings"
+                     ("Key", "Campus", "Dept", "Account No", "Vendor",
+                      "Contract Name", "Contract Gid", "Description Pattern",
+                      "Learned At", "Notes")
+                   VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?)''',
+                (group_key, campus, dept, account_no, name, gid, pattern,
+                 today_iso, notes),
+            )
+        g.conn.commit()
+        flash(f"Linked “{description[:40]}” → {name}. Next ingest attributes the "
+              f"matching rows to it (in-term only).", "success")
+        return redirect(url_for("p_card_spend"))
+
     @app.route("/needs-tagging/<int:record_id>/dismiss", methods=["POST"])
     def needs_tagging_dismiss(record_id: int):
         existing = g.conn.execute(
@@ -922,6 +1021,10 @@ def register_routes(app: Flask) -> None:
         the operator can eyeball them and (optionally) "Ignore once" the
         ones they've reviewed."""
         show = request.args.get("show", "open").lower()
+        # A fully-reversed group (Charge + matching Credit) nets to $0 — pure
+        # noise, nothing to attribute. Hide those from Open; keep them under All
+        # for audit. ponytail: 0.005 = sub-cent rounding guard.
+        nonzero = 'AND ABS(COALESCE("$ in group", 0)) >= 0.005'
         if show == "ignored":
             where = ('WHERE COALESCE("Is P-Card", 0) = 1 '
                      'AND COALESCE("P-Card Ignored", 0) = 1')
@@ -930,7 +1033,7 @@ def register_routes(app: Flask) -> None:
         else:
             show = "open"
             where = ('WHERE COALESCE("Is P-Card", 0) = 1 '
-                     'AND COALESCE("P-Card Ignored", 0) = 0')
+                     f'AND COALESCE("P-Card Ignored", 0) = 0 {nonzero}')
         rows = g.conn.execute(
             f'''SELECT * FROM "Needs Tagging"
                 {where}
@@ -940,14 +1043,22 @@ def register_routes(app: Flask) -> None:
         # much p-card exposure is in scope and how many rows they've
         # already eyeballed (Ignored).
         open_count = g.conn.execute(
-            '''SELECT COUNT(*) FROM "Needs Tagging"
+            f'''SELECT COUNT(*) FROM "Needs Tagging"
                WHERE COALESCE("Is P-Card", 0) = 1
-                 AND COALESCE("P-Card Ignored", 0) = 0'''
+                 AND COALESCE("P-Card Ignored", 0) = 0 {nonzero}'''
         ).fetchone()[0]
         ignored_count = g.conn.execute(
             '''SELECT COUNT(*) FROM "Needs Tagging"
                WHERE COALESCE("Is P-Card", 0) = 1
                  AND COALESCE("P-Card Ignored", 0) = 1'''
+        ).fetchone()[0]
+        # How many net-$0 (fully reversed) groups are hidden from Open — shown
+        # as a note so the suppression is transparent, never silent.
+        hidden_zero = g.conn.execute(
+            '''SELECT COUNT(*) FROM "Needs Tagging"
+               WHERE COALESCE("Is P-Card", 0) = 1
+                 AND COALESCE("P-Card Ignored", 0) = 0
+                 AND ABS(COALESCE("$ in group", 0)) < 0.005'''
         ).fetchone()[0]
         visible_total = sum((r["$ in group"] or 0) for r in rows)
 
@@ -958,7 +1069,9 @@ def register_routes(app: Flask) -> None:
         # Live Asana pull, resilient (like /capex-budgets, /unlinked-capex).
         import json as _json
         from engine.name_match import match_unlinked
+        from config import settings as _settings
         pool: list[tuple[str, str, set[str]]] = []
+        capex_gids: set[str] = set()
         asana_error = None
         try:
             from engine import asana_client, asana_contracts
@@ -966,9 +1079,16 @@ def register_routes(app: Flask) -> None:
                 asana_client.get_api_client()
             )
             pool = [(c.name, c.gid, set(c.campus_options)) for c in contracts if c.name]
+            # CapEx targets can't be linked here — their spend is joined by
+            # Project ID, so the operator sets the CapEx ID in Asana instead.
+            # Flag them so the template renders advice, not an Attribute button.
+            capex_gids = {
+                c.gid for c in contracts
+                if c.acc == _settings.CAPEX_ACCOUNT_NO or c.capex_id
+            }
         except Exception as exc:  # noqa: BLE001 — UI stays usable offline
             asana_error = f"{type(exc).__name__}: {exc}"
-        hints: dict[int, list[str]] = {}
+        hints: dict[int, list[dict]] = {}
         if pool:
             for r in rows:
                 try:
@@ -979,9 +1099,84 @@ def register_routes(app: Flask) -> None:
                 if not descs:
                     descs = [r["Sample Record Description"] or ""]
                 campus = {(r["Campus"] or "").strip()} - {""}
-                confident, _ = match_unlinked(descs, campus, pool)
-                if confident:
-                    hints[r["id"]] = [name for name, _gid in confident]
+                confident, cross = match_unlinked(descs, campus, pool)
+                # Surface cross-campus name matches too: a P-Card / "(pcard)"
+                # contract is often filed under one campus (NKC) while the
+                # charge lands under another (WWK). The link's gid-pin attributes
+                # regardless of campus, so a cross-campus match is actionable —
+                # just flagged so the operator eyeballs it. Still name-anchored
+                # (all distinctive tokens in one description), so GL noise like
+                # Amazon/Lowes never surfaces.
+                nominated = ([(n, g, False) for n, g in confident]
+                             + [(n, g, True) for n, g in cross])
+                if nominated:
+                    hints[r["id"]] = [
+                        {"name": name, "gid": gid,
+                         "is_capex": gid in capex_gids, "cross": is_cross}
+                        for name, gid, is_cross in nominated
+                    ]
+
+        # Already-linked: pattern-bearing blank-vendor Learned Mappings, keyed
+        # to each visible group (Group Key) so the operator can see and undo a
+        # prior "Attribute to X". Independent of Asana — shows even offline.
+        linked: dict[int, list[dict]] = {}
+        lm_rows = g.conn.execute(
+            '''SELECT id, "Key", "Contract Name", "Description Pattern"
+               FROM "Learned Mappings"
+               WHERE COALESCE("Vendor", '') = ''
+                 AND COALESCE("Description Pattern", '') <> '' '''
+        ).fetchall()
+        by_key: dict[str, list] = {}
+        for lm in lm_rows:
+            by_key.setdefault((lm["Key"] or "").strip(), []).append(lm)
+        for r in rows:
+            gk = (r["Group Key"] or "").strip()
+            if gk in by_key:
+                linked[r["id"]] = [
+                    {"name": lm["Contract Name"],
+                     "pattern": lm["Description Pattern"],
+                     "lm_id": lm["id"]}
+                    for lm in by_key[gk]
+                ]
+
+        # Per-line-item picker. A blank-vendor group is a MIXED bucket — some
+        # line items are genuine employee P-card buys ("…, Name, MM/DD/YYYY"),
+        # some are contract spend missing its vendor ("Gallivan Snow Contract").
+        # The signature labels each bucket P-card vs contract; the operator
+        # links the contract ones to a SPECIFIC contract (handles the cases the
+        # auto name-matcher can't — verbose legal names, cross-campus). Contract
+        # line items (no signature) sort first.
+        from engine.ingest import has_cardholder_signature
+        link_buckets: dict[int, list[dict]] = {}   # contract line items only
+        pcard_counts: dict[int, int] = {}           # employee P-card items skipped
+        for r in rows:
+            try:
+                dd = _json.loads(r["Distinct Descriptions JSON"] or "[]")
+            except Exception:  # noqa: BLE001 — malformed JSON → fall back
+                dd = []
+            contract_items, pc = [], 0
+            for b in dd:
+                if isinstance(b, dict):
+                    desc, amt = b.get("description", ""), b.get("amount", 0)
+                elif isinstance(b, (list, tuple)) and b:
+                    desc, amt = b[0], (b[2] if len(b) > 2 else 0)
+                else:
+                    continue
+                if not str(desc).strip():
+                    continue
+                if has_cardholder_signature(desc):
+                    pc += 1                          # genuine P-card buy → Ignore
+                else:
+                    contract_items.append({"desc": desc, "amount": amt or 0})
+            if not contract_items and not dd and (r["Sample Record Description"] or "").strip():
+                d = r["Sample Record Description"]
+                (contract_items if not has_cardholder_signature(d)
+                 else []).append({"desc": d, "amount": r["$ in group"] or 0})
+            if contract_items:
+                contract_items.sort(key=lambda x: -abs(x["amount"]))
+                link_buckets[r["id"]] = contract_items
+                pcard_counts[r["id"]] = pc
+        link_contracts = _link_contract_options(g.conn) if link_buckets else []
         return render_template(
             "p_card_spend.html",
             rows=rows,
@@ -989,7 +1184,12 @@ def register_routes(app: Flask) -> None:
             open_count=open_count,
             ignored_count=ignored_count,
             visible_total=visible_total,
+            hidden_zero=hidden_zero,
             hints=hints,
+            linked=linked,
+            link_buckets=link_buckets,
+            pcard_counts=pcard_counts,
+            link_contracts=link_contracts,
             asana_error=asana_error,
         )
 
@@ -1022,6 +1222,116 @@ def register_routes(app: Flask) -> None:
         )
         flash("Restored to the active P-Card list.", "success")
         return redirect(url_for("p_card_spend", show="ignored"))
+
+    @app.route("/p-card-spend/<int:record_id>/attribute", methods=["POST"])
+    def p_card_spend_attribute(record_id: int):
+        """Operator confirms a blank-vendor P-Card group belongs to a live
+        contract whose name appears in the description (option A). Writes a
+        Description-Pattern Learned Mapping keyed on the group, with the
+        pattern = the contract's distinctive name tokens. Next ingest then
+        attributes matching rows to the contract through the SAME learned path
+        as every other operator pin; non-matching blank-vendor rows stay here.
+
+        Scope: opex contracts only. A CapEx target is joined by Project ID, so
+        its spend is linked by setting the CapEx ID in Asana, not here."""
+        nt = g.conn.execute(
+            'SELECT * FROM "Needs Tagging" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if nt is None:
+            abort(404)
+        chosen_gid = (request.form.get("gid") or "").strip()
+        if not chosen_gid:
+            abort(400)
+
+        # Validate the gid against the LIVE open-contract set. P-Card rows have
+        # no engine-curated candidate list (blank vendor → no fuzzy match), so
+        # the live pull IS the anti-tampering allowlist.
+        try:
+            from engine import asana_client, asana_contracts
+            contracts = asana_contracts.load_open_contracts(
+                asana_client.get_api_client()
+            )
+        except Exception as exc:  # noqa: BLE001
+            flash(f"Asana unreachable ({type(exc).__name__}) — couldn't verify the "
+                  f"contract. Try again.", "error")
+            return redirect(url_for("p_card_spend"))
+        target = next((c for c in contracts if c.gid == chosen_gid), None)
+        if target is None:
+            flash("That contract is no longer open in Asana.", "error")
+            return redirect(url_for("p_card_spend"))
+
+        from config import settings as _settings
+        if target.acc == _settings.CAPEX_ACCOUNT_NO or target.capex_id:
+            flash(f"“{target.name}” is a CapEx contract — link its spend by setting its "
+                  f"CapEx ID in Asana (account 63015 is joined by Project ID, not here).",
+                  "error")
+            return redirect(url_for("p_card_spend"))
+
+        # Pattern = the contract's DISTINCTIVE name tokens (name_match drops
+        # generic industry words like 'building'/'services'), then run through
+        # normalize_lm_pattern so the stored stem matches the attribution
+        # tokenizer. Empty → the name has nothing distinctive to match on;
+        # refuse rather than write a pattern that over-matches.
+        from engine.name_match import distinctive_tokens
+        toks = sorted(distinctive_tokens(target.name))
+        pattern = normalize_lm_pattern(" ".join(toks))
+        if not pattern:
+            flash(f"“{target.name}” has no distinctive words to match descriptions on, "
+                  f"so it can't be linked by description. (A per-row picker would be "
+                  f"option B.)", "error")
+            return redirect(url_for("p_card_spend"))
+
+        group_key = (nt["Group Key"] or "").strip()
+        campus = (nt["Campus"] or "").strip()
+        dept = (nt["Dept"] or "").strip()
+        account_no = (nt["Account No"] or "").strip()
+        from datetime import datetime, timezone
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        notes = (f"P-Card link via P-Card Spend on {today_iso}. Blank-vendor rows in "
+                 f"{group_key!r} whose description matches pattern {pattern!r} → "
+                 f"gid {chosen_gid} ({target.name}).")
+        # Upsert on (Key, Description Pattern) — re-linking the same contract is
+        # idempotent rather than duplicating.
+        existing = g.conn.execute(
+            '''SELECT id FROM "Learned Mappings"
+               WHERE "Key" = ? AND COALESCE("Description Pattern", '') = ?''',
+            (group_key, pattern),
+        ).fetchone()
+        if existing:
+            g.conn.execute(
+                '''UPDATE "Learned Mappings"
+                   SET "Campus" = ?, "Dept" = ?, "Account No" = ?, "Vendor" = '',
+                       "Contract Name" = ?, "Contract Gid" = ?,
+                       "Description Pattern" = ?, "Learned At" = ?, "Notes" = ?
+                   WHERE id = ?''',
+                (campus, dept, account_no, target.name, chosen_gid, pattern,
+                 today_iso, notes, existing["id"]),
+            )
+        else:
+            g.conn.execute(
+                '''INSERT INTO "Learned Mappings"
+                     ("Key", "Campus", "Dept", "Account No", "Vendor",
+                      "Contract Name", "Contract Gid", "Description Pattern",
+                      "Learned At", "Notes")
+                   VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?)''',
+                (group_key, campus, dept, account_no, target.name, chosen_gid,
+                 pattern, today_iso, notes),
+            )
+        g.conn.commit()
+        flash(f"Linked → {target.name}. Next ingest attributes blank-vendor rows in "
+              f"{campus}/{dept}/{account_no} whose description names “{' '.join(toks)}” "
+              f"to this contract (in-term rows only). Undo from the “linked” note below.",
+              "success")
+        return redirect(url_for("p_card_spend"))
+
+    @app.route("/p-card-spend/unlink/<int:lm_id>", methods=["POST"])
+    def p_card_spend_unlink(lm_id: int):
+        """Remove a P-Card link (delete its Description-Pattern Learned
+        Mapping). Next ingest stops attributing those rows; they return here."""
+        sqlite_client.delete_learned_mapping(g.conn, record_id=lm_id)
+        flash("P-Card link removed. Matching rows return to this tab on the next ingest.",
+              "success")
+        return redirect(url_for("p_card_spend"))
 
     @app.route("/needs-tagging/<int:record_id>/unmark-conflict-other",
                methods=["POST"])

@@ -1817,7 +1817,7 @@ def test_p_card_classified_on_upsert_when_vendor_blank(conn):
     rec_pcard = upsert_needs_tagging_group(
         conn, group_key="CEN|000|63040|", campus="CEN", dept="000",
         account_no="63040", vendor="",
-        sample_description="Parking lot reflective markers, GRAINGER, Hunter",
+        sample_description="Parking lot reflective markers, GRAINGER, Hunter, Tami, 01/03/2025",
         amount=120.0, candidate_names=[],
         created_at_iso_date="2026-06-12",
     )
@@ -1835,7 +1835,7 @@ def test_p_card_rows_excluded_from_needs_tagging_open(client, conn):
     """P-card rows must NOT appear in /needs-tagging — they live on /p-card-spend."""
     _seed_needs_tagging(
         conn, group_key="CEN|000|63040|", vendor="",
-        sample_description="P-CARD ONLY DESC, GRAINGER, Hunter",
+        sample_description="P-CARD ONLY DESC, GRAINGER, Hunter, Tami, 01/03/2025",
     )
     _seed_needs_tagging(
         conn, group_key="STO|000|63090|The Stewards Company",
@@ -1856,7 +1856,7 @@ def test_p_card_rows_excluded_from_vendor_conflicts(client, conn):
                         asana_task_gid="g_b", campus_set="CEN")
     _seed_needs_tagging(
         conn, group_key="CEN|000|63040|", vendor="",
-        sample_description="P-CARD CONFLICT DESC, AMAZON, Davis",
+        sample_description="P-CARD CONFLICT DESC, AMAZON, Davis, Jesse, 01/03/2025",
         candidate_names=["Foo Co", "Foo Co"],
         candidate_gids=["g_a", "g_b"],
     )
@@ -1867,12 +1867,12 @@ def test_p_card_rows_excluded_from_vendor_conflicts(client, conn):
 def test_p_card_spend_lists_p_card_rows_with_totals(client, conn):
     _seed_needs_tagging(
         conn, group_key="CEN|000|63040|", vendor="",
-        sample_description="Reflective markers, GRAINGER, Hunter",
+        sample_description="Reflective markers, GRAINGER, Hunter, Tami, 01/03/2025",
         amount=120.50,
     )
     _seed_needs_tagging(
         conn, group_key="STO|000|63090|", vendor="",
-        sample_description="Office monitor, AMAZON, Davis",
+        sample_description="Office monitor, AMAZON, Davis, Jesse, 01/03/2025",
         amount=350.00,
     )
     body = client.get("/p-card-spend").get_data(as_text=True)
@@ -1885,7 +1885,7 @@ def test_p_card_spend_lists_p_card_rows_with_totals(client, conn):
 def test_p_card_spend_ignore_once_hides_row_and_shows_in_ignored_tab(client, conn):
     rec_id = _seed_needs_tagging(
         conn, group_key="CEN|000|63040|", vendor="",
-        sample_description="Reflective markers, GRAINGER, Hunter",
+        sample_description="Reflective markers, GRAINGER, Hunter, Tami, 01/03/2025",
     )
     # Initially on Open.
     open_body = client.get("/p-card-spend?show=open").get_data(as_text=True)
@@ -1905,7 +1905,7 @@ def test_p_card_spend_ignore_once_hides_row_and_shows_in_ignored_tab(client, con
 def test_p_card_spend_restore_brings_row_back_to_open(client, conn):
     rec_id = _seed_needs_tagging(
         conn, group_key="CEN|000|63040|", vendor="",
-        sample_description="Office monitor, AMAZON, Davis",
+        sample_description="Office monitor, AMAZON, Davis, Jesse, 01/03/2025",
     )
     sqlite_client.set_needs_tagging_p_card_ignored(
         conn, record_id=rec_id, p_card_ignored=True,

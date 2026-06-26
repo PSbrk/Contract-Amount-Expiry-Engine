@@ -36,6 +36,11 @@ _GENERIC: frozenset[str] = frozenset({
 })
 
 _WORD = re.compile(r"[^a-z0-9 ]")
+# Operator tags appended in parentheses — "(pcard)", "(renewal)", "(2024)".
+# They're not part of the vendor name and a description never repeats them, so
+# left in they become a required token that blocks every match (the "(pcard)"
+# contracts — the very ones built for blank-vendor linking — all failed).
+_PAREN = re.compile(r"\([^)]*\)")
 
 
 def _tokenize(text: str) -> list[str]:
@@ -44,8 +49,10 @@ def _tokenize(text: str) -> list[str]:
 
 def distinctive_tokens(name: str) -> set[str]:
     """The meaningful, distinguishing tokens of a contract name: length >= 3 and
-    not a generic industry word. Empty when a name is only generic words."""
-    return {t for t in _tokenize(name) if len(t) >= 3 and t not in _GENERIC}
+    not a generic industry word. Parenthetical operator tags ('(pcard)') are
+    stripped first. Empty when a name is only generic words."""
+    return {t for t in _tokenize(_PAREN.sub(" ", name or ""))
+            if len(t) >= 3 and t not in _GENERIC}
 
 
 def name_in_description(name_tokens: set[str], description: str) -> bool:

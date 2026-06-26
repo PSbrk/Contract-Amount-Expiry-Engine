@@ -539,6 +539,40 @@ def load_learned_mappings(
     return out
 
 
+def load_pcard_links(conn: sqlite3.Connection) -> list[dict]:
+    """Return the operator's P-Card links: blank-vendor, pattern-bearing
+    Learned Mappings written by the P-Card Spend "Attribute to X" action.
+
+    Each is {campus, dept, account_no, gid, name, pattern}. They drive a
+    pre-attribution vendor stamp (engine.attribution.stamp_pcard_links): a
+    blank-vendor row whose description matches the pattern gets the contract's
+    vendor name stamped on, so it splits into its own clean vendor group and
+    attributes normally — instead of poisoning the whole blank-vendor group to
+    'ambiguous'. Stored on the Learned Mappings table (reuses its columns); the
+    blank Vendor + present Description Pattern is what distinguishes them."""
+    out: list[dict] = []
+    for row in conn.execute(
+        '''SELECT "Campus", "Dept", "Account No", "Contract Name",
+                  "Contract Gid", "Description Pattern"
+           FROM "Learned Mappings"
+           WHERE COALESCE("Vendor", '') = ''
+             AND COALESCE("Description Pattern", '') <> '' '''
+    ):
+        name = (row["Contract Name"] or "").strip()
+        pattern = (row["Description Pattern"] or "").strip()
+        campus = (row["Campus"] or "").strip()
+        dept = (row["Dept"] or "").strip()
+        account_no = (row["Account No"] or "").strip()
+        if not (name and pattern and campus and dept and account_no):
+            continue
+        out.append({
+            "campus": campus, "dept": dept, "account_no": account_no,
+            "gid": (row["Contract Gid"] or "").strip() or None,
+            "name": name, "pattern": pattern,
+        })
+    return out
+
+
 def load_capex_budgets(conn: sqlite3.Connection) -> dict[str, float]:
     """Return {normalized CapEx ID: budget} from the CapEx Budgets table.
 
