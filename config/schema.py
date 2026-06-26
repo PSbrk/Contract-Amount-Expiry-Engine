@@ -476,6 +476,31 @@ TABLES_SCHEMA: Final = [
         ],
     },
     {
+        "name": "Unlinked CapEx",
+        "description": (
+            "One row per CapEx project (Project ID) the LAST ingest found "
+            "Tableau spend for but NO live Asana contract carries that CapEx ID "
+            "(engine.capex spend_no_contract). Enriched with campuses + the "
+            "distinct Record Descriptions so the /unlinked-capex surface can name "
+            "the likely owner (the vendor is often blank but named in the "
+            "description). Rewritten wholesale on every --ingest (a snapshot, "
+            "not an audit log). Advisory only — the operator sets the CapEx ID "
+            "on the matched contract in Asana; the engine never writes here."
+        ),
+        "fields": [
+            {"name": "CapEx ID", "type": "singleLineText",
+             "description": "Normalized Project ID with parked spend and no live contract."},
+            {"name": "Spend", "type": "number", "options": {"precision": 2},
+             "description": "Total Tableau spend for this project (cumulative, no term window)."},
+            {"name": "Campuses", "type": "singleLineText",
+             "description": "Comma-joined campuses the project's charges hit."},
+            {"name": "Descriptions", "type": "multilineText",
+             "description": "Distinct Record Descriptions (newline-joined) — the name-match haystack + operator display."},
+            {"name": "Rows", "type": "number", "options": {"precision": 0}},
+            {"name": "Last Updated", "type": "date"},
+        ],
+    },
+    {
         "name": "Run Log",
         "description": (
             "One row per engine run. Rolling-window pruned to "

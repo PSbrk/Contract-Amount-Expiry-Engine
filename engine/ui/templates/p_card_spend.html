@@ -19,6 +19,9 @@
       list (restorable from the Ignored tab).
     </small>
   </p>
+  {% if asana_error %}
+  <p><small class="alarm-on">⚠ Asana unreachable ({{ asana_error }}) — contract-name hints unavailable.</small></p>
+  {% endif %}
   <nav>
     <ul>
       <li><a href="{{ url_for('p_card_spend', show='open') }}"
@@ -64,7 +67,13 @@
           {% endif %}
         </small>
       </td>
-      <td><small>{{ (r["Sample Record Description"] or "")[:160] }}</small></td>
+      <td>
+        <small>{{ (r["Sample Record Description"] or "")[:160] }}</small>
+        {% if hints.get(r["id"]) %}
+        <br><small><span class="pill">⚲ names a contract</span>
+          <strong>{{ hints[r["id"]]|join(", ") }}</strong> — blank vendor, verify &amp; recode at source if it's really them</small>
+        {% endif %}
+      </td>
       <td>
         {% if ignored %}
           <form method="post"

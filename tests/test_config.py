@@ -69,18 +69,19 @@ def test_expected_read_fields_have_status_and_expire_options():
 
 
 def test_engine_table_names_in_schema():
-    """The 12-table contract: Inbox, Dashboard, Needs Tagging, Vendor Aliases,
+    """The 13-table contract: Inbox, Dashboard, Needs Tagging, Vendor Aliases,
     Campus Map, CapEx Budgets, Learned Mappings, Resolved Contracts,
-    Attributed Lines, Amendment Links, State, Run Log. Pinned in config.schema
-    so a rename or deletion fails CI rather than silently breaking the UI."""
+    Attributed Lines, Unlinked CapEx, Amendment Links, State, Run Log. Pinned in
+    config.schema so a rename or deletion fails CI rather than silently breaking
+    the UI."""
     from config import schema
     expected = {
         "Inbox", "Dashboard", "Needs Tagging", "Vendor Aliases",
         "Campus Map", "CapEx Budgets", "Learned Mappings", "Resolved Contracts",
-        "Attributed Lines", "Amendment Links", "State", "Run Log",
+        "Attributed Lines", "Unlinked CapEx", "Amendment Links", "State", "Run Log",
     }
     assert set(schema.TABLE_NAMES) == expected
-    assert len(schema.TABLE_NAMES) == 12  # no duplicates
+    assert len(schema.TABLE_NAMES) == 13  # no duplicates
 
 
 def test_write_gate_section_is_active_compliant():

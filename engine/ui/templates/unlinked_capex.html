@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Unlinked CapEx — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>Unlinked CapEx spend</h2>
+  <p>
+    <small>
+      CapEx (63015) projects with Tableau spend but <strong>no live contract
+      carrying that CapEx ID</strong>. The vendor field is often blank, so the
+      engine reads the <strong>Record Description</strong> to name the likely
+      owner. <strong>Advisory only</strong>: set the matched contract's
+      <em>CapEx ID</em> to the Project ID in Asana — the next ingest then
+      attributes the project to it automatically. A project drops off this list
+      as soon as a live contract carries its ID.
+    </small>
+  </p>
+  {% if asana_error %}
+  <p><small class="alarm-on">⚠ Asana unreachable ({{ asana_error }}) — showing parked spend without live name-matching.</small></p>
+  {% endif %}
+  {% if resolved %}
+  <p><small>{{ resolved }} project(s) hidden — a live contract now carries the CapEx ID (resolved since last ingest).</small></p>
+  {% endif %}
+</header>
+
+<h3>Suggested links ({{ suggested|length }})</h3>
+{% if suggested %}
+<figure>
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Project</th>
+      <th class="num">Spend</th>
+      <th>Description(s)</th>
+      <th style="min-width: 20rem;">Likely owner — set its CapEx ID in Asana</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for item in suggested %}
+    {% set r = item.row %}
+    <tr>
+      <td>
+        <strong>{{ r["CapEx ID"] }}</strong><br>
+        <small>{{ item.campuses|join(", ") or "—" }} &middot; {{ r["Rows"] or 0 }} row(s)</small>
+      </td>
+      <td class="num">${{ "{:,.2f}".format(r["Spend"] or 0) }}</td>
+      <td><small style="color: var(--pico-muted-color);">{{ (r["Descriptions"] or "").replace("\n", " | ")[:160] }}</small></td>
+      <td>
+        {% for name, gid in item.confident %}
+          <div><span class="pill">campus match</span>
+            <strong>{{ name }}</strong>
+            <br><small>→ set CapEx ID <code>{{ r["CapEx ID"] }}</code> on this contract</small>
+          </div>
+        {% endfor %}
+        {% for name, gid in item.cross %}
+          <div><span class="pill alarm-off">different campus</span>
+            {{ name }}
+            <br><small>→ verify, then set CapEx ID <code>{{ r["CapEx ID"] }}</code> if it's the owner</small>
+          </div>
+        {% endfor %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% else %}
+  <p>No parked CapEx projects matched a live contract by name.</p>
+{% endif %}
+
+<details>
+  <summary><strong>Other parked CapEx spend ({{ other|length }})</strong> — no name match, eyeball manually</summary>
+  {% if other %}
+  <figure>
+  <table role="grid">
+    <thead>
+      <tr><th>Project</th><th>Campus</th><th class="num">Spend</th><th>Description(s)</th></tr>
+    </thead>
+    <tbody>
+    {% for item in other %}
+      {% set r = item.row %}
+      <tr>
+        <td><strong>{{ r["CapEx ID"] }}</strong><br><small>{{ r["Rows"] or 0 }} row(s)</small></td>
+        <td><small>{{ item.campuses|join(", ") or "—" }}</small></td>
+        <td class="num">${{ "{:,.2f}".format(r["Spend"] or 0) }}</td>
+        <td><small style="color: var(--pico-muted-color);">{{ (r["Descriptions"] or "").replace("\n", " | ")[:160] }}</small></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </figure>
+  {% else %}
+    <p>None.</p>
+  {% endif %}
+</details>
+{% endblock %}

@@ -950,6 +950,38 @@ def register_routes(app: Flask) -> None:
                  AND COALESCE("P-Card Ignored", 0) = 1'''
         ).fetchone()[0]
         visible_total = sum((r["$ in group"] or 0) for r in rows)
+
+        # Spotting hint: a blank-vendor P-card group whose DESCRIPTION names a
+        # live contract (the vendor field is empty but the vendor is in the free
+        # text). Confident only — name + campus — because cross-campus matching
+        # on P-card/GL noise (Amazon, rentals) is too false-positive-prone.
+        # Live Asana pull, resilient (like /capex-budgets, /unlinked-capex).
+        import json as _json
+        from engine.name_match import match_unlinked
+        pool: list[tuple[str, str, set[str]]] = []
+        asana_error = None
+        try:
+            from engine import asana_client, asana_contracts
+            contracts = asana_contracts.load_open_contracts(
+                asana_client.get_api_client()
+            )
+            pool = [(c.name, c.gid, set(c.campus_options)) for c in contracts if c.name]
+        except Exception as exc:  # noqa: BLE001 — UI stays usable offline
+            asana_error = f"{type(exc).__name__}: {exc}"
+        hints: dict[int, list[str]] = {}
+        if pool:
+            for r in rows:
+                try:
+                    dd = _json.loads(r["Distinct Descriptions JSON"] or "[]")
+                    descs = [d.get("description", "") for d in dd]
+                except Exception:  # noqa: BLE001 — malformed JSON → fall back
+                    descs = []
+                if not descs:
+                    descs = [r["Sample Record Description"] or ""]
+                campus = {(r["Campus"] or "").strip()} - {""}
+                confident, _ = match_unlinked(descs, campus, pool)
+                if confident:
+                    hints[r["id"]] = [name for name, _gid in confident]
         return render_template(
             "p_card_spend.html",
             rows=rows,
@@ -957,6 +989,8 @@ def register_routes(app: Flask) -> None:
             open_count=open_count,
             ignored_count=ignored_count,
             visible_total=visible_total,
+            hints=hints,
+            asana_error=asana_error,
         )
 
     @app.route("/p-card-spend/<int:record_id>/ignore-once", methods=["POST"])
@@ -1549,6 +1583,67 @@ def register_routes(app: Flask) -> None:
             budget_rows=budget_rows,
             live_counts=live_counts,
             asana_error=asana_error,
+        )
+
+    # ------------------------------------------------------------------
+    # /unlinked-capex — parked CapEx spend (Project ID, no contract carries
+    # that CapEx ID) with the likely owner inferred from the description.
+    # Advisory: the operator sets the CapEx ID on the matched contract in Asana.
+    # ------------------------------------------------------------------
+    @app.route("/unlinked-capex")
+    def unlinked_capex():
+        from engine.name_match import match_unlinked
+
+        rows = sqlite_client.load_unlinked_capex(g.conn)
+
+        # Live Asana pull (like /capex-budgets): the match pool + which CapEx IDs
+        # are NOW carried by a live contract. Resilient if Asana is unreachable.
+        match_pool: list[tuple[str, str, set[str]]] = []
+        carried_ids: set[str] = set()
+        asana_error = None
+        try:
+            from engine import asana_client, asana_contracts
+            from engine.capex import _capex_live
+            contracts = asana_contracts.load_open_contracts(
+                asana_client.get_api_client()
+            )
+            for c in contracts:
+                if c.name:
+                    match_pool.append((c.name, c.gid, set(c.campus_options)))
+                if c.capex_id and _capex_live(c):
+                    carried_ids.add(c.capex_id)
+        except Exception as exc:  # noqa: BLE001 — UI stays usable offline
+            asana_error = f"{type(exc).__name__}: {exc}"
+
+        suggested, other, resolved = [], [], 0
+        for r in rows:
+            cid = (r["CapEx ID"] or "").strip()
+            if cid in carried_ids:
+                # A live contract now carries this CapEx ID — resolved since the
+                # last ingest. Hide it (self-clears without a re-ingest).
+                resolved += 1
+                continue
+            descs = [d for d in (r["Descriptions"] or "").split("\n") if d.strip()]
+            campuses = {c for c in (r["Campuses"] or "").split(",") if c.strip()}
+            confident, cross = (
+                match_unlinked(descs, campuses, match_pool) if match_pool else ([], [])
+            )
+            item = {
+                "row": r,
+                "campuses": sorted(campuses),
+                "confident": confident,
+                "cross": cross,
+            }
+            (suggested if (confident or cross) else other).append(item)
+
+        # Confident-bearing first, then by spend.
+        suggested.sort(key=lambda i: (0 if i["confident"] else 1,
+                                      -(i["row"]["Spend"] or 0)))
+        other.sort(key=lambda i: -(i["row"]["Spend"] or 0))
+        return render_template(
+            "unlinked_capex.html",
+            suggested=suggested, other=other,
+            resolved=resolved, asana_error=asana_error,
         )
 
     @app.route("/capex-budgets/bulk", methods=["POST"])

@@ -945,6 +945,7 @@ def _run_attribution_and_needs_tagging(
         load_amendment_links,
         load_capex_budgets,
         replace_attributed_lines,
+        replace_unlinked_capex,
         upsert_dashboard_row,
     )
     today_date = datetime.now(timezone.utc).date()
@@ -968,6 +969,16 @@ def _run_attribution_and_needs_tagging(
     budgets = load_capex_budgets(conn)
     capex_run = capex_mod.compute_capex(kept_df, contracts, budgets, today_date)
     capex_rows = list(capex_run.rows)
+
+    # Persist parked CapEx projects (spend, no live contract) enriched with
+    # campuses + descriptions for the /unlinked-capex spotting surface. Snapshot,
+    # rewritten wholesale each ingest. Advisory only — no attribution here.
+    _parked_ids = {cid for cid, _ in capex_run.spend_no_contract}
+    _unlinked = capex_mod.summarize_unlinked(kept_df, _parked_ids, capex_account)
+    for _u in _unlinked:
+        _u["updated"] = today_date.isoformat()
+    print(f"  persisted {replace_unlinked_capex(conn, _unlinked)} "
+          f"unlinked CapEx project(s) for the spotting surface.")
 
     dashboard_rows = opex_rows + capex_rows
     alarms_count = sum(1 for r in dashboard_rows if r.alarms == "ALARM")

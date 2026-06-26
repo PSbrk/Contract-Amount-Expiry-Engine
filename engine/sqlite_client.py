@@ -1557,6 +1557,31 @@ def load_attributed_lines(
     ).fetchall()
 
 
+def replace_unlinked_capex(conn: sqlite3.Connection, rows: list[dict]) -> int:
+    """Wholesale-replace the Unlinked CapEx table with this ingest's parked
+    projects (engine.capex.summarize_unlinked output). A snapshot, not an audit
+    log. Each dict: capex_id, spend, campuses, descriptions, rows, updated."""
+    conn.execute('DELETE FROM "Unlinked CapEx"')
+    if rows:
+        conn.executemany(
+            '''INSERT INTO "Unlinked CapEx"
+                 ("CapEx ID", "Spend", "Campuses", "Descriptions",
+                  "Rows", "Last Updated")
+               VALUES (:capex_id, :spend, :campuses, :descriptions,
+                       :rows, :updated)''',
+            rows,
+        )
+    conn.commit()
+    return len(rows)
+
+
+def load_unlinked_capex(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Parked CapEx projects from the last ingest, biggest spend first."""
+    return conn.execute(
+        'SELECT * FROM "Unlinked CapEx" ORDER BY COALESCE("Spend", 0) DESC'
+    ).fetchall()
+
+
 # ---------------------------------------------------------------------------
 # State table I/O
 # ---------------------------------------------------------------------------

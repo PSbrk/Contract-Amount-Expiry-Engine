@@ -222,10 +222,48 @@ def capex_lines(
     return lines
 
 
+def summarize_unlinked(
+    in_scope_df: pd.DataFrame,
+    parked_capex_ids: set[str],
+    capex_account: str,
+) -> list[dict]:
+    """Enrich each parked CapEx project (spend, no live contract) for the
+    Unlinked-CapEx spotting surface: total spend, campuses, distinct Record
+    Descriptions, row count. The descriptions are the haystack the name-matcher
+    later searches at request time (the vendor field is often blank but the
+    vendor is named in the description). Returns a list of dicts ready to persist.
+    """
+    if not parked_capex_ids:
+        return []
+    cap = in_scope_df[in_scope_df["Account No"] == capex_account].copy()
+    if cap.empty:
+        return []
+    cap["_cid"] = cap["Project ID"].map(normalize_capex_id)
+    cap = cap[cap["_cid"].isin(parked_capex_ids)]
+    out: list[dict] = []
+    for cid, grp in cap.groupby("_cid"):
+        descs = sorted({
+            str(d).strip() for d in grp["Record Description"].dropna()
+            if str(d).strip()
+        })
+        campuses = sorted({
+            str(c).strip() for c in grp["Campus"].dropna() if str(c).strip()
+        })
+        out.append({
+            "capex_id": cid,
+            "spend": round(float(grp["Amount"].sum()), 2),
+            "campuses": ",".join(campuses),
+            "descriptions": "\n".join(descs),
+            "rows": int(len(grp)),
+        })
+    return out
+
+
 __all__ = [
     "CapExRun",
     "compute_capex",
     "capex_lines",
+    "summarize_unlinked",
 ]
 
 
