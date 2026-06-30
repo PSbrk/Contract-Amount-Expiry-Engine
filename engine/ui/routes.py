@@ -1975,8 +1975,12 @@ def register_routes(app: Flask) -> None:
             'SELECT "Asana Task GID" gid, Contract n, "Campus Set" camp '
             'FROM "Dashboard"'
         ):
-            toks = set(re.findall(r"[A-Z]{2,4}", (r["camp"] or "").upper()))
-            dash[r["gid"]] = {"name": r["n"], "camp": r["camp"] or "", "toks": toks}
+            camp = r["camp"] or ""
+            # "All Campuses" is the Asana wildcard — it serves EVERY campus, so
+            # token-matching its name ({ALL,CAMP,USES}) would wrongly miss it.
+            wild = "all campus" in camp.lower()
+            toks = set(re.findall(r"[A-Z]{2,4}", camp.upper()))
+            dash[r["gid"]] = {"name": r["n"], "camp": camp, "toks": toks, "wild": wild}
 
         items, total = [], 0.0
         for r in g.conn.execute(
@@ -1985,14 +1989,19 @@ def register_routes(app: Flask) -> None:
             gids = gid_re.findall(r["Engine Candidate Gids"] or "")
             if not gids:
                 continue  # no same-vendor contract anywhere — that's "genuinely empty", not no-home
-            gcamp = (r["Group Key"] or "|").split("|")[0]
+            gcamp = (r["Group Key"] or "|").split("|")[0].strip().upper()
             live = [(gx, dash[gx]) for gx in gids if gx in dash]
-            if any(gcamp in d["toks"] for _, d in live):
+            if any(d["wild"] or gcamp in d["toks"] for _, d in live):
                 continue  # a live contract serves this campus — has a home
             try:
                 descs = json.loads(r["Distinct Descriptions JSON"] or "[]")
             except Exception:
                 descs = []
+            # Guard the SHAPE, not just parse errors: a JSON null/object/list-of-
+            # non-dicts would otherwise crash sorted()/d.get() and 500 the tab.
+            if not isinstance(descs, list):
+                descs = []
+            descs = [d for d in descs if isinstance(d, dict)]
             sample = sorted(descs, key=lambda d: -(d.get("amount") or 0))[:4]
             amt = r["$ in group"] or 0
             total += amt

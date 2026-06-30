@@ -2244,3 +2244,53 @@ def test_date_intervals_overlap_blank_due_is_not_universally_compatible():
     assert _date_intervals_overlap("2026-09-30", "", "2026-12-01", "2026-12-15") is True
     # Unknown bucket dates -> can't judge -> compatible (text-only fallback).
     assert _date_intervals_overlap("2026-01-01", "2026-12-31", "", "") is True
+
+
+# ---------------------------------------------------------------------------
+# /no-home — campus-mismatched spend review surface
+# ---------------------------------------------------------------------------
+
+def _insert_raw_nt(conn, *, group_key, vendor, candidate_gids, descs_json,
+                   amount=1000.0):
+    """Insert a Needs Tagging row with exact control over the columns the
+    /no-home route reads (candidate gids + distinct-descriptions JSON)."""
+    conn.execute(
+        'INSERT INTO "Needs Tagging" '
+        '("Group Key", Campus, Vendor, "$ in group", "First Date", "Last Date", '
+        ' "Engine Candidate Gids", "Distinct Descriptions JSON", Dismissed) '
+        'VALUES (?,?,?,?,?,?,?,?,0)',
+        (group_key, group_key.split("|")[0], vendor, amount, "2025-01-01",
+         "2026-01-01", " ".join(candidate_gids), descs_json),
+    )
+    conn.commit()
+
+
+def test_no_home_classifies_wildcard_and_survives_bad_json(client, conn):
+    """/no-home: a real campus-mismatch is listed; an All-Campuses (wildcard)
+    candidate counts as a home (suppressed); and a malformed Distinct
+    Descriptions JSON does NOT crash the tab (shape guard, not just parse)."""
+    _seed_dashboard_row(conn, contract_name="Chiller OKC",
+                        asana_task_gid="100000000000001", campus_set="OKC")
+    _seed_dashboard_row(conn, contract_name="BELFOR",
+                        asana_task_gid="100000000000002",
+                        campus_set="All Campuses")
+
+    # A: TUL spend, only an OKC same-vendor contract exists -> NO-HOME (listed)
+    _insert_raw_nt(conn, group_key="TUL|000|63040|Chiller",
+                   vendor="Chiller", candidate_gids=["100000000000001"],
+                   descs_json='[{"amount": 500, "description": "hvac repair"}]')
+    # B: TUL spend whose candidate is the All-Campuses contract -> HAS HOME (hidden)
+    _insert_raw_nt(conn, group_key="TUL|000|63040|Belfor",
+                   vendor="Belfor", candidate_gids=["100000000000002"],
+                   descs_json='[{"amount": 700, "description": "water damage"}]')
+    # C: malformed JSON (literal null) must not 500 the page; still NO-HOME (listed)
+    _insert_raw_nt(conn, group_key="MWC|000|63040|Chiller",
+                   vendor="ChillerMWC", candidate_gids=["100000000000001"],
+                   descs_json='null')
+
+    resp = client.get("/no-home")
+    assert resp.status_code == 200          # shape guard held on the 'null' row
+    body = resp.get_data(as_text=True)
+    assert "TUL|000|63040|Chiller" in body  # A listed
+    assert "MWC|000|63040|Chiller" in body  # C listed (no crash)
+    assert "Belfor" not in body             # B suppressed by All-Campuses wildcard
