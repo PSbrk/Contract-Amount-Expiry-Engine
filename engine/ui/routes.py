@@ -1956,6 +1956,58 @@ def register_routes(app: Flask) -> None:
             resolved=resolved, asana_error=asana_error,
         )
 
+    @app.route("/no-home")
+    def no_home():
+        # Review surface (read-only): vendor spend coded to a campus that has
+        # NO live contract for that vendor. The engine found same-vendor
+        # contract(s) in OTHER campuses but none serving this campus, so it
+        # correctly parks the spend at $0 rather than guess across campuses.
+        # Each row is either a missing Asana contract or campus-miscoded spend
+        # — resolve at the source, not here. Derived live from Needs Tagging +
+        # Dashboard so it never goes stale (no extra table to maintain).
+        import json
+        import re
+
+        gid_re = re.compile(r"\d{15,}")
+        # live contracts -> campus tokens (Campus Set may be "BAO, TUL" etc.)
+        dash: dict[str, dict] = {}
+        for r in g.conn.execute(
+            'SELECT "Asana Task GID" gid, Contract n, "Campus Set" camp '
+            'FROM "Dashboard"'
+        ):
+            toks = set(re.findall(r"[A-Z]{2,4}", (r["camp"] or "").upper()))
+            dash[r["gid"]] = {"name": r["n"], "camp": r["camp"] or "", "toks": toks}
+
+        items, total = [], 0.0
+        for r in g.conn.execute(
+            'SELECT * FROM "Needs Tagging" WHERE COALESCE(Dismissed,0)=0'
+        ):
+            gids = gid_re.findall(r["Engine Candidate Gids"] or "")
+            if not gids:
+                continue  # no same-vendor contract anywhere — that's "genuinely empty", not no-home
+            gcamp = (r["Group Key"] or "|").split("|")[0]
+            live = [(gx, dash[gx]) for gx in gids if gx in dash]
+            if any(gcamp in d["toks"] for _, d in live):
+                continue  # a live contract serves this campus — has a home
+            try:
+                descs = json.loads(r["Distinct Descriptions JSON"] or "[]")
+            except Exception:
+                descs = []
+            sample = sorted(descs, key=lambda d: -(d.get("amount") or 0))[:4]
+            amt = r["$ in group"] or 0
+            total += amt
+            items.append({
+                "key": r["Group Key"], "campus": gcamp, "vendor": r["Vendor"],
+                "amount": amt, "first": r["First Date"], "last": r["Last Date"],
+                "live": [{"name": d["name"], "camp": d["camp"]} for _, d in live],
+                "offdash": len(gids) - len(live),
+                "sample": [{"amount": s.get("amount") or 0,
+                            "desc": (s.get("desc") or s.get("description") or "")}
+                           for s in sample],
+            })
+        items.sort(key=lambda i: -i["amount"])
+        return render_template("no_home.html", items=items, total=total)
+
     @app.route("/capex-budgets/bulk", methods=["POST"])
     def capex_budgets_bulk():
         from datetime import datetime, timezone

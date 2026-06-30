@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}No-Home Spend — Contract Engine{% endblock %}
+{% block content %}
+<header>
+  <h2>No-home spend <small>({{ items|length }} group(s) &middot; ${{ "{:,.0f}".format(total) }})</small></h2>
+  <p>
+    <small>
+      Vendor spend coded to a <strong>campus that has no live contract for that
+      vendor</strong>. The engine found same-vendor contract(s) in <em>other</em>
+      campuses but none serving this campus, so it correctly leaves the spend
+      <strong>unattributed ($0)</strong> rather than guess across campuses. Each
+      row is either a <strong>missing Asana contract</strong> for that campus, or
+      spend <strong>miscoded to the wrong campus</strong>. <strong>Resolve at the
+      source</strong> (Asana / Tableau coding) — this tab is a review surface so
+      the spend stays visible instead of sitting silently at $0.
+    </small>
+  </p>
+</header>
+
+{% if items %}
+<figure>
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Campus &middot; Vendor</th>
+      <th class="num">Parked $</th>
+      <th>Dates</th>
+      <th style="min-width: 16rem;">Same-vendor contracts that DO exist (wrong campus)</th>
+      <th>Sample descriptions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for it in items %}
+    <tr>
+      <td>
+        <strong>{{ it.campus }}</strong> &middot; {{ it.vendor }}<br>
+        <small style="color: var(--pico-muted-color);">{{ it.key }}</small>
+      </td>
+      <td class="num">${{ "{:,.2f}".format(it.amount) }}</td>
+      <td><small>{{ it.first }}<br>&rarr; {{ it.last }}</small></td>
+      <td><small>
+        {% for c in it.live %}
+          <span class="pill alarm-off">{{ c.camp or "?" }}</span> {{ c.name }}<br>
+        {% endfor %}
+        {% if it.offdash %}<em>+{{ it.offdash }} not on live dashboard</em><br>{% endif %}
+        {% if not it.live %}<em>none live</em>{% endif %}
+      </small></td>
+      <td><small style="color: var(--pico-muted-color);">
+        {% for s in it.sample %}
+          ${{ "{:,.0f}".format(s.amount) }} — {{ s.desc[:48] }}<br>
+        {% endfor %}
+      </small></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</figure>
+{% else %}
+  <p>No no-home spend — every parked vendor group has a live contract for its campus. 🎉</p>
+{% endif %}
+{% endblock %}
