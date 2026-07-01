@@ -42,6 +42,13 @@ function Get-PendingCount {
         Where-Object { $Allowed -contains $_.Extension.ToLower() }).Count
 }
 
+# Watchdog ceiling for a single ingest. A stalled Asana pull can otherwise block
+# this synchronous call forever, and a hang (unlike a crash) never trips Task
+# Scheduler's restart -- so one stall would silently disable all auto-ingest. On
+# timeout we kill the run; the next event or the 60s re-check retries.
+# ponytail: bump this if a legitimate ingest ever genuinely needs longer.
+$IngestTimeoutMs = 600000   # 10 min
+
 function Invoke-Drain {
     # Ingest processes the OLDEST file per run and moves it out of inbox on
     # success. Loop until the folder stops shrinking: empty (done) or a run
@@ -52,7 +59,14 @@ function Invoke-Drain {
         $before = Get-PendingCount
         if ($before -eq 0) { return }
         Write-WatcherLog "ingest: $before file(s) pending -> running"
-        & $Bat | Out-Null
+        # Run under a watchdog so a stalled run can't block the watcher forever.
+        # Start-Process + bounded WaitForExit; run-ingest.bat writes its own log.
+        $p = Start-Process -FilePath $Bat -PassThru -WindowStyle Hidden
+        if (-not $p.WaitForExit($IngestTimeoutMs)) {
+            Write-WatcherLog "ingest EXCEEDED $([int]($IngestTimeoutMs/1000))s (stalled) -> killing pid $($p.Id) + children; will retry on next event/re-check"
+            & taskkill /PID $p.Id /T /F 2>&1 | Out-Null
+            return
+        }
         if ((Get-PendingCount) -ge $before) {
             Write-WatcherLog "ingest: nothing processed (no-op or parse error) -> waiting for next drop"
             return
