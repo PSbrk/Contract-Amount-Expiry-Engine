@@ -558,6 +558,35 @@ def test_dashboard_detail_lists_linked_learned_mappings_and_aliases(client, conn
     assert "ACME, ACME INC" in body
 
 
+def test_dashboard_detail_learned_panel_excludes_other_campus_same_name(client, conn):
+    """Same-vendor tasks in different campuses share the Asana name, so the
+    'Learned Mappings attributing here' panel must key on the pinned gid /
+    campus, NOT the name — else a CEN task's page lists OKC/BAO mappings that
+    actually feed other tasks (the reported cross-campus display bug)."""
+    _seed_dashboard_row(conn, contract_name="Oklahoma Chiller Corporation",
+                        asana_task_gid="cen-gid", campus_set="CEN")
+    _seed_dashboard_row(conn, contract_name="Oklahoma Chiller Corporation",
+                        asana_task_gid="okc-gid", campus_set="OKC")
+
+    def _lm(key, campus, gid):
+        conn.execute(
+            'INSERT INTO "Learned Mappings" '
+            '("Key",Campus,Dept,"Account No",Vendor,"Contract Name","Contract Gid") '
+            'VALUES (?,?,?,?,?,?,?)',
+            (key, campus, "000", "63040", "OKLAHOMA CHILLER",
+             "Oklahoma Chiller Corporation", gid),
+        )
+    _lm("CEN|000|63040|OKLAHOMA CHILLER", "CEN", "cen-gid")   # pinned here
+    _lm("OKC|000|63040|OKLAHOMA CHILLER", "OKC", "okc-gid")   # pinned elsewhere
+    _lm("OKC|107|63040|OKLAHOMA CHILLER", "OKC", "")          # blank-gid, OKC campus
+    conn.commit()
+
+    body = client.get("/dashboard-detail/cen-gid").get_data(as_text=True)
+    assert "CEN|000|63040|OKLAHOMA CHILLER" in body      # this task's own mapping
+    assert "OKC|000|63040|OKLAHOMA CHILLER" not in body  # gid-pinned to OKC task
+    assert "OKC|107|63040|OKLAHOMA CHILLER" not in body  # blank-gid, wrong campus
+
+
 def test_dashboard_detail_404s_for_unknown_gid(client):
     resp = client.get("/dashboard-detail/gid-does-not-exist")
     assert resp.status_code == 404

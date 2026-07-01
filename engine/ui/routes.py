@@ -2077,13 +2077,33 @@ def register_routes(app: Flask) -> None:
         if row is None:
             abort(404)
         # Show the learned mappings + vendor aliases that feed THIS
-        # contract's transactions. Joined by the human-readable contract
-        # name (the Asana task name) since that's the cross-table key.
+        # contract's transactions. Contract Name alone is NOT a safe key:
+        # same-vendor tasks in different campuses share the Asana name
+        # ("Oklahoma Chiller Corporation" exists for CEN, OKC, BAO, ...), so a
+        # name-only join listed every campus's mappings on every task's page,
+        # making cross-campus spend LOOK attributed here. Keep only the
+        # mappings that actually resolve to THIS task: an explicit gid pin to
+        # this gid, or a blank-gid (name-only) mapping whose campus this task
+        # serves per the crosswalk. Same-name tasks in other campuses drop off.
         contract_name = row["Contract"]
-        learned = g.conn.execute(
+        from engine import campus_map
+        _fo, _do = sqlite_client.load_campus_map_overrides(g.conn)
+        _xw = campus_map.build(_fo, _do)
+        _opts = frozenset(s for s in (row["Campus Set"] or "").split(", ") if s)
+        _named = g.conn.execute(
             'SELECT * FROM "Learned Mappings" WHERE "Contract Name" = ?',
             (contract_name,),
         ).fetchall()
+        learned = [
+            lm for lm in _named
+            if (lm["Contract Gid"] or "").strip() == gid
+            or (
+                not (lm["Contract Gid"] or "").strip()
+                and _xw.contract_matches_tableau_campus(
+                    _opts, (lm["Campus"] or "").strip()
+                )
+            )
+        ]
         aliases = g.conn.execute(
             'SELECT * FROM "Vendor Aliases" WHERE "Contract Name" = ?',
             (contract_name,),
