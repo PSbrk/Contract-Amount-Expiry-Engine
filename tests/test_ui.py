@@ -2260,7 +2260,7 @@ def _insert_raw_nt(conn, *, group_key, vendor, candidate_gids, descs_json,
         ' "Engine Candidate Gids", "Distinct Descriptions JSON", Dismissed) '
         'VALUES (?,?,?,?,?,?,?,?,0)',
         (group_key, group_key.split("|")[0], vendor, amount, "2025-01-01",
-         "2026-01-01", " ".join(candidate_gids), descs_json),
+         "2026-01-01", "\n".join(candidate_gids), descs_json),
     )
     conn.commit()
 

@@ -23,6 +23,7 @@ $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BundleRoot = (Get-Item $ScriptDir).Parent.FullName
 $Bat        = Join-Path $ScriptDir "run-ingest.bat"
 $Inbox      = Join-Path $BundleRoot "data\inbox"
+$Stalled    = Join-Path $BundleRoot "data\stalled"
 $LogDir     = Join-Path $BundleRoot "logs"
 # ponytail: mirror engine.ingest.LocalInboxSource._ALLOWED_SUFFIXES. If the
 # engine ever accepts another extension, add it here too.
@@ -40,6 +41,14 @@ function Write-WatcherLog($msg) {
 function Get-PendingCount {
     @(Get-ChildItem $Inbox -File -ErrorAction SilentlyContinue |
         Where-Object { $Allowed -contains $_.Extension.ToLower() }).Count
+}
+
+function Get-OldestPending {
+    # Ingest processes the OLDEST allowed file per run, so this is the file a
+    # stalled run was working on.
+    Get-ChildItem $Inbox -File -ErrorAction SilentlyContinue |
+        Where-Object { $Allowed -contains $_.Extension.ToLower() } |
+        Sort-Object LastWriteTime | Select-Object -First 1
 }
 
 # Watchdog ceiling for a single ingest. A stalled Asana pull can otherwise block
@@ -61,10 +70,28 @@ function Invoke-Drain {
         Write-WatcherLog "ingest: $before file(s) pending -> running"
         # Run under a watchdog so a stalled run can't block the watcher forever.
         # Start-Process + bounded WaitForExit; run-ingest.bat writes its own log.
+        $poison = Get-OldestPending   # the file this run is working on
         $p = Start-Process -FilePath $Bat -PassThru -WindowStyle Hidden
         if (-not $p.WaitForExit($IngestTimeoutMs)) {
-            Write-WatcherLog "ingest EXCEEDED $([int]($IngestTimeoutMs/1000))s (stalled) -> killing pid $($p.Id) + children; will retry on next event/re-check"
-            & taskkill /PID $p.Id /T /F 2>&1 | Out-Null
+            $secs = [int]($IngestTimeoutMs / 1000)
+            Write-WatcherLog "ingest EXCEEDED ${secs}s (stalled) -> killing pid $($p.Id) + children"
+            $out = & taskkill /PID $p.Id /T /F 2>&1
+            # Confirm the tree is actually dead. If the kill failed, DO NOT loop
+            # or return-then-retry -- a surviving EngineApp is still writing the
+            # SQLite DB, and starting a second run would put two writers on it.
+            if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) {
+                if ($poison) {
+                    # Quarantine the stalling file so good files behind it can
+                    # still drain, instead of livelocking on it every re-check.
+                    if (-not (Test-Path $Stalled)) { New-Item -ItemType Directory -Path $Stalled -Force | Out-Null }
+                    Move-Item -LiteralPath $poison.FullName -Destination (Join-Path $Stalled $poison.Name) -Force -ErrorAction SilentlyContinue
+                    Write-WatcherLog "quarantined stalled file -> data\stalled\$($poison.Name); continuing drain"
+                    continue
+                }
+                Write-WatcherLog "killed; no pending file to quarantine -> will retry on next event/re-check"
+                return
+            }
+            Write-WatcherLog "ERROR taskkill did NOT reap pid $($p.Id) ($out) -> leaving watcher idle to avoid a second concurrent ingest; needs manual attention"
             return
         }
         if ((Get-PendingCount) -ge $before) {

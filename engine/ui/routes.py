@@ -1965,37 +1965,47 @@ def register_routes(app: Flask) -> None:
         # Each row is either a missing Asana contract or campus-miscoded spend
         # — resolve at the source, not here. Derived live from Needs Tagging +
         # Dashboard so it never goes stale (no extra table to maintain).
-        import json
-        import re
+        import json as _json
+        from engine import campus_map
 
-        gid_re = re.compile(r"\d{15,}")
-        # live contracts -> campus tokens (Campus Set may be "BAO, TUL" etc.)
+        # Decide "does this contract serve this campus" with the SAME crosswalk
+        # attribution uses, so this surface can't disagree with what the engine
+        # actually parked. It handles the All Campuses wildcard, INT drops, and
+        # ***NOR/***TUL reverse-encodings + operator overrides — a hand-rolled
+        # token match here would silently diverge (e.g. "***TUL (contract is for
+        # SBA)" would falsely count as serving TUL).
+        _fo, _do = sqlite_client.load_campus_map_overrides(g.conn)
+        _crosswalk = campus_map.build(_fo, _do)
+
         dash: dict[str, dict] = {}
         for r in g.conn.execute(
             'SELECT "Asana Task GID" gid, Contract n, "Campus Set" camp '
             'FROM "Dashboard"'
         ):
-            camp = r["camp"] or ""
-            # "All Campuses" is the Asana wildcard — it serves EVERY campus, so
-            # token-matching its name ({ALL,CAMP,USES}) would wrongly miss it.
-            wild = "all campus" in camp.lower()
-            toks = set(re.findall(r"[A-Z]{2,4}", camp.upper()))
-            dash[r["gid"]] = {"name": r["n"], "camp": camp, "toks": toks, "wild": wild}
+            dash[r["gid"]] = {"name": r["n"], "camp": r["camp"] or ""}
 
         items, total = [], 0.0
+        # Pre-filter in SQL: a row with no candidate gids can never be no-home.
         for r in g.conn.execute(
-            'SELECT * FROM "Needs Tagging" WHERE COALESCE(Dismissed,0)=0'
+            'SELECT * FROM "Needs Tagging" '
+            "WHERE COALESCE(Dismissed,0)=0 "
+            "AND COALESCE(\"Engine Candidate Gids\",'') <> ''"
         ):
-            gids = gid_re.findall(r["Engine Candidate Gids"] or "")
+            gids = [x for x in (r["Engine Candidate Gids"] or "").splitlines() if x.strip()]
             if not gids:
-                continue  # no same-vendor contract anywhere — that's "genuinely empty", not no-home
-            gcamp = (r["Group Key"] or "|").split("|")[0].strip().upper()
-            live = [(gx, dash[gx]) for gx in gids if gx in dash]
-            if any(d["wild"] or gcamp in d["toks"] for _, d in live):
+                continue  # no same-vendor contract anywhere — "genuinely empty", not no-home
+            gcamp = (r["Campus"] or "").strip()
+            live = [dash[gx] for gx in gids if gx in dash]
+            if any(
+                _crosswalk.contract_matches_tableau_campus(
+                    frozenset(s for s in d["camp"].split(", ") if s), gcamp
+                )
+                for d in live
+            ):
                 continue  # a live contract serves this campus — has a home
             try:
-                descs = json.loads(r["Distinct Descriptions JSON"] or "[]")
-            except Exception:
+                descs = _json.loads(r["Distinct Descriptions JSON"] or "[]")
+            except (TypeError, ValueError):
                 descs = []
             # Guard the SHAPE, not just parse errors: a JSON null/object/list-of-
             # non-dicts would otherwise crash sorted()/d.get() and 500 the tab.
@@ -2008,7 +2018,7 @@ def register_routes(app: Flask) -> None:
             items.append({
                 "key": r["Group Key"], "campus": gcamp, "vendor": r["Vendor"],
                 "amount": amt, "first": r["First Date"], "last": r["Last Date"],
-                "live": [{"name": d["name"], "camp": d["camp"]} for _, d in live],
+                "live": [{"name": d["name"], "camp": d["camp"]} for d in live],
                 "offdash": len(gids) - len(live),
                 "sample": [{"amount": s.get("amount") or 0,
                             "desc": (s.get("desc") or s.get("description") or "")}
