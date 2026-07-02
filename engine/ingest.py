@@ -474,6 +474,19 @@ class LocalInboxSource:
             Path(processed_dir) if processed_dir is not None
             else Path("data") / "processed"
         )
+        # Where the ingest sanity gate quarantines a suspicious export (wrong
+        # scope / partial / cratered totals) instead of writing it to Asana.
+        self.held_dir = self.processed_dir.parent / "held"
+
+    def move_to_held(self, source_path: str | os.PathLike, *, file_hash: str) -> Path:
+        """Quarantine a file the sanity gate refused, to data/held/. Same
+        naming as move_to_processed. NOT recorded as processed, so once the
+        operator confirms the export is correct they can re-drop it."""
+        src = Path(source_path)
+        self.held_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.held_dir / f"{file_hash[:12]}-{src.name}"
+        shutil.move(str(src), str(dest))
+        return dest
 
     def get_latest_transactions(self) -> tuple[pd.DataFrame, SourceMetadata]:
         # Imported inside the method so a test module that imports

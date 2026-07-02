@@ -615,6 +615,72 @@ def _build_transaction_source(conn):
     return LocalInboxSource(conn)
 
 
+def _check_ingest_sanity(conn, *, rows_in, total_in, rows_out):
+    """Guard against a wrong/partial/differently-scoped export overwriting
+    Asana. Compares this run's in-scope volume to the last OK ingest.
+
+    Returns (ok, reasons, baseline). ok is False when any check breaches; the
+    caller then HOLDS the file instead of attributing + writing. No prior OK
+    ingest (first run) → only the out-of-scope check applies (nothing to
+    compare volume against).
+    """
+    from engine import sqlite_client
+    from config import settings
+
+    drop = settings.INGEST_SANITY_DROP_PCT
+    baseline = sqlite_client.last_ok_ingest_metrics(conn)
+    reasons: list[str] = []
+
+    total_rows = rows_in + rows_out
+    oos_ratio = (rows_out / total_rows) if total_rows else 0.0
+    if oos_ratio > settings.INGEST_SANITY_OOS_PCT:
+        reasons.append(
+            f"out-of-scope ratio {oos_ratio:.1%} exceeds "
+            f"{settings.INGEST_SANITY_OOS_PCT:.0%} ({rows_out:,} of {total_rows:,} rows) "
+            "— export looks differently scoped"
+        )
+
+    if baseline:
+        b_rows = baseline.get("rows_in") or 0
+        b_total = baseline.get("total_in") or 0.0
+        if b_rows and rows_in < b_rows * (1 - drop):
+            reasons.append(
+                f"in-scope rows {rows_in:,} down {1 - rows_in / b_rows:.1%} vs "
+                f"last OK ingest ({b_rows:,})"
+            )
+        if b_total and total_in < b_total * (1 - drop):
+            reasons.append(
+                f"in-scope dollars ${total_in:,.0f} down {1 - total_in / b_total:.1%} "
+                f"vs last OK ingest (${b_total:,.0f})"
+            )
+
+    return (not reasons), reasons, baseline
+
+
+def _write_held_alert(meta, reasons, held_path, today_iso) -> None:
+    """Drop a plain-text alert into data/held/ so a held export is impossible
+    to miss even outside the UI. Best-effort — never breaks the ingest."""
+    from pathlib import Path as _Path
+    try:
+        alert_dir = _Path("data") / "held"
+        alert_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "INGEST HELD BY SANITY GATE — NOT WRITTEN TO ASANA",
+            f"when:  {today_iso}",
+            f"file:  {meta.name}  (hash {meta.hash[:12]})",
+            f"held:  {held_path}" if held_path else "held:  (non-inbox source)",
+            "why:",
+            *[f"  - {r}" for r in reasons],
+            "",
+            "The prior good Dashboard/Asana state is intact. If this export is",
+            "CORRECT, move it from data\\held\\ back into data\\inbox\\ to re-ingest.",
+            "If it is WRONG, delete it from data\\held\\.",
+        ]
+        (alert_dir / "HELD-ALERT.txt").write_text("\n".join(lines), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — alerting must never break ingest
+        pass
+
+
 def _run_ingest() -> int:
     """Phase-2 local-first --ingest path.
 
@@ -693,6 +759,41 @@ def _run_ingest() -> int:
             kept = in_scope(df)
             rejected = out_of_scope(df)
             in_total, out_total = _print_ingest_report(df, meta, kept, rejected)
+
+            # Sanity gate: refuse a wrong / partial / differently-scoped export
+            # BEFORE it can attribute + overwrite Asana. Compares in-scope
+            # volume against the last OK ingest; on a breach the file is held
+            # (quarantined, no writes) and the prior good state is left intact.
+            sane, hold_reasons, _baseline = _check_ingest_sanity(
+                conn, rows_in=len(kept), total_in=in_total, rows_out=len(rejected),
+            )
+            if not sane:
+                flags = "HELD: " + "; ".join(hold_reasons)
+                print("\nINGEST HELD by sanity gate — NOT written to Asana:\n  "
+                      + "\n  ".join(hold_reasons), file=sys.stderr)
+                log.warning("ingest sanity gate held %s: %s", meta.name, flags)
+                held_path = None
+                if isinstance(source, LocalInboxSource) and meta.source_path:
+                    held_path = source.move_to_held(meta.source_path, file_hash=meta.hash)
+                _write_held_alert(meta, hold_reasons, held_path, today_iso)
+                sqlite_client.append_run_log(
+                    conn, run_id=run_id, mode="ingest", outcome="partial",
+                    file_name=meta.name, file_hash=meta.hash,
+                    rows_in_scope=len(kept), rows_out_of_scope=len(rejected),
+                    total_in_scope=in_total, total_out_of_scope=out_total,
+                    review_flags=flags,
+                    notes=(
+                        "HELD by sanity gate — NOT attributed, NOT written to "
+                        "Asana; prior Dashboard/Asana state left intact. Review "
+                        "data\\held\\ and re-drop into data\\inbox\\ if the export "
+                        "is correct. " + "; ".join(hold_reasons)
+                    ),
+                )
+                _prune_run_log_safely(conn)
+                _backup_database_safely(
+                    sqlite_client.DEFAULT_DB_PATH, settings.ONEDRIVE_BACKUP_PATH,
+                )
+                return 0
 
             # Attribution + Needs Tagging + Dashboard + State + Asana
             # writes — all storage-side state goes to SQLite.

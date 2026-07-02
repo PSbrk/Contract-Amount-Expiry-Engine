@@ -365,6 +365,47 @@ def append_run_log(
     return _fetch_by_id(conn, "Run Log", cur.lastrowid)
 
 
+def last_ok_ingest_metrics(conn: sqlite3.Connection) -> dict | None:
+    """Rows/dollar totals from the most recent SUCCESSFUL ingest, for the
+    ingest sanity gate to compare a new export against. Returns None when no
+    prior OK ingest exists (first run — nothing to compare, so never held)."""
+    row = conn.execute(
+        '''SELECT "Rows In Scope" AS rows_in, "Total In Scope" AS total_in,
+                  "File Name" AS file_name, "Run ID" AS run_id
+             FROM "Run Log"
+            WHERE "Mode" = 'ingest' AND "Outcome" = 'ok'
+              AND "Rows In Scope" IS NOT NULL
+            ORDER BY id DESC LIMIT 1'''
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "rows_in": row["rows_in"], "total_in": row["total_in"],
+        "file_name": row["file_name"], "run_id": row["run_id"],
+    }
+
+
+def latest_ingest_hold(conn: sqlite3.Connection) -> dict | None:
+    """If the MOST RECENT ingest was HELD by the sanity gate (outcome
+    'partial' with a HELD review flag), return its details for the UI banner;
+    else None. A later OK ingest clears it (this only looks at the newest)."""
+    row = conn.execute(
+        '''SELECT "Outcome" AS outcome, "Review Flags" AS flags,
+                  "Notes" AS notes, "File Name" AS file_name, "Run ID" AS run_id
+             FROM "Run Log"
+            WHERE "Mode" = 'ingest'
+            ORDER BY id DESC LIMIT 1'''
+    ).fetchone()
+    if row is None or row["outcome"] != "partial":
+        return None
+    if not (row["flags"] or "").startswith("HELD"):
+        return None
+    return {
+        "flags": row["flags"], "notes": row["notes"],
+        "file_name": row["file_name"], "run_id": row["run_id"],
+    }
+
+
 def prune_run_log_older_than(
     conn: sqlite3.Connection,
     *,

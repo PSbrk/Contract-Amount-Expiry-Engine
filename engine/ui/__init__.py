@@ -88,6 +88,15 @@ def create_app(
             pass
         return response
 
+    @app.context_processor
+    def _inject_held_alert():
+        # Surface a held ingest (sanity gate) as a banner on every page until a
+        # good export clears it. Best-effort — never break rendering.
+        try:
+            return {"held_alert": sqlite_client.latest_ingest_hold(g.conn)}
+        except Exception:  # noqa: BLE001
+            return {"held_alert": None}
+
     from engine.ui.routes import register_routes
     register_routes(app)
 

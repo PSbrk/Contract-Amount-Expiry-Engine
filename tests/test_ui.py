@@ -592,6 +592,28 @@ def test_dashboard_detail_404s_for_unknown_gid(client):
     assert resp.status_code == 404
 
 
+def test_held_ingest_shows_banner_until_a_good_ingest_clears_it(client, conn):
+    """A sanity-gate HOLD shows a banner on every page; a later OK ingest clears it."""
+    from engine.sqlite_client import append_run_log
+    append_run_log(
+        conn, run_id="2026-07-01T16:34:00", mode="ingest", outcome="partial",
+        file_name="Transactions (1).csv", file_hash="c" * 64,
+        rows_in_scope=14815, rows_out_of_scope=2027, total_in_scope=17_785_561.0,
+        review_flags="HELD: in-scope rows down 14%",
+        notes="HELD by sanity gate — NOT written to Asana.",
+    )
+    body = client.get("/").get_data(as_text=True)
+    assert "Ingest held" in body
+    assert "Transactions (1).csv" in body
+
+    append_run_log(
+        conn, run_id="2026-07-02T14:00:00", mode="ingest", outcome="ok",
+        file_name="Transactions.csv", file_hash="a" * 64,
+        rows_in_scope=17231, rows_out_of_scope=0, total_in_scope=20_790_332.0,
+    )
+    assert "Ingest held" not in client.get("/").get_data(as_text=True)
+
+
 # ---------------------------------------------------------------------------
 # Admin tables — CRUD round-trip via /vendor-aliases as representative
 # ---------------------------------------------------------------------------

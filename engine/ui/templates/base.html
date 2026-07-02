@@ -30,6 +30,12 @@
                font-weight: 600; }
   .flash-success { color: #1b7a43; background: #e7f6ec; border: 1px solid #b6e0c4; }
   .flash-error   { color: #b3261e; background: #fdecea; border: 1px solid #f0a6a0; }
+  /* Ingest sanity gate: a held export left Asana untouched — pinned, loud, on
+     every page until a good export clears it. */
+  .held-banner { position: sticky; top: 0; z-index: 200; margin-bottom: 1rem;
+                 padding: 0.7rem 1rem; border-radius: 0.4rem; font-weight: 600;
+                 color: #7a2e0e; background: #fff4e5; border: 1px solid #f0c089; }
+  .held-banner small { font-weight: 400; }
 </style>
 </head>
 <body>
@@ -62,6 +68,13 @@
   </ul>
 </nav>
 <main class="container">
+  {% if held_alert %}
+    <div class="held-banner" role="alert">
+      ⚠ Ingest held — Asana was NOT updated from the latest export
+      (<code>{{ held_alert.file_name }}</code>).<br>
+      <small>{{ held_alert.notes }} See <a href="{{ url_for('run_log') }}">Run Log</a>.</small>
+    </div>
+  {% endif %}
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
     <div class="flashes" role="alert">

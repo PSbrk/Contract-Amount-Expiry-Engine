@@ -206,6 +206,19 @@ REVIEW_LARGE_DELTA_DOLLARS: Final = 10000.0
 RUN_LOG_RETENTION_DAYS: Final = int(os.environ.get("RUN_LOG_RETENTION_DAYS", "365").strip() or "365")
 
 
+# Ingest sanity gate: a wrong / partial / differently-scoped Tableau export
+# dropped in the inbox would otherwise be attributed and written to Asana
+# unattended, silently cratering spend (2026-07-01: a 14,815-row export
+# replaced the 17,231-row one and dropped ~$566k of attribution to Asana). If
+# an ingest's in-scope row count OR in-scope dollar total drops by more than
+# this fraction vs the last OK ingest, OR its out-of-scope ratio exceeds
+# INGEST_SANITY_OOS_PCT, the file is HELD (quarantined to data/held/, not
+# written to Asana) for operator confirmation. ponytail: two knobs; widen only
+# if legitimate exports keep tripping it.
+INGEST_SANITY_DROP_PCT: Final = float(os.environ.get("INGEST_SANITY_DROP_PCT", "0.05").strip() or "0.05")
+INGEST_SANITY_OOS_PCT: Final = float(os.environ.get("INGEST_SANITY_OOS_PCT", "0.05").strip() or "0.05")
+
+
 # ---------------------------------------------------------------------------
 # Run-mode overrides from env (so dry-run can be toggled in CI/locally without
 # code change)
