@@ -39,6 +39,7 @@ def test_alarms_options():
     assert settings.ASANA_ALARMS_OPTIONS == {
         "Clear": "1215681548746114",
         "ALARM": "1215681548746115",
+        "Previously Alarmed": "1216234592726616",
     }
 
 
@@ -79,9 +80,10 @@ def test_engine_table_names_in_schema():
         "Inbox", "Dashboard", "Needs Tagging", "Vendor Aliases",
         "Campus Map", "CapEx Budgets", "Learned Mappings", "Resolved Contracts",
         "Attributed Lines", "Unlinked CapEx", "Amendment Links", "State", "Run Log",
+        "Alarm Rearm",
     }
     assert set(schema.TABLE_NAMES) == expected
-    assert len(schema.TABLE_NAMES) == 13  # no duplicates
+    assert len(schema.TABLE_NAMES) == 14  # no duplicates
 
 
 def test_write_gate_section_is_active_compliant():

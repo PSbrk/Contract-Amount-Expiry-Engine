@@ -689,6 +689,22 @@ def test_promote_same_campus_leaves_flag_off(conn):
 # cleanup_stale_needs_tagging
 # ---------------------------------------------------------------------------
 
+def test_alarm_rearm_upsert_load_delete_roundtrip(conn):
+    from engine.sqlite_client import (
+        delete_alarm_rearm, load_alarm_rearm, upsert_alarm_rearm,
+    )
+    assert load_alarm_rearm(conn) == {}
+    upsert_alarm_rearm(conn, gid="g1", band="75%", updated_at="2026-07-02")
+    upsert_alarm_rearm(conn, gid="g2", band="Over", updated_at="2026-07-02")
+    assert load_alarm_rearm(conn) == {"g1": "75%", "g2": "Over"}
+    # Upsert raises the high-water in place (no duplicate row).
+    upsert_alarm_rearm(conn, gid="g1", band="90%", updated_at="2026-07-03")
+    assert load_alarm_rearm(conn) == {"g1": "90%", "g2": "Over"}
+    delete_alarm_rearm(conn, gid="g1")
+    assert load_alarm_rearm(conn) == {"g2": "Over"}
+    delete_alarm_rearm(conn, gid="g1")  # idempotent
+
+
 def test_cleanup_stale_needs_tagging_deletes_only_empty_rows_not_in_live_set(conn):
     _seed(conn, "Needs Tagging",
           {"Group Key": "STALE|000|63015|X", "Assign Contract": ""})

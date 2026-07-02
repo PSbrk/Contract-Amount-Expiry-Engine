@@ -66,7 +66,19 @@ ASANA_SPENDING_RATE_ALARM_OPTIONS: Final = {
 ASANA_ALARMS_OPTIONS: Final = {
     "Clear": "1215681548746114",
     "ALARM": "1215681548746115",
+    # Auto per-band re-arm resting state (2026-07-02): after a contract fires
+    # ALARM at a % band and the email rule has run, the engine writes this so the
+    # NEXT band is a fresh Clear/Previously-Alarmed -> ALARM edge that re-fires
+    # the email. See engine/alarm_rearm.py.
+    "Previously Alarmed": "1216234592726616",
 }
+
+# Seconds to wait after writing ALARM before re-arming the field to "Previously
+# Alarmed" — long enough for Asana's automation (the email rule) to observe the
+# ALARM edge first. Batched: ONE wait per ingest regardless of alarm count.
+ALARM_REARM_DELAY_SECONDS: Final = int(
+    os.environ.get("ALARM_REARM_DELAY_SECONDS", "120")
+)
 
 # Live gate (spec §7): a contract qualifies for writes only when
 #   (section == ASANA_WRITE_GATE_SECTION  OR  Contract Status == Active)

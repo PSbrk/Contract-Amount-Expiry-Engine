@@ -34,6 +34,7 @@ _SPENDING_RATE_ALARM_CHOICES: Final = [
 _ALARMS_CHOICES: Final = [
     {"name": "Clear"},
     {"name": "ALARM"},
+    {"name": "Previously Alarmed"},
 ]
 _RUN_MODE_CHOICES: Final = [
     {"name": "ingest"},
@@ -455,6 +456,25 @@ TABLES_SCHEMA: Final = [
             {"name": "Resolved At", "type": "date"},
             {"name": "Notes", "type": "multilineText",
              "description": "Operator-editable."},
+        ],
+    },
+    {
+        "name": "Alarm Rearm",
+        "description": (
+            "Engine-owned per-contract high-water for the AUTOMATIC per-band "
+            "alarm re-arm (distinct from operator-set Resolved Contracts). "
+            "Stores the % Spent band at which a contract last fired ALARM. The "
+            "binary Alarms field re-fires (a fresh email) only when the current "
+            "band climbs ABOVE this; between bands it self-mutes to 'Previously "
+            "Alarmed'; at 'Over' it stays ALARM. Cleared when the contract drops "
+            "below 75% so a later climb fires fresh. See engine/alarm_rearm.py."
+        ),
+        "fields": [
+            {"name": "Asana Task GID", "type": "singleLineText",
+             "description": "Contract. UNIQUE -- upsert key."},
+            {"name": "Alarmed Band", "type": "singleLineText",
+             "description": "Highest % Spent band fired so far (75%/90%/100%/Over)."},
+            {"name": "Updated At", "type": "date"},
         ],
     },
     {

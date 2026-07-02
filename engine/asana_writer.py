@@ -306,6 +306,35 @@ def apply_writes(
     )
 
 
+def force_write_alarms(
+    api_client: asana.ApiClient | None,
+    contract_gid: str,
+    contract_name: str,
+    value: str,
+    *,
+    dry_run: bool,
+) -> bool:
+    """Unconditionally set ONE task's Alarms enum to `value` (no diff, no
+    guards). Used by the automatic per-band re-arm to reset a just-fired
+    contract to "Previously Alarmed" after the notify delay. Returns True on a
+    real write. Raises on an unknown option name (caller passes a known one)."""
+    option_gid = _ENUM_OPTIONS["Alarms"].get(value)
+    if option_gid is None:
+        raise ValueError(
+            f"force_write_alarms: {value!r} not in {sorted(_ENUM_OPTIONS['Alarms'])}"
+        )
+    if dry_run:
+        log.info("[DRY RUN] would re-arm Alarms=%r on %s (%s)",
+                 value, contract_gid, contract_name)
+        return False
+    if api_client is None:
+        raise RuntimeError("force_write_alarms called with dry_run=False but no api_client")
+    body = {"data": {"custom_fields": {_FIELD_NAME_TO_GID["Alarms"]: option_gid}}}
+    asana.TasksApi(api_client).update_task(body, contract_gid, {"opt_fields": "gid"})
+    log.info("re-armed Alarms=%r on %s (%s)", value, contract_gid, contract_name)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Roll-up summary
 # ---------------------------------------------------------------------------
@@ -355,5 +384,6 @@ __all__ = [
     "diff_dashboard_vs_current",
     "build_custom_fields_payload",
     "apply_writes",
+    "force_write_alarms",
     "summarize",
 ]

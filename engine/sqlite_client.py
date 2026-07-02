@@ -144,6 +144,8 @@ _UNIQUE_FIELDS: dict[str, str] = {
     "Amendment Links": "Amendment Gid",
     # One row per resolved contract; the GID is its identity for upserts.
     "Resolved Contracts": "Asana Task GID",
+    # One row per contract with an automatic alarm re-arm high-water.
+    "Alarm Rearm": "Asana Task GID",
 }
 
 # Legacy indexes that ensure_schema actively drops on existing databases
@@ -1423,6 +1425,49 @@ def unresolve_contract(conn: sqlite3.Connection, *, gid: str) -> None:
     conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Alarm Rearm — engine-owned per-contract high-water for automatic per-band
+# alarm re-arm (see engine/alarm_rearm.py).
+# ---------------------------------------------------------------------------
+
+def load_alarm_rearm(conn: sqlite3.Connection) -> dict[str, str]:
+    """Return {gid: alarmed_band} for every contract with a re-arm high-water."""
+    out: dict[str, str] = {}
+    for row in conn.execute(
+        'SELECT "Asana Task GID", "Alarmed Band" FROM "Alarm Rearm"'
+    ):
+        gid = (row["Asana Task GID"] or "").strip()
+        if gid:
+            out[gid] = (row["Alarmed Band"] or "").strip()
+    return out
+
+
+def upsert_alarm_rearm(
+    conn: sqlite3.Connection, *, gid: str, band: str, updated_at: str,
+    commit: bool = True,
+) -> None:
+    """Set a contract's last-alarmed band high-water. UNIQUE on GID."""
+    conn.execute(
+        '''INSERT INTO "Alarm Rearm" ("Asana Task GID", "Alarmed Band", "Updated At")
+           VALUES (?, ?, ?)
+           ON CONFLICT("Asana Task GID") DO UPDATE SET
+             "Alarmed Band" = excluded."Alarmed Band",
+             "Updated At" = excluded."Updated At"''',
+        (gid, band, updated_at),
+    )
+    if commit:
+        conn.commit()
+
+
+def delete_alarm_rearm(
+    conn: sqlite3.Connection, *, gid: str, commit: bool = True,
+) -> None:
+    """Clear a contract's re-arm high-water (it dropped below 75%). Idempotent."""
+    conn.execute('DELETE FROM "Alarm Rearm" WHERE "Asana Task GID" = ?', (gid,))
+    if commit:
+        conn.commit()
+
+
 def set_needs_tagging_dismissed(
     conn: sqlite3.Connection,
     *,
@@ -1922,6 +1967,9 @@ __all__ = [
     "load_resolved_contracts",
     "set_contract_resolved",
     "update_resolved_baseline",
+    "load_alarm_rearm",
+    "upsert_alarm_rearm",
+    "delete_alarm_rearm",
     "unresolve_contract",
     "upsert_dashboard_row",
     "replace_attributed_lines",

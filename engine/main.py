@@ -1249,10 +1249,15 @@ def _run_attribution_and_needs_tagging(
     #   - Each contract's writes are computed by diffing the DashboardRow
     #     values against the Contract's cached current Asana values; only
     #     fields that actually changed get written (idempotent).
-    from engine import asana_writer
+    import dataclasses as _dataclasses
+    import time as _time
+    from engine import alarm_rearm, asana_writer
     from engine.sqlite_client import (
+        delete_alarm_rearm,
+        load_alarm_rearm,
         load_resolved_contracts,
         update_resolved_baseline,
+        upsert_alarm_rearm,
     )
     contracts_by_gid = {c.gid: c for c in contracts}
     write_results: list[asana_writer.WriteResult] = []
@@ -1264,6 +1269,13 @@ def _run_attribution_and_needs_tagging(
     # discipline (don't mutate operator state mid-pipeline).
     resolved = load_resolved_contracts(conn)
     rearm_bumps: list[tuple[str, str]] = []  # (gid, new_band)
+    # AUTOMATIC per-band alarm re-arm (default for un-resolved contracts): the
+    # binary Alarms field re-fires ALARM on each band climb (email), then after
+    # a delay resets to "Previously Alarmed" so the next band is a fresh edge;
+    # "Over" stays ALARM. The high-water lives in the Alarm Rearm table.
+    auto_rearm = load_alarm_rearm(conn)
+    auto_updates: list[tuple[str, str]] = []     # (gid, band); "" => clear row
+    reset_after_delay: list[tuple[str, str]] = []  # (gid, name) -> Previously Alarmed
     for dash_row in dashboard_rows:
         current_contract = contracts_by_gid.get(dash_row.asana_task_gid)
         if current_contract is None:
@@ -1274,26 +1286,47 @@ def _run_attribution_and_needs_tagging(
                 dash_row.asana_task_gid, dash_row.contract_name,
             )
             continue
+        gid = dash_row.asana_task_gid
         suppress: frozenset[str] = frozenset()
-        info = resolved.get(dash_row.asana_task_gid)
+        row_to_write = dash_row
+        info = resolved.get(gid)
         if info is not None:
+            # Manual Resolved takes precedence over the automatic re-arm.
             new_band = dash_row.spending_rate_alarm
             if asana_writer.band_severity(new_band) > asana_writer.band_severity(
                 info["baseline_band"]
             ):
                 # Band worsened past the baseline — break silence this once,
                 # then re-baseline so it goes quiet again at the new level.
-                rearm_bumps.append((dash_row.asana_task_gid, new_band or ""))
+                rearm_bumps.append((gid, new_band or ""))
                 log.info(
                     "resolved re-arm: %s (%s) band %r -> %r; alarm writes "
                     "allowed this run",
-                    dash_row.asana_task_gid, dash_row.contract_name,
-                    info["baseline_band"], new_band,
+                    gid, dash_row.contract_name, info["baseline_band"], new_band,
                 )
             else:
                 suppress = asana_writer.ALARM_FIELDS
+        else:
+            # Automatic per-band re-arm. Override the binary Alarms value the
+            # diff will write; the % band (Spending Rate Alarm) still writes as
+            # computed. The high-water is advanced at FIRE time (before the
+            # delay) so a crash mid-delay self-heals next run (the muted branch
+            # writes "Previously Alarmed" over any stuck ALARM).
+            plan = alarm_rearm.plan_rearm(
+                current_band=dash_row.spending_rate_alarm,
+                last_alarmed_band=auto_rearm.get(gid, ""),
+                base_alarms=dash_row.alarms,
+            )
+            if plan.desired_alarms != dash_row.alarms:
+                row_to_write = _dataclasses.replace(
+                    dash_row, alarms=plan.desired_alarms
+                )
+            auto_updates.append((gid, plan.stored_band))
+            if (plan.fire_reset and not settings.DRY_RUN_ASANA
+                    and (test_gid is None or gid == test_gid)):
+                reset_after_delay.append((gid, dash_row.contract_name))
         res = asana_writer.apply_writes(
-            asana_api, dash_row, current_contract,
+            asana_api, row_to_write, current_contract,
             dry_run=settings.DRY_RUN_ASANA,
             test_contract_gid=test_gid,
             suppress_fields=suppress,
@@ -1301,6 +1334,33 @@ def _run_attribution_and_needs_tagging(
         write_results.append(res)
     for gid, new_band in rearm_bumps:
         update_resolved_baseline(conn, gid=gid, baseline_band=new_band)
+    # Persist auto re-arm high-water BEFORE the delay so a crash mid-delay is
+    # recoverable (next run sees the advanced band and mutes the stuck ALARM).
+    for gid, band in auto_updates:
+        if band:
+            upsert_alarm_rearm(conn, gid=gid, band=band,
+                               updated_at=today_iso, commit=False)
+        else:
+            delete_alarm_rearm(conn, gid=gid, commit=False)
+    conn.commit()
+    # Batched re-arm: ONE wait for Asana's email rule to observe the ALARM
+    # edge, then reset the just-fired (sub-Over) contracts to "Previously
+    # Alarmed" so the next band re-fires cleanly.
+    if reset_after_delay:
+        delay = settings.ALARM_REARM_DELAY_SECONDS
+        print(f"  alarm re-arm: {len(reset_after_delay)} contract(s) fired; "
+              f"waiting {delay}s for Asana's email rule, then re-arming to "
+              f"'Previously Alarmed'...")
+        _time.sleep(delay)
+        for gid, name in reset_after_delay:
+            try:
+                asana_writer.force_write_alarms(
+                    asana_api, gid, name, alarm_rearm.PREVIOUSLY_ALARMED,
+                    dry_run=settings.DRY_RUN_ASANA,
+                )
+            except Exception:  # noqa: BLE001 — one bad reset shouldn't abort
+                log.exception("alarm re-arm reset failed for %s (%s)", gid, name)
+        print(f"  alarm re-arm: reset {len(reset_after_delay)} contract(s).")
 
     # State PERSIST — runs AFTER Dashboard upsert AND AFTER Asana writes so
     # State becomes the "high-water mark of a fully-successful run". If
