@@ -429,17 +429,17 @@ TABLES_SCHEMA: Final = [
     {
         "name": "Resolved Contracts",
         "description": (
-            "Operator-set: contracts the operator has acknowledged and no "
-            "longer wants alarm churn for. While a contract's GID is here, "
-            "Step 5 writes ONLY the numeric fields (Spent so far, % Spent, "
-            "Spending Rate) and SUPPRESSES the two alarm enums (Alarms, "
-            "Spending Rate Alarm), so the operator's email-on-ALARM Asana rule "
-            "stops firing. Re-arm: if a later ingest computes a Spending Rate "
-            "Alarm band WORSE than 'Baseline Band' (the band at resolve time, "
-            "raised each time it re-fires), the engine lets the alarm fields "
-            "write once and bumps the baseline so it goes quiet again at the "
-            "new level. Operator-owned: delete the row (un-resolve) to resume "
-            "normal alarm writes. The engine never writes here."
+            "Operator-set FULL-SILENCE override. While a contract's GID is "
+            "here, Step 5 writes ONLY the numeric fields (Spent so far, % "
+            "Spent, Spending Rate) and SUPPRESSES the two alarm enums (Alarms, "
+            "Spending Rate Alarm) ENTIRELY -- no email even if the band "
+            "worsens. This is the stronger 'stop pinging me about this one' "
+            "mute; the per-band re-fire is now the DEFAULT for un-resolved "
+            "contracts (see the Alarm Rearm table / engine.alarm_rearm). "
+            "Operator-owned: delete the row (un-resolve) to resume normal "
+            "per-band alarm writes. 'Baseline Band' is retained as a snapshot "
+            "of the band at resolve time (no longer drives a re-arm). The "
+            "engine never writes here."
         ),
         "fields": [
             {"name": "Asana Task GID", "type": "singleLineText",

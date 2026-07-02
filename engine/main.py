@@ -1256,19 +1256,17 @@ def _run_attribution_and_needs_tagging(
         delete_alarm_rearm,
         load_alarm_rearm,
         load_resolved_contracts,
-        update_resolved_baseline,
         upsert_alarm_rearm,
     )
     contracts_by_gid = {c.gid: c for c in contracts}
     write_results: list[asana_writer.WriteResult] = []
     test_gid = settings.WRITE_TEST_CONTRACT or None
-    # Operator-resolved contracts: mute the two alarm enums, but RE-ARM (let
-    # them write once, then raise the baseline) if the Spending Rate Alarm
-    # band climbs above the band recorded at resolve time. Baseline bumps are
-    # collected and applied after the loop, mirroring the State-persist
-    # discipline (don't mutate operator state mid-pipeline).
+    # Manual Resolved = FULL SILENCE (operator override): while a contract's GID
+    # is in Resolved Contracts, the two alarm enums are never written, even if
+    # the band worsens. The per-band re-fire is now the DEFAULT (auto re-arm
+    # below); Resolved is the stronger "stop pinging me about this one entirely"
+    # mute the operator applies deliberately.
     resolved = load_resolved_contracts(conn)
-    rearm_bumps: list[tuple[str, str]] = []  # (gid, new_band)
     # AUTOMATIC per-band alarm re-arm (default for un-resolved contracts): the
     # binary Alarms field re-fires ALARM on each band climb (email), then after
     # a delay resets to "Previously Alarmed" so the next band is a fresh edge;
@@ -1291,21 +1289,9 @@ def _run_attribution_and_needs_tagging(
         row_to_write = dash_row
         info = resolved.get(gid)
         if info is not None:
-            # Manual Resolved takes precedence over the automatic re-arm.
-            new_band = dash_row.spending_rate_alarm
-            if asana_writer.band_severity(new_band) > asana_writer.band_severity(
-                info["baseline_band"]
-            ):
-                # Band worsened past the baseline — break silence this once,
-                # then re-baseline so it goes quiet again at the new level.
-                rearm_bumps.append((gid, new_band or ""))
-                log.info(
-                    "resolved re-arm: %s (%s) band %r -> %r; alarm writes "
-                    "allowed this run",
-                    gid, dash_row.contract_name, info["baseline_band"], new_band,
-                )
-            else:
-                suppress = asana_writer.ALARM_FIELDS
+            # Full silence: never write the alarm enums while resolved. Takes
+            # precedence over the automatic per-band re-arm.
+            suppress = asana_writer.ALARM_FIELDS
         else:
             # Automatic per-band re-arm. Override the binary Alarms value the
             # diff will write; the % band (Spending Rate Alarm) still writes as
@@ -1332,8 +1318,6 @@ def _run_attribution_and_needs_tagging(
             suppress_fields=suppress,
         )
         write_results.append(res)
-    for gid, new_band in rearm_bumps:
-        update_resolved_baseline(conn, gid=gid, baseline_band=new_band)
     # Persist auto re-arm high-water BEFORE the delay so a crash mid-delay is
     # recoverable (next run sees the advanced band and mutes the stuck ALARM).
     for gid, band in auto_updates:
