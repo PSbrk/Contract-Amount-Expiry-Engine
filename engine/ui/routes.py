@@ -370,6 +370,39 @@ def _form_kwargs(spec: dict) -> dict:
     return out
 
 
+def _assign_is_cross_campus(conn, contract_name: str, row_campus: str) -> bool:
+    """True when assigning `contract_name` to a row coded `row_campus` crosses
+    campus — i.e. no open task with that name serves the row's Tableau campus.
+
+    Mirrors the promotion-time detection (sqlite_client.promote_filled_needs_
+    tagging) so the UI's assign-time flash agrees with what actually gets
+    flagged. Uses the Dashboard's per-name Campus Set (the last ingest's view
+    of each task) and the same crosswalk attribution uses. Best-effort: any
+    failure or unknown contract returns False (don't cry cross-campus on noise).
+    """
+    if not contract_name or not row_campus:
+        return False
+    try:
+        from engine import campus_map
+        _fo, _do = sqlite_client.load_campus_map_overrides(conn)
+        crosswalk = campus_map.build(_fo, _do)
+        rows = conn.execute(
+            'SELECT "Campus Set" FROM "Dashboard" WHERE "Contract" = ?',
+            (contract_name,),
+        ).fetchall()
+        if not rows:
+            return False  # unknown name — can't judge; let promotion decide
+        for r in rows:
+            opts = frozenset(
+                s for s in (r["Campus Set"] or "").split(", ") if s
+            )
+            if crosswalk.contract_matches_tableau_campus(opts, row_campus):
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def register_routes(app: Flask) -> None:
     # A secret key is required for flash() messages; for a single-user
     # localhost app there's no auth surface, so a fixed dev key is fine.
@@ -541,7 +574,7 @@ def register_routes(app: Flask) -> None:
         # operator left a stale tab open and the row was cleaned up by
         # a --ingest run).
         existing = g.conn.execute(
-            'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (record_id,)
+            'SELECT "Campus" FROM "Needs Tagging" WHERE id = ?', (record_id,)
         ).fetchone()
         if existing is None:
             abort(404)
@@ -549,12 +582,28 @@ def register_routes(app: Flask) -> None:
         sqlite_client.set_needs_tagging_assign_contract(
             g.conn, record_id=record_id, contract_name=contract_name,
         )
-        flash(
-            f"Saved. Next --ingest will promote this row to Learned Mappings."
-            if contract_name
-            else "Cleared Assign Contract on this row.",
-            "success",
-        )
+        if not contract_name:
+            flash("Cleared Assign Contract on this row.", "success")
+            return redirect(url_for("needs_tagging"))
+        # "ASK if there is any doubt": tell the operator up front when their pick
+        # is CROSS-CAMPUS — the assigned contract serves no campus matching this
+        # row's Tableau campus. Promotion records it as a deliberate exception;
+        # this flash makes that visible at decision time so an accidental pick is
+        # caught before the next ingest. Best-effort — never block the save.
+        row_campus = (existing["Campus"] or "").strip()
+        if _assign_is_cross_campus(g.conn, contract_name, row_campus):
+            flash(
+                f"Saved as a CROSS-CAMPUS EXCEPTION: {row_campus} spend → "
+                f"“{contract_name}” (a contract on another campus). Next "
+                f"--ingest will record it as a deliberate exception. Clear this "
+                f"field if that wasn’t intended.",
+                "success",
+            )
+        else:
+            flash(
+                "Saved. Next --ingest will promote this row to Learned Mappings.",
+                "success",
+            )
         return redirect(url_for("needs_tagging"))
 
     @app.route("/p-card-spend/<int:record_id>/link-by-description", methods=["POST"])

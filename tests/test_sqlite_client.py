@@ -385,13 +385,13 @@ def test_load_learned_mappings_builds_key_tuple(conn):
         "Key": "PARTIAL", "Campus": "CEN", "Contract Name": "",
     })
     out = load_learned_mappings(conn)
-    # Phase 7c: value is a LIST of (name, gid, description_pattern) tuples
-    # so one (campus, dept, account, vendor) key can carry multiple
-    # description-pattern-specific LMs (operator splits a single group
-    # across multiple Asana tasks by line-item scope). Legacy single-LM rows
-    # come back as a one-element list with gid + pattern both None.
+    # Phase 7c: value is a LIST of (name, gid, description_pattern,
+    # cross_campus_exception) tuples so one (campus, dept, account, vendor) key
+    # can carry multiple description-pattern-specific LMs. Legacy single-LM rows
+    # come back as a one-element list with gid + pattern None and flag False.
     assert out == {
-        ("CEN", "000", "63015", "Acme SaaS"): [("Acme SaaS Contract", None, None)],
+        ("CEN", "000", "63015", "Acme SaaS"):
+            [("Acme SaaS Contract", None, None, False)],
     }
 
 
@@ -638,6 +638,51 @@ def test_promote_with_no_validation_set_still_promotes(conn):
     })
     promotions = promote_filled_needs_tagging(conn, learned_at_iso_date="2026-06-12")
     assert len(promotions) == 1
+
+
+def _xc_setup(conn, *, row_campus, contract_campus):
+    """Seed one filled Needs Tagging row + return (crosswalk, contracts_by_name)
+    for a single 'DH Pace' contract on `contract_campus`."""
+    from engine import campus_map
+    from engine.asana_contracts import Contract
+    _seed(conn, "Needs Tagging", {
+        "Group Key": f"{row_campus}|000|63040|DH Pace",
+        "Campus": row_campus, "Dept": "000", "Account No": "63040",
+        "Vendor": "DH Pace", "Assign Contract": "DH Pace",
+    })
+    c = Contract(
+        gid="cen1", name="DH Pace",
+        campus_options=frozenset({contract_campus}),
+        contract_amount=1000.0, target_start=date(2026, 1, 1),
+        due_on=date(2026, 12, 31), status="Active", expire_countdown=None,
+        pm_email=None, section_name="Active - Compliant",
+    )
+    return campus_map.build(), {"DH Pace": [c]}
+
+
+def test_promote_flags_cross_campus_exception(conn):
+    """WAR row assigned to a CEN-only contract → promotion sets the
+    Cross-Campus Exception flag so attribution honors the pin across campus."""
+    crosswalk, by_name = _xc_setup(conn, row_campus="WAR", contract_campus="CEN")
+    promotions = promote_filled_needs_tagging(
+        conn, learned_at_iso_date="2026-06-12",
+        crosswalk=crosswalk, contracts_by_name=by_name,
+    )
+    assert len(promotions) == 1 and promotions[0].cross_campus is True
+    lm = _all_rows(conn, "Learned Mappings")[0]
+    assert lm["Cross-Campus Exception"] == 1
+
+
+def test_promote_same_campus_leaves_flag_off(conn):
+    """CEN row assigned to a CEN contract is ordinary — flag stays off."""
+    crosswalk, by_name = _xc_setup(conn, row_campus="CEN", contract_campus="CEN")
+    promotions = promote_filled_needs_tagging(
+        conn, learned_at_iso_date="2026-06-12",
+        crosswalk=crosswalk, contracts_by_name=by_name,
+    )
+    assert len(promotions) == 1 and promotions[0].cross_campus is False
+    lm = _all_rows(conn, "Learned Mappings")[0]
+    assert (lm["Cross-Campus Exception"] or 0) == 0
 
 
 # ---------------------------------------------------------------------------

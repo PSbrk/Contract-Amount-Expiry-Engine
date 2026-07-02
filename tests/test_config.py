@@ -95,10 +95,9 @@ def test_campus_map_overrides():
     # Exact-match (2026-06-24): no forward Tableau→Asana guesses. Identity is
     # implicit in the matcher; YVN/ZNR/etc. fall to the operator until coded.
     assert campus_map.TABLEAU_TO_ASANA == {}
-    # Asana-side starred overrides are kept (they encode a real Asana option
-    # label → Tableau code, not a guess).
-    assert campus_map.ASANA_OVERRIDE_TO_TABLEAU["***NOR (contract is for OMH)"] == frozenset({"OMH"})
-    assert campus_map.ASANA_OVERRIDE_TO_TABLEAU["***TUL (contract is for SBA)"] == frozenset({"SBA"})
+    # 2026-07-02: the ***NOR/***TUL blanket overrides are RETIRED — cross-campus
+    # is now a per-case flagged Learned Mapping, not a global crosswalk rule.
+    assert campus_map.ASANA_OVERRIDE_TO_TABLEAU == {}
 
 
 def test_pace_and_budget_defaults():

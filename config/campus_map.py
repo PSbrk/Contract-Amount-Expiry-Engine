@@ -26,13 +26,18 @@ ASANA_WILDCARD_OPTIONS: Final = frozenset({"All Campuses"})
 # ponytail: empty by design — re-add a code here only for a genuine non-identity alias.
 TABLEAU_TO_ASANA: Final = {}
 
-# Asana option NAME → Tableau code that should hit it (for the starred overrides).
-# These are the inverse direction: a Tableau code can match many Asana options;
-# and an Asana option can be tied to a non-matching Tableau code via these overrides.
-ASANA_OVERRIDE_TO_TABLEAU: Final = {
-    "***NOR (contract is for OMH)": frozenset({"OMH"}),
-    "***TUL (contract is for SBA)": frozenset({"SBA"}),
-}
+# Asana option NAME → Tableau code that should hit it (for non-identity aliases).
+# The inverse direction: an Asana option tied to a non-matching Tableau code.
+# EMPTY by design (2026-07-02): the old ***NOR→OMH / ***TUL→SBA entries were
+# EXCEPTIONS wrongly encoded as always-on GLOBAL rules — they cross-attributed
+# every OMH/SBA transaction for those vendors regardless of the operator's
+# intent. Cross-campus is now NEVER automatic: it happens only via a per-case,
+# operator-confirmed Learned Mapping carrying the "Cross-Campus Exception" flag.
+# ***NOR/***TUL-tagged contracts whose spend used to ride this override now fall
+# to Needs Tagging, where the operator confirms each once (see engine.attribution
+# flagged-exception path). ponytail: re-add here ONLY for a genuine always-true
+# non-identity alias — a real one-off belongs in a flagged LM, not this map.
+ASANA_OVERRIDE_TO_TABLEAU: Final = {}
 
 # Asana options that exist but have no Tableau equivalent (yet). Left here for
 # documentation; the matcher just won't find transactions for these.

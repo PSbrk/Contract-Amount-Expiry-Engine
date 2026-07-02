@@ -198,6 +198,106 @@ def test_learned_mapping_takes_precedence_over_fuzzy_match():
     assert run.learned[0].status == "learned"
 
 
+def test_learned_mapping_gid_pin_must_respect_campus():
+    """A gid-pinned Learned Mapping must NOT attribute across campus. A pin
+    keyed to EDM but pointing at a CEN-only contract (the real EDM->CEN
+    Oklahoma Chiller leak) is ignored; with no EDM contract for the vendor the
+    row falls through to unmatched instead of dumping spend on the CEN task."""
+    df = _df(
+        {"Record No": "R1", "Campus": "EDM", "Dept": "000", "Account No": "63040",
+         "Vendor": "Oklahoma Chiller Corporation", "Record Description": "hvac",
+         "Amount": 5000.0},
+    )
+    cen = _contract("Oklahoma Chiller Corporation", frozenset({"CEN"}), gid="cen1")
+    learned = {("EDM", "000", "63040", "Oklahoma Chiller Corporation"):
+               [("Oklahoma Chiller Corporation", "cen1", None)]}
+    run = attribute(df, [cen], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings=learned)
+    assert len(run.learned) == 0            # cross-campus pin NOT honored
+    assert run.row_gids == (None,)          # no spend leaked onto the CEN gid
+    assert len(run.unmatched) == 1
+
+
+def test_learned_mapping_gid_pin_honored_when_campus_matches():
+    """The same pin, for a row whose campus the contract DOES serve, still
+    attributes — the campus guard only blocks cross-campus pins."""
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63040",
+         "Vendor": "Oklahoma Chiller Corporation", "Record Description": "hvac",
+         "Amount": 5000.0},
+    )
+    cen = _contract("Oklahoma Chiller Corporation", frozenset({"CEN"}), gid="cen1")
+    learned = {("CEN", "000", "63040", "Oklahoma Chiller Corporation"):
+               [("Oklahoma Chiller Corporation", "cen1", None)]}
+    run = attribute(df, [cen], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings=learned)
+    assert len(run.learned) == 1
+    assert run.learned[0].contract_gid == "cen1"
+
+
+# ---------------------------------------------------------------------------
+# Cross-campus EXCEPTIONS — the flagged, operator-confirmed override
+# ---------------------------------------------------------------------------
+
+def _xc_learned(campus, vendor, name, gid):
+    """A flagged (Cross-Campus Exception) gid-pinned Learned Mapping."""
+    return {(campus, "000", "63040", vendor):
+            [(name, gid, None, True)]}
+
+
+def test_flagged_cross_campus_exception_is_honored():
+    """A WAR-coded row billed to a CEN contract: with the Cross-Campus Exception
+    flag set AND no WAR contract for the vendor, the pin attributes across
+    campus (the deliberate exception the operator confirmed)."""
+    df = _df(
+        {"Record No": "R1", "Campus": "WAR", "Dept": "000", "Account No": "63040",
+         "Vendor": "DH Pace", "Record Description": "doors", "Amount": 5000.0},
+    )
+    cen = _contract("DH Pace", frozenset({"CEN"}), gid="cen1")
+    learned = _xc_learned("WAR", "DH Pace", "DH Pace", "cen1")
+    run = attribute(df, [cen], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings=learned)
+    assert len(run.learned) == 1
+    assert run.learned[0].contract_gid == "cen1"
+    assert run.row_gids == ("cen1",)
+
+
+def test_unflagged_cross_campus_pin_still_blocked():
+    """The SAME pin without the flag is treated as an accidental leak and
+    blocked — the regression guard for the Oklahoma Chiller incident stays."""
+    df = _df(
+        {"Record No": "R1", "Campus": "WAR", "Dept": "000", "Account No": "63040",
+         "Vendor": "DH Pace", "Record Description": "doors", "Amount": 5000.0},
+    )
+    cen = _contract("DH Pace", frozenset({"CEN"}), gid="cen1")
+    learned = {("WAR", "000", "63040", "DH Pace"):
+               [("DH Pace", "cen1", None, False)]}
+    run = attribute(df, [cen], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings=learned)
+    assert len(run.learned) == 0
+    assert run.row_gids == (None,)
+
+
+def test_flagged_exception_re_asks_when_same_campus_home_exists():
+    """Play-it-safe rule: even with a flagged cross-campus exception, if the
+    row's OWN campus now has a live contract for the vendor, don't silently
+    apply the old exception — surface BOTH as ambiguous so the operator
+    re-decides."""
+    df = _df(
+        {"Record No": "R1", "Campus": "WAR", "Dept": "000", "Account No": "63040",
+         "Vendor": "DH Pace", "Record Description": "doors", "Amount": 5000.0},
+    )
+    cen = _contract("DH Pace", frozenset({"CEN"}), gid="cen1")
+    war = _contract("DH Pace", frozenset({"WAR"}), gid="war1")  # new same-campus home
+    learned = _xc_learned("WAR", "DH Pace", "DH Pace", "cen1")
+    run = attribute(df, [cen, war], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings=learned)
+    assert len(run.learned) == 0
+    assert len(run.ambiguous) == 1
+    assert set(run.ambiguous[0].candidate_gids) == {"cen1", "war1"}
+    assert run.row_gids == (None,)  # no spend lands until operator re-decides
+
+
 # ---------------------------------------------------------------------------
 # Ambiguous — multiple candidates after campus narrow
 # ---------------------------------------------------------------------------
@@ -276,27 +376,69 @@ def test_dropped_when_campus_is_int():
 
 
 # ---------------------------------------------------------------------------
-# Wildcard contract matches any campus
+# "All Campuses" wildcard — prefer specific, ask on wildcard-only (2026-07-02)
 # ---------------------------------------------------------------------------
 
-def test_wildcard_contract_matches_any_tableau_campus():
+def test_wildcard_only_match_is_not_auto_attributed_but_surfaced():
+    """A match that exists SOLELY via the All-Campuses wildcard is no longer
+    auto-attributed — the operator can't control that Asana coding, so the
+    engine asks once (ambiguous → Needs Tagging) rather than silently letting a
+    magnet contract swallow the spend."""
     df = _df(
         {"Record No": "R1", "Campus": "DAL", "Dept": "000", "Account No": "63015",
          "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 100.0},
     )
-    contracts = [_contract("Acme SaaS", frozenset({"All Campuses"}))]
+    contracts = [_contract("Acme SaaS", frozenset({"All Campuses"}), gid="wild")]
     run = attribute(df, contracts, aliases={}, crosswalk=campus_map.build(),
                     learned_mappings={})
+    assert len(run.auto) == 0
+    assert len(run.ambiguous) == 1
+    assert run.ambiguous[0].candidate_gids == ("wild",)  # surfaced for confirm
+    assert run.row_gids == (None,)                        # nothing lands yet
+
+
+def test_specific_campus_contract_beats_all_campuses_wildcard():
+    """The DH Pace scenario: a campus-specific contract and an All-Campuses
+    contract both vendor-match. The specific one wins automatically; the
+    wildcard magnet never grabs the spend."""
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63040",
+         "Vendor": "DH Pace", "Record Description": "doors", "Amount": 5000.0},
+    )
+    specific = _contract("DH Pace", frozenset({"CEN"}), gid="cen1")
+    wildcard = _contract("DH Pace", frozenset({"All Campuses"}), gid="wild")
+    run = attribute(df, [specific, wildcard], aliases={},
+                    crosswalk=campus_map.build(), learned_mappings={})
     assert len(run.auto) == 1
+    assert run.auto[0].contract_gid == "cen1"
+    assert run.row_gids == ("cen1",)
+
+
+def test_wildcard_learned_mapping_still_attributes_after_confirm():
+    """Once the operator confirms a wildcard-only match (a Learned Mapping), it
+    attributes directly — the 'ask' happens once, not every ingest."""
+    df = _df(
+        {"Record No": "R1", "Campus": "DAL", "Dept": "000", "Account No": "63015",
+         "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 100.0},
+    )
+    wildcard = _contract("Acme SaaS", frozenset({"All Campuses"}), gid="wild")
+    learned = {("DAL", "000", "63015", "Acme SaaS"):
+               [("Acme SaaS", "wild", None, False)]}
+    run = attribute(df, [wildcard], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings=learned)
+    assert len(run.learned) == 1
+    assert run.row_gids == ("wild",)
 
 
 # ---------------------------------------------------------------------------
 # Crosswalk-driven matches
 # ---------------------------------------------------------------------------
 
-def test_omh_transaction_matches_contract_with_nor_override():
-    """A contract with Asana option '***NOR (contract is for OMH)' must
-    match Tableau OMH transactions (spec §5 reverse override)."""
+def test_omh_transaction_no_longer_auto_matches_retired_nor_override():
+    """2026-07-02: the ***NOR→OMH blanket override is retired. A contract still
+    tagged with the old '***NOR (contract is for OMH)' option name no longer
+    auto-matches OMH transactions — the row falls to unmatched (Needs Tagging),
+    where the operator confirms a cross-campus exception once."""
     df = _df(
         {"Record No": "R1", "Campus": "OMH", "Dept": "000", "Account No": "63015",
          "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 100.0},
@@ -306,7 +448,8 @@ def test_omh_transaction_matches_contract_with_nor_override():
     ]
     run = attribute(df, contracts, aliases={}, crosswalk=campus_map.build(),
                     learned_mappings={})
-    assert len(run.auto) == 1
+    assert len(run.auto) == 0
+    assert len(run.unmatched) == 1
 
 
 def test_yvn_transaction_needs_exact_campus_match():

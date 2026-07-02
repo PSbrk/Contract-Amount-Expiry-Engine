@@ -590,28 +590,19 @@ def _narrow_by_description(
     return top
 
 
-def _narrow_and_pick(
-    candidates: list[Contract],
+def _pick_within_term(
+    pool: list[Contract],
     *,
-    campus: str,
     row_date: date | None,
     record_description: str,
-    crosswalk: CampusCrosswalk,
 ) -> tuple[Contract | None, list[Contract]]:
-    """Apply campus + date + description + earliest-start narrowing.
+    """Date + description + earliest-start narrowing over an ALREADY
+    campus-filtered pool. Split out of _narrow_and_pick so the campus-narrow
+    can first prefer specific contracts over the All-Campuses wildcard.
 
-    Returns (winner, surviving). winner is the single contract attribution
-    landed on (None if 0 or >1 survived). surviving is the candidates left
-    after all narrowing — the "ambiguous" set when winner is None and len > 1,
-    the "vendor-only hints" set when winner is None and len == 0 (caller can
-    rebuild from candidates).
+    Returns (winner, surviving) — winner is None when 0 or >1 survive.
     """
-    # Campus narrow.
-    after_campus = [
-        c for c in candidates
-        if crosswalk.contract_matches_tableau_campus(c.campus_options, campus)
-    ]
-    if not after_campus:
+    if not pool:
         return None, []
 
     # Phase 14a: Even when only one contract matches by campus, the date
@@ -622,14 +613,14 @@ def _narrow_and_pick(
     # ambiguity set so the operator sees it in Vendor Conflicts with a
     # "outside term" marker and can resolve it (extend the term in Asana,
     # or mark as pre-dates).
-    if len(after_campus) == 1:
-        only = after_campus[0]
+    if len(pool) == 1:
+        only = pool[0]
         if _date_contains(only, row_date):
             return only, [only]
         return None, [only]
 
     # Date narrow — only contracts whose window contains the row's date.
-    after_date = [c for c in after_campus if _date_contains(c, row_date)]
+    after_date = [c for c in pool if _date_contains(c, row_date)]
     if len(after_date) == 1:
         return after_date[0], [after_date[0]]
 
@@ -637,7 +628,7 @@ def _narrow_and_pick(
         # All campus-matching contracts have windows that don't cover this
         # date. Surface them as ambiguous candidates — operator will need to
         # either fix the date data, the contract dates, or assign manually.
-        return None, after_campus
+        return None, pool
 
     # Description narrow: one vendor often holds two contracts in different
     # scopes (landscaping + snow removal). Match Tableau's Record Description
@@ -673,6 +664,62 @@ def _narrow_and_pick(
     return None, tied
 
 
+def _narrow_and_pick(
+    candidates: list[Contract],
+    *,
+    campus: str,
+    row_date: date | None,
+    record_description: str,
+    crosswalk: CampusCrosswalk,
+    ask_on_wildcard: bool = True,
+) -> tuple[Contract | None, list[Contract]]:
+    """Apply campus + date + description + earliest-start narrowing.
+
+    Returns (winner, surviving). winner is the single contract attribution
+    landed on (None if 0 or >1 survived). surviving is the candidates left
+    after all narrowing — the "ambiguous" set when winner is None and len > 1,
+    the "vendor-only hints" set when winner is None and len == 0 (caller can
+    rebuild from candidates).
+
+    "All Campuses" (wildcard) handling:
+      - PREFER SPECIFIC: if any candidate matches this campus specifically, the
+        wildcard-only candidates are dropped — a real per-campus contract always
+        beats the org-wide magnet (prevents e.g. an All-Campuses DH Pace task
+        from swallowing a campus's spend away from its own DH Pace contract).
+      - ASK ON WILDCARD-ONLY: when the ONLY matches are via the wildcard, don't
+        auto-attribute — surface the pick as ambiguous so the operator confirms
+        once (the confirm becomes a Learned Mapping; future ingests attribute
+        directly). Suppressed (ask_on_wildcard=False) when the caller already
+        has an operator-confirmed answer (the multi-task Learned Mapping path).
+    """
+    # Campus narrow.
+    after_campus = [
+        c for c in candidates
+        if crosswalk.contract_matches_tableau_campus(c.campus_options, campus)
+    ]
+    if not after_campus:
+        return None, []
+
+    # Prefer campus-SPECIFIC over the All-Campuses wildcard.
+    specific = [
+        c for c in after_campus
+        if crosswalk.contract_matches_specific(c.campus_options, campus)
+    ]
+    wildcard_only = not specific
+    pool = specific if specific else after_campus
+
+    winner, surviving = _pick_within_term(
+        pool, row_date=row_date, record_description=record_description,
+    )
+
+    # Ask-on-wildcard-only: never silently auto-attribute a match that exists
+    # solely via the All-Campuses wildcard. Surface the winner (single-candidate
+    # ambiguous) so the operator confirms once.
+    if wildcard_only and ask_on_wildcard and winner is not None:
+        return None, [winner]
+    return winner, surviving
+
+
 # ---------------------------------------------------------------------------
 # Per-row attribution
 # ---------------------------------------------------------------------------
@@ -689,7 +736,7 @@ def _attribute_row(
     crosswalk: CampusCrosswalk,
     learned_mappings: Mapping[
         tuple[str, str, str, str],
-        list[tuple[str, str | None, str | None]],
+        list[tuple[str, str | None, str | None, bool]],
     ],
     contracts_by_name: Mapping[str, list[Contract]],
     fuzzy_threshold: int,
@@ -733,7 +780,10 @@ def _attribute_row(
         best_pattern_specificity = -1
         plain_lm: tuple | None = None
         for lm in lms:
-            cn_i, gid_i, pat_i = lm
+            # LM entries are 4-tuples: (name, gid, pattern, cross_campus_exc).
+            # ponytail: tolerate legacy 3-tuples (default flag False) so
+            # hand-authored / older callers don't need the 4th element.
+            cn_i, gid_i, pat_i, xc_i = lm if len(lm) == 4 else (*lm, False)
             if pat_i:
                 # #7: match by normalized meaningful-token subset, not raw
                 # substring, so a pattern survives volatile invoice numbers /
@@ -743,26 +793,80 @@ def _attribute_row(
                     specificity = len(_meaningful_tokens(pat_i))
                     if specificity > best_pattern_specificity:
                         best_pattern_specificity = specificity
-                        best_pattern_match = (cn_i, gid_i, pat_i)
+                        best_pattern_match = (cn_i, gid_i, pat_i, xc_i)
             else:
                 # Take the FIRST plain LM seen (operator shouldn't author
                 # duplicates; the schema doesn't enforce uniqueness here
                 # because the key shape changed).
                 if plain_lm is None:
-                    plain_lm = (cn_i, gid_i, None)
+                    plain_lm = (cn_i, gid_i, None, xc_i)
         chosen = best_pattern_match or plain_lm
         if chosen is not None:
-            cn, pinned_gid, _ = chosen
+            cn, pinned_gid, _, is_exc = chosen
             same_name_contracts = list(contracts_by_name.get(cn, []))
+            # Flagged CROSS-CAMPUS EXCEPTION -- handled BEFORE same-campus
+            # resolution so an old exception can't silently switch to (or be
+            # overridden by) a newly-valid same-campus contract. The operator
+            # DELIBERATELY mapped this key to a contract on another campus
+            # (e.g. WAR-coded spend billed to a CEN contract). Resolve the
+            # intended target; if it's genuinely cross-campus, honor it --
+            # UNLESS the row's own campus now has a live home for this vendor,
+            # in which case re-ask (surface both). "Play it safe" per operator.
+            if is_exc and same_name_contracts:
+                target = None
+                if pinned_gid:
+                    target = next(
+                        (c for c in same_name_contracts if c.gid == pinned_gid), None,
+                    )
+                if target is None and len(same_name_contracts) == 1:
+                    target = same_name_contracts[0]
+                if target is not None and not crosswalk.contract_matches_tableau_campus(
+                    target.campus_options, campus,
+                ):
+                    same_campus_home = [
+                        c for c in _match_vendor(
+                            vendor, searchable, fuzzy_threshold, campus_codes,
+                        )
+                        if c.gid != target.gid
+                        and crosswalk.contract_matches_tableau_campus(
+                            c.campus_options, campus,
+                        )
+                        and _coding_compatible(c, dept, account_no)
+                        and _date_contains(c, row_date)
+                    ]
+                    if same_campus_home:
+                        cands = tuple(
+                            {c.gid: c for c in (target, *same_campus_home)}.values()
+                        )
+                        return "ambiguous", None, cands, cands
+                    # No same-campus home → honor the exception (date-gated,
+                    # same current-term-only drop rule as the pinned path).
+                    if _date_contains(target, row_date):
+                        return "learned", target.gid, (target,), ()
+                    return "dropped", None, (), ()
+                # target unresolved / actually same-campus → fall through to
+                # normal same-campus resolution below.
+            # A Learned Mapping must still respect the campus crosswalk. The LM
+            # key includes campus, so a pin only applies to contracts that serve
+            # THIS row's campus. Resolving against the campus-compatible tasks
+            # only stops an operator pick (or a same-name default) that crossed
+            # campus from leaking spend onto a wrong-campus contract -- e.g. an
+            # "EDM|...|Oklahoma Chiller" pin onto a CEN-only contract. When no
+            # same-name task serves this campus the LM doesn't apply: fall
+            # through to vendor match + campus narrow, which routes the row to
+            # the right-campus contract or parks it (Needs Tagging / No-Home).
+            campus_ok = [
+                c for c in same_name_contracts
+                if crosswalk.contract_matches_tableau_campus(c.campus_options, campus)
+            ]
             # Gid-pinned (Vendor Conflicts panel): operator chose a specific
-            # task. Only honor the pin if the task is still in the open
-            # contracts set.
+            # task. Only honor the pin if that task is open AND serves this campus.
             if pinned_gid:
                 pinned_match = next(
-                    (c for c in same_name_contracts if c.gid == pinned_gid), None,
+                    (c for c in campus_ok if c.gid == pinned_gid), None,
                 )
                 if pinned_match is not None:
-                    # Pinned LM still has to pass the date check. But the
+                    # Pinned + campus-OK still has to pass the date check. But the
                     # operator pinned THIS contract, so an out-of-term row is
                     # not an ambiguity — under the current-term-only model it's
                     # pre-term spend that belongs to a prior contract. Drop it
@@ -774,41 +878,59 @@ def _attribute_row(
                     if _date_contains(pinned_match, row_date):
                         return "learned", pinned_gid, (pinned_match,), ()
                     return "dropped", None, (), ()
-                # Pinned gid no longer exists — fall through to name resolution.
-            if len(same_name_contracts) == 1:
-                # The learned name resolves to exactly one open contract;
-                # enforce the date check. Out-of-term → pre-term spend → drop
-                # (same rationale as the pinned-gid path above).
-                only = same_name_contracts[0]
+                # Pinned gid is stale OR cross-campus — fall through to name
+                # resolution below (over the campus-compatible set).
+            if len(campus_ok) == 1:
+                # The learned name resolves to exactly one campus-compatible open
+                # contract; enforce the date check. Out-of-term → pre-term spend
+                # → drop (same rationale as the pinned-gid path above).
+                only = campus_ok[0]
                 if _date_contains(only, row_date):
                     return "learned", only.gid, (only,), ()
                 return "dropped", None, (), ()
-            if len(same_name_contracts) > 1:
-                # Out-of-term for EVERY task under the operator's learned name
-                # → pre-term spend → drop, consistent with the single-name and
-                # pinned paths. (Only an in-term-but-undecidable row stays
+            if len(campus_ok) > 1:
+                # Out-of-term for EVERY campus-compatible task under the learned
+                # name → pre-term spend → drop, consistent with the single-name
+                # and pinned paths. (Only an in-term-but-undecidable row stays
                 # ambiguous below.)
-                if not any(_date_contains(c, row_date) for c in same_name_contracts):
+                if not any(_date_contains(c, row_date) for c in campus_ok):
                     return "dropped", None, (), ()
-                # Treat learned-name as the candidate set and run normal narrowing.
+                # Narrow within the learned name's campus-compatible tasks.
+                # ask_on_wildcard=False: the operator already confirmed this
+                # name via the Learned Mapping, so a wildcard match here needs
+                # no second confirm.
                 winner, surviving = _narrow_and_pick(
-                    same_name_contracts, campus=campus, row_date=row_date,
+                    campus_ok, campus=campus, row_date=row_date,
                     record_description=record_description, crosswalk=crosswalk,
+                    ask_on_wildcard=False,
                 )
                 if winner is not None:
                     return "learned", winner.gid, tuple(surviving), ()
-                # Couldn't narrow even within the learned name's tasks → ambiguous.
-                return "ambiguous", None, tuple(surviving), tuple(same_name_contracts)
-            # Stale: learned name no longer maps to any open contract — fall
-            # through to fuzzy match, log once per group_key+stale-name pair.
+                # Couldn't narrow even within them → ambiguous.
+                return "ambiguous", None, tuple(surviving), tuple(campus_ok)
+            # No campus-compatible open task carries the learned name. Either the
+            # LM is stale (name maps to no open contract) or it's an UNFLAGGED
+            # cross-campus pin (contract exists but serves another campus, and
+            # the operator did NOT mark it a Cross-Campus Exception → treated as
+            # an accidental leak). Log once per group key and fall through to
+            # fuzzy match + campus narrow, which handles both correctly.
             if key not in stale_learned_seen:
                 stale_learned_seen.add(key)
-                log.warning(
-                    "stale Learned Mapping for group %s -> %r: that contract is no "
-                    "longer in the open Asana contracts list. Falling through to "
-                    "fuzzy match. Edit or delete the Learned Mappings row to clean up.",
-                    "|".join(key), cn,
-                )
+                if same_name_contracts:
+                    log.warning(
+                        "cross-campus Learned Mapping for group %s -> %r: that "
+                        "name's open contract(s) do not serve campus %r. Ignoring "
+                        "the pin and falling through to vendor match. Fix or delete "
+                        "the Learned Mappings row.",
+                        "|".join(key), cn, campus,
+                    )
+                else:
+                    log.warning(
+                        "stale Learned Mapping for group %s -> %r: that contract is no "
+                        "longer in the open Asana contracts list. Falling through to "
+                        "fuzzy match. Edit or delete the Learned Mappings row to clean up.",
+                        "|".join(key), cn,
+                    )
 
     # 3. Vendor fuzzy match (with aliases). Candidates may be empty.
     vendor_candidates = _match_vendor(vendor, searchable, fuzzy_threshold, campus_codes)
@@ -876,7 +998,7 @@ def attribute(
     crosswalk: CampusCrosswalk,
     learned_mappings: Mapping[
         tuple[str, str, str, str],
-        list[tuple[str, str | None, str | None]],
+        list[tuple[str, str | None, str | None, bool]],
     ],
     *,
     fuzzy_threshold: int = DEFAULT_FUZZY_THRESHOLD,

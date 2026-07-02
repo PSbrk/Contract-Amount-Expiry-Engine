@@ -34,19 +34,16 @@ def test_default_crosswalk_yvn_is_identity_not_cen():
     assert not cw.contract_matches_tableau_campus(frozenset({"CEN"}), "YVN")
 
 
-def test_default_crosswalk_omh_includes_nor_override():
-    """Spec §5: Asana '***NOR (contract is for OMH)' → Tableau OMH. The
-    forward crosswalk must reverse-encode this so a contract tagged with
-    ***NOR matches Tableau OMH transactions."""
+def test_nor_tul_blanket_overrides_are_retired():
+    """2026-07-02: the ***NOR→OMH / ***TUL→SBA blanket crosswalk overrides are
+    GONE (they were exceptions wrongly encoded as always-on rules). OMH/SBA now
+    resolve to plain identity; cross-campus routing is a per-case flagged
+    Learned Mapping, not a global map entry."""
     cw = campus_map.build()
-    assert "***NOR (contract is for OMH)" in cw.lookup("OMH")
-    assert "OMH" in cw.lookup("OMH")
-
-
-def test_default_crosswalk_sba_includes_tul_override():
-    cw = campus_map.build()
-    assert "***TUL (contract is for SBA)" in cw.lookup("SBA")
-    assert "SBA" in cw.lookup("SBA")
+    assert cw.lookup("OMH") == frozenset({"OMH"})
+    assert cw.lookup("SBA") == frozenset({"SBA"})
+    assert "***NOR (contract is for OMH)" not in cw.lookup("OMH")
+    assert "***TUL (contract is for SBA)" not in cw.lookup("SBA")
 
 
 def test_default_crosswalk_int_is_drop_code():
@@ -76,12 +73,14 @@ def test_contract_matches_on_exact_campus():
     assert cw.contract_matches_tableau_campus(frozenset({"YVN"}), "YVN")
 
 
-def test_contract_matches_via_nor_override():
-    """A contract tagged with '***NOR (contract is for OMH)' must match
-    Tableau OMH transactions (the override's whole purpose)."""
+def test_nor_tagged_contract_no_longer_matches_omh():
+    """With the blanket override retired, a contract still tagged with the old
+    '***NOR (contract is for OMH)' option name matches NOTHING by identity — its
+    OMH spend falls to Needs Tagging, where the operator confirms a cross-campus
+    exception once (the migration path)."""
     cw = campus_map.build()
     contract = frozenset({"***NOR (contract is for OMH)"})
-    assert cw.contract_matches_tableau_campus(contract, "OMH")
+    assert not cw.contract_matches_tableau_campus(contract, "OMH")
     assert not cw.contract_matches_tableau_campus(contract, "CEN")
 
 
@@ -92,30 +91,9 @@ def test_forward_overrides_replace_config_per_code():
         forward_overrides={"CEN": frozenset({"CEN", "EDM_NEW"})},
     )
     assert cw.lookup("CEN") == frozenset({"CEN", "EDM_NEW"})
-    # Codes not in overrides keep the reverse-encoded Asana-side specials.
-    assert "***NOR (contract is for OMH)" in cw.lookup("OMH")  # default kept
-
-
-def test_forward_override_preserves_reverse_encoded_starred_options():
-    """An operator override for OMH must NOT silently wipe the reverse-encoded
-    '***NOR (contract is for OMH)' option -- that would break attribution for
-    every contract still tagged with the starred name. Same for SBA/***TUL."""
-    # Operator added OMH_NEW to the OMH option set but didn't list the
-    # starred name. The crosswalk must still include the starred name so
-    # contracts tagged with it continue to match OMH transactions.
-    cw = campus_map.build(
-        forward_overrides={"OMH": frozenset({"OMH", "OMH_NEW"})},
-    )
-    options = cw.lookup("OMH")
-    assert "OMH" in options
-    assert "OMH_NEW" in options  # operator's addition
-    assert "***NOR (contract is for OMH)" in options  # reverse-encoded preserved
-
-    # Same hazard for SBA / ***TUL.
-    cw_sba = campus_map.build(
-        forward_overrides={"SBA": frozenset({"SBA"})},
-    )
-    assert "***TUL (contract is for SBA)" in cw_sba.lookup("SBA")
+    # Codes not in overrides fall back to identity (no reverse-encoded specials
+    # left to preserve now that the blanket overrides are retired).
+    assert cw.lookup("OMH") == frozenset({"OMH"})
 
 
 def test_drop_override_replaces_config_drops_when_provided():

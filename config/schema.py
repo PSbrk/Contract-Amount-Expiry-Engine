@@ -334,6 +334,17 @@ TABLES_SCHEMA: Final = [
                  "coding-overrides distinctly from ordinary name/conflict "
                  "mappings. Blank for all normal Learned Mappings."
              )},
+            {"name": "Cross-Campus Exception", "type": "checkbox",
+             "description": (
+                 "1 = the operator DELIBERATELY assigned this row's spend to a "
+                 "contract whose campus differs from the row's Tableau campus "
+                 "(e.g. WAR-coded spend billed to a CEN contract). Only a "
+                 "mapping with this flag set may attribute across campus; "
+                 "unflagged cross-campus mappings are treated as accidental "
+                 "leaks and blocked. Set automatically at promotion time when "
+                 "the assigned contract does not serve the row's campus. "
+                 "Replaces the old blanket ***NOR/***TUL crosswalk overrides."
+             )},
             {"name": "Learned At", "type": "date"},
             {"name": "Notes", "type": "multilineText"},
         ],

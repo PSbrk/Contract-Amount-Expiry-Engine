@@ -80,6 +80,21 @@ class CampusCrosswalk:
             return True
         return bool(contract_campus_options & self.lookup(tableau_code))
 
+    def contract_matches_specific(
+        self,
+        contract_campus_options: frozenset[str],
+        tableau_code: str,
+    ) -> bool:
+        """Like contract_matches_tableau_campus but WITHOUT the wildcard rule:
+        True only when the contract's options intersect this code's crosswalk
+        set. Lets attribution PREFER a campus-specific contract over an
+        "All Campuses" wildcard (the wildcard is a fallback, not a competitor),
+        and recognize a match that exists SOLELY via the wildcard so it can be
+        confirmed rather than auto-attributed to a magnet contract."""
+        if tableau_code in self.drop_codes:
+            return False
+        return bool(contract_campus_options & self.lookup(tableau_code))
+
 
 def build(
     forward_overrides: Mapping[str, frozenset[str]] | None = None,

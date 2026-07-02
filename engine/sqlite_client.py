@@ -531,11 +531,15 @@ def load_campus_map_overrides(
 
 def load_learned_mappings(
     conn: sqlite3.Connection,
-) -> dict[tuple[str, str, str, str], list[tuple[str, str | None, str | None]]]:
+) -> dict[tuple[str, str, str, str], list[tuple[str, str | None, str | None, bool]]]:
     """Return {(Campus, Dept, Account No, Vendor): [LearnedMapping, ...]}.
 
-    Each LearnedMapping is a 3-tuple (Contract Name, Contract Gid, Description
-    Pattern):
+    Each LearnedMapping is a 4-tuple (Contract Name, Contract Gid, Description
+    Pattern, Cross-Campus Exception):
+      - Cross-Campus Exception: True iff the operator deliberately mapped this
+        key to a contract on a DIFFERENT campus. Attribution honors the pin
+        across campus only when this is set; unflagged cross-campus pins are
+        blocked as accidental leaks (engine.attribution._attribute_row).
       - Contract Gid: None for legacy mappings (operator picked by name only).
         When set, attribution prefers the specific Asana task GID over the
         name-based resolution.
@@ -551,10 +555,11 @@ def load_learned_mappings(
     and the plain LM (if any) last; the attribution lookup walks the list
     and picks the most-specific match.
     """
-    out: dict[tuple[str, str, str, str], list[tuple[str, str | None, str | None]]] = {}
+    out: dict[tuple[str, str, str, str], list[tuple[str, str | None, str | None, bool]]] = {}
     for row in conn.execute(
         '''SELECT "Campus", "Dept", "Account No", "Vendor",
-                  "Contract Name", "Contract Gid", "Description Pattern"
+                  "Contract Name", "Contract Gid", "Description Pattern",
+                  COALESCE("Cross-Campus Exception", 0) AS xcampus
            FROM "Learned Mappings"'''
     ):
         key = (
@@ -566,9 +571,10 @@ def load_learned_mappings(
         contract = (row["Contract Name"] or "").strip()
         gid = (row["Contract Gid"] or "").strip() or None
         pattern = (row["Description Pattern"] or "").strip() or None
+        cross_campus = bool(row["xcampus"])
         if not contract or not all(key):
             continue
-        out.setdefault(key, []).append((contract, gid, pattern))
+        out.setdefault(key, []).append((contract, gid, pattern, cross_campus))
 
     # Sort each key's list: pattern-bearing LMs first (longest pattern wins
     # the tiebreaker at lookup time, but presorting reduces work there),
@@ -718,9 +724,15 @@ def upsert_plain_learned_mapping(
     learned_at: str,
     notes: str = "",
     ignore_coding: bool = False,
+    cross_campus_exception: bool = False,
     commit: bool = True,
 ) -> None:
     """Insert or update the PLAIN (no-pattern) Learned Mapping for `key`.
+
+    cross_campus_exception=True marks a deliberate operator decision to
+    attribute this key's spend across campus (see the schema field). The
+    UPDATE path ALWAYS writes it, so a later same-campus promotion clears a
+    stale cross-campus flag — same discipline as Contract Gid / Ignore Coding.
 
     ignore_coding=True marks the mapping as a Miscoded? 'Accept' override
     (the gid-pinned learned path already bypasses the coding-narrow; this
@@ -741,6 +753,7 @@ def upsert_plain_learned_mapping(
     """
     gid_val = (contract_gid or "").strip()
     ic_val = 1 if ignore_coding else 0
+    xc_val = 1 if cross_campus_exception else 0
     existing = conn.execute(
         '''SELECT id FROM "Learned Mappings"
            WHERE "Key" = ?
@@ -752,20 +765,21 @@ def upsert_plain_learned_mapping(
             '''UPDATE "Learned Mappings"
                SET "Campus" = ?, "Dept" = ?, "Account No" = ?,
                    "Vendor" = ?, "Contract Name" = ?, "Contract Gid" = ?,
-                   "Ignore Coding" = ?, "Learned At" = ?, "Notes" = ?
+                   "Ignore Coding" = ?, "Cross-Campus Exception" = ?,
+                   "Learned At" = ?, "Notes" = ?
                WHERE id = ?''',
             (campus, dept, account_no, vendor, contract_name, gid_val,
-             ic_val, learned_at, notes, existing["id"]),
+             ic_val, xc_val, learned_at, notes, existing["id"]),
         )
     else:
         conn.execute(
             '''INSERT INTO "Learned Mappings"
                  ("Key", "Campus", "Dept", "Account No", "Vendor",
                   "Contract Name", "Contract Gid", "Ignore Coding",
-                  "Learned At", "Notes")
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  "Cross-Campus Exception", "Learned At", "Notes")
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (key, campus, dept, account_no, vendor, contract_name, gid_val,
-             ic_val, learned_at, notes),
+             ic_val, xc_val, learned_at, notes),
         )
     if commit:
         conn.commit()
@@ -785,6 +799,9 @@ class Promotion:
     account_no: str
     vendor: str
     contract_name: str
+    # True when the assigned contract serves NO campus matching this row's
+    # Tableau campus — a deliberate cross-campus exception (flag set on the LM).
+    cross_campus: bool = False
 
 
 def upsert_needs_tagging_group(
@@ -992,6 +1009,8 @@ def promote_filled_needs_tagging(
     *,
     learned_at_iso_date: str,
     valid_contract_names: frozenset[str] | None = None,
+    crosswalk=None,
+    contracts_by_name: "Mapping[str, list] | None" = None,
 ) -> list[Promotion]:
     """For every Needs Tagging row with a filled Assign Contract:
     1. Validate against open Asana contract names (if provided).
@@ -1001,6 +1020,13 @@ def promote_filled_needs_tagging(
     Idempotent against partial failures: if step 3 dies after step 2,
     the next run re-enters with a no-op LM upsert, the delete succeeds,
     and we converge.
+
+    When `crosswalk` + `contracts_by_name` are provided, a promotion whose
+    assigned contract serves NO campus matching the row's Tableau campus is a
+    deliberate CROSS-CAMPUS EXCEPTION — the LM is written with that flag set so
+    attribution honors the pin across campus (unflagged cross-campus LMs are
+    blocked as leaks). Omit them and every promotion is treated same-campus
+    (backward-compatible; the standalone --promote path passes them too).
     """
     filled_rows = conn.execute(
         '''SELECT * FROM "Needs Tagging"
@@ -1037,9 +1063,25 @@ def promote_filled_needs_tagging(
             or f"{campus}|{dept}|{account_no}|{vendor}"
         )
 
+        # Cross-campus detection: if the assigned contract's open task(s) serve
+        # NO campus matching this row's Tableau campus, the operator deliberately
+        # routed spend across campus — flag it so attribution honors the pin
+        # (unflagged cross-campus LMs are blocked as leaks). Needs both the
+        # crosswalk and the name→contracts map; without them, assume same-campus.
+        cross_campus = False
+        if crosswalk is not None and contracts_by_name is not None:
+            same_name = contracts_by_name.get(contract_name, [])
+            if same_name and not any(
+                crosswalk.contract_matches_tableau_campus(c.campus_options, campus)
+                for c in same_name
+            ):
+                cross_campus = True
+
         notes_text = (
             f"Promoted from Needs Tagging on {learned_at_iso_date}. "
             f"Operator selected: {contract_name}."
+            + (f" CROSS-CAMPUS EXCEPTION: {campus} spend → a contract on "
+               f"another campus (operator-confirmed)." if cross_campus else "")
         )
         # Write the PLAIN (no-pattern) catch-all LM for the group via the
         # shared helper. contract_gid is intentionally omitted (->''): a
@@ -1053,6 +1095,7 @@ def promote_filled_needs_tagging(
             contract_name=contract_name,
             learned_at=learned_at_iso_date,
             notes=notes_text,
+            cross_campus_exception=cross_campus,
             commit=False,
         )
 
@@ -1071,6 +1114,7 @@ def promote_filled_needs_tagging(
             group_key=group_key,
             campus=campus, dept=dept, account_no=account_no, vendor=vendor,
             contract_name=contract_name,
+            cross_campus=cross_campus,
         ))
 
     if promotions:

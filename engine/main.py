@@ -300,22 +300,34 @@ def _run_promotion_only(conn, *, today_iso: str) -> int:
     who fills Assign Contract on Friday and runs --ingest with no new file
     still sees their answers get promoted. Returns the number promoted.
     """
-    from engine import asana_client, asana_contracts
-    from engine.sqlite_client import promote_filled_needs_tagging
+    from engine import asana_client, asana_contracts, campus_map
+    from engine.sqlite_client import (
+        load_campus_map_overrides, promote_filled_needs_tagging,
+    )
 
-    # Best-effort: load contract names for validation; if Asana auth fails,
-    # promote without validation (the operator will see the typo eventually).
+    # Best-effort: load contract names for validation + a name→contracts map and
+    # crosswalk for cross-campus detection; if Asana auth fails, promote without
+    # them (validation and cross-campus flagging both degrade gracefully).
     valid_names: frozenset[str] | None = None
+    crosswalk = None
+    contracts_by_name: dict[str, list] | None = None
     try:
         api = asana_client.get_api_client()
         contracts = asana_contracts.load_open_contracts(api)
         valid_names = frozenset(c.name for c in contracts if c.name)
+        _fo, _do = load_campus_map_overrides(conn)
+        crosswalk = campus_map.build(_fo, _do)
+        contracts_by_name = {}
+        for c in contracts:
+            if c.name:
+                contracts_by_name.setdefault(c.name, []).append(c)
     except Exception as exc:  # noqa: BLE001
         log.warning("Skipping contract-name validation during promotion: %s", exc)
 
     promotions = promote_filled_needs_tagging(
         conn, learned_at_iso_date=today_iso,
         valid_contract_names=valid_names,
+        crosswalk=crosswalk, contracts_by_name=contracts_by_name,
     )
     if promotions:
         print(f"Promoted {len(promotions)} Needs Tagging answer(s) to Learned Mappings:")
@@ -933,21 +945,32 @@ def _run_attribution_and_needs_tagging(
 
     opex_df = kept_df.loc[kept_df["Account No"] != capex_account].copy()
 
+    aliases = load_vendor_aliases(conn)
+    forward_overrides, drop_override = load_campus_map_overrides(conn)
+    crosswalk = campus_map.build(forward_overrides, drop_override)
+
+    # name -> [Contract, ...] over ALL open contracts, so promotion can tell
+    # whether an operator's Assign Contract pick is same-campus or a deliberate
+    # cross-campus exception (flagged on the LM; honored by attribution).
+    _contracts_by_name: dict[str, list] = {}
+    for _c in contracts:
+        if _c.name:
+            _contracts_by_name.setdefault(_c.name, []).append(_c)
+
     # Operator-driven promotions first. With valid_contract_names plumbed in,
     # a typo or stale rename in Assign Contract is caught at promotion time
     # rather than baked into a permanent Learned Mappings row.
     promotions = promote_filled_needs_tagging(
         conn, learned_at_iso_date=today_iso,
         valid_contract_names=valid_contract_names,
+        crosswalk=crosswalk, contracts_by_name=_contracts_by_name,
     )
     if promotions:
         print(f"Promoted {len(promotions)} Needs Tagging answer(s) to Learned Mappings:")
         for p in promotions:
-            print(f"  {p.group_key}  ->  {p.contract_name}")
+            _xc = "  [CROSS-CAMPUS EXCEPTION]" if p.cross_campus else ""
+            print(f"  {p.group_key}  ->  {p.contract_name}{_xc}")
 
-    aliases = load_vendor_aliases(conn)
-    forward_overrides, drop_override = load_campus_map_overrides(conn)
-    crosswalk = campus_map.build(forward_overrides, drop_override)
     learned = load_learned_mappings(conn)
 
     # P-Card links: operator said "this blank-vendor spend belongs to contract
@@ -970,7 +993,7 @@ def _run_attribution_and_needs_tagging(
         # duplicates, …) — name-only fuzzy would otherwise go ambiguous.
         for _lk in _pcard_links:
             _key = (_lk["campus"], _lk["dept"], _lk["account_no"], _lk["name"])
-            learned.setdefault(_key, []).insert(0, (_lk["name"], _lk["gid"], None))
+            learned.setdefault(_key, []).insert(0, (_lk["name"], _lk["gid"], None, False))
         print(f"P-Card links: stamped {_stamped} blank-vendor row(s) onto "
               f"{len({l['gid'] for l in _pcard_links})} linked contract(s).")
 
