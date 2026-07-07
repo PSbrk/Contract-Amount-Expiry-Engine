@@ -109,6 +109,7 @@ _ADMIN_LEARNED_MAPPINGS = {
     "save_endpoint": "learned_mappings_save",
     "delete_endpoint": "learned_mappings_delete",
     "add_endpoint": "learned_mappings_add",
+    "purge_stale_endpoint": "learned_mappings_purge_stale",
     "intro": (
         "(Campus, Dept, Account No, Vendor) → Contract attribution. "
         "Normally written by promote_filled_needs_tagging after the "
@@ -2234,6 +2235,90 @@ def register_routes(app: Flask) -> None:
                            insert=sqlite_client.insert_learned_mapping,
                            update=sqlite_client.update_learned_mapping,
                            delete=sqlite_client.delete_learned_mapping)
+
+    # ------------------------------------------------------------------
+    # /learned-mappings/purge-stale — operator-triggered "unlearning"
+    #
+    # Live Asana check: list the Learned Mappings whose target contract is no
+    # longer open (the ones attribution logs as stale before falling through to
+    # fuzzy), then delete on confirm. NOT automatic — a partial Asana fetch
+    # would make many good mappings look stale, so a human confirms and a
+    # completeness guard refuses a suspiciously large purge.
+    # ------------------------------------------------------------------
+
+    # A purge that would wipe more than this fraction of the table is treated as
+    # a likely partial Asana load, not a real cleanup, and is refused.
+    _PURGE_STALE_MAX_FRACTION = 0.5
+
+    def _load_open_contract_sets():
+        """(open_gids, open_names) from live Asana, or None on any failure."""
+        try:
+            from engine import asana_client, asana_contracts
+            contracts = asana_contracts.load_open_contracts(
+                asana_client.get_api_client()
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as an operator message
+            log.warning("purge-stale: could not load Asana contracts: %s", exc)
+            return None
+        if not contracts:
+            return None
+        gids = frozenset(c.gid for c in contracts if c.gid)
+        names = frozenset(c.name for c in contracts if c.name)
+        return gids, names
+
+    @app.route("/learned-mappings/purge-stale", methods=["GET"],
+               endpoint="learned_mappings_purge_stale")
+    def learned_mappings_purge_stale():
+        total = g.conn.execute(
+            'SELECT COUNT(*) FROM "Learned Mappings"'
+        ).fetchone()[0]
+        sets = _load_open_contract_sets()
+        if sets is None:
+            flash("Could not load open contracts from Asana — no changes made. "
+                  "Try again; a partial load must never drive a purge.", "error")
+            return redirect(url_for("learned_mappings_list"))
+        open_gids, open_names = sets
+        stale = sqlite_client.find_stale_learned_mappings(
+            g.conn, open_gids, open_names,
+        )
+        over_guard = bool(total) and len(stale) > total * _PURGE_STALE_MAX_FRACTION
+        return render_template(
+            "purge_stale_lms.html",
+            stale=stale, total=total, open_count=len(open_gids),
+            over_guard=over_guard, max_fraction=_PURGE_STALE_MAX_FRACTION,
+        )
+
+    @app.route("/learned-mappings/purge-stale", methods=["POST"],
+               endpoint="learned_mappings_purge_stale_confirm")
+    def learned_mappings_purge_stale_confirm():
+        total = g.conn.execute(
+            'SELECT COUNT(*) FROM "Learned Mappings"'
+        ).fetchone()[0]
+        # Re-fetch + re-compute server-side; never trust a client-submitted list.
+        sets = _load_open_contract_sets()
+        if sets is None:
+            flash("Could not load open contracts from Asana — no changes made.",
+                  "error")
+            return redirect(url_for("learned_mappings_list"))
+        open_gids, open_names = sets
+        stale = sqlite_client.find_stale_learned_mappings(
+            g.conn, open_gids, open_names,
+        )
+        if not stale:
+            flash("No stale Learned Mappings — nothing to purge.", "success")
+            return redirect(url_for("learned_mappings_list"))
+        if total and len(stale) > total * _PURGE_STALE_MAX_FRACTION:
+            flash(
+                f"Refused: {len(stale)} of {total} mappings look stale "
+                f"(> {int(_PURGE_STALE_MAX_FRACTION * 100)}%). That points to a "
+                "partial Asana load, not real cleanup. No changes made.",
+                "error",
+            )
+            return redirect(url_for("learned_mappings_list"))
+        for r in stale:
+            sqlite_client.delete_learned_mapping(g.conn, record_id=r["id"])
+        flash(f"Unlearned {len(stale)} stale Learned Mapping(s).", "success")
+        return redirect(url_for("learned_mappings_list"))
 
     # ------------------------------------------------------------------
     # /state — read-only audit view of the State table

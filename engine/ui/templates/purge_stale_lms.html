@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Purge stale Learned Mappings — Contract Engine{% endblock %}
+
+{% block content %}
+<header>
+  <h2>Unlearn stale Learned Mappings</h2>
+  <p><small>
+    Live Asana check against {{ open_count }} open contract(s). These mappings
+    point at a contract that is no longer open, so attribution already ignores
+    them and falls through to fuzzy match — deleting them just cleans up.
+    Cross-campus mappings (contract still exists, wrong campus) are intentionally
+    left alone.
+  </small></p>
+  <p>
+    <span class="pill">{{ stale|length }} stale</span>
+    <span class="pill">of {{ total }} total</span>
+  </p>
+</header>
+
+{% if over_guard %}
+  <article style="border-left:4px solid var(--del-color, #c00); padding-left:1rem;">
+    <strong>Refused as a safety guard.</strong>
+    {{ stale|length }} of {{ total }} mappings ({{ (stale|length / total * 100)|round(0, 'floor')|int }}%)
+    look stale — more than {{ (max_fraction * 100)|int }}%. That usually means Asana
+    returned a partial contract list, not that these are really stale. No delete
+    button is shown. Re-open this page in a minute to retry.
+  </article>
+  <p><a href="{{ url_for('learned_mappings_list') }}" role="button" class="secondary">Back to Learned Mappings</a></p>
+{% elif stale %}
+  <figure>
+  <table role="grid">
+    <thead>
+      <tr><th>Campus</th><th>Dept</th><th>Account</th><th>Vendor</th><th>Maps to</th><th>Pattern</th></tr>
+    </thead>
+    <tbody>
+      {% for r in stale %}
+        <tr>
+          <td>{{ r["Campus"] }}</td>
+          <td>{{ r["Dept"] }}</td>
+          <td>{{ r["Account No"] }}</td>
+          <td>{{ r["Vendor"] }}</td>
+          <td>{{ r["Contract Name"] }}{% if r["Contract Gid"] %} <small>({{ r["Contract Gid"] }})</small>{% endif %}</td>
+          <td>{{ r["Description Pattern"] or "—" }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </figure>
+  <form method="post" action="{{ url_for('learned_mappings_purge_stale_confirm') }}"
+        onsubmit="return confirm('Delete {{ stale|length }} stale Learned Mapping(s)? This cannot be undone.');">
+    <button type="submit" class="contrast">Unlearn {{ stale|length }} stale mapping(s)</button>
+    <a href="{{ url_for('learned_mappings_list') }}" role="button" class="secondary outline">Cancel</a>
+  </form>
+{% else %}
+  <p>No stale Learned Mappings — nothing to unlearn. ✓</p>
+  <p><a href="{{ url_for('learned_mappings_list') }}" role="button" class="secondary">Back to Learned Mappings</a></p>
+{% endif %}
+{% endblock %}

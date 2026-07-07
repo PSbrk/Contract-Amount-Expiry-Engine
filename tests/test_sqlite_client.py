@@ -1285,3 +1285,61 @@ def test_delete_amendment_link_unknown_gid_is_noop(conn):
     rows = _all_rows(conn, "Amendment Links")
     assert len(rows) == 1
     assert rows[0]["Amendment Gid"] == "g_a"
+
+
+# ---------------------------------------------------------------------------
+# find_stale_learned_mappings — "unlearning" candidate detection
+# ---------------------------------------------------------------------------
+
+def _seed_lm(conn, *, campus, dept, acct, vendor, name, gid="", pattern=None):
+    conn.execute(
+        'INSERT INTO "Learned Mappings" '
+        '("Key","Campus","Dept","Account No","Vendor","Contract Name",'
+        ' "Contract Gid","Description Pattern") VALUES (?,?,?,?,?,?,?,?)',
+        (f"{campus}|{dept}|{acct}|{vendor}", campus, dept, acct, vendor,
+         name, gid, pattern),
+    )
+    conn.commit()
+
+
+def test_find_stale_learned_mappings_gid_and_name_semantics(conn):
+    """A gid-pinned row is stale iff its gid is not open; a name-based row is
+    stale iff its name has no open contract. Cross-campus (name/gid still
+    exists) is NOT stale, and a row with neither gid nor name is left alone."""
+    from engine.sqlite_client import find_stale_learned_mappings
+
+    # name-based, name open -> keep
+    _seed_lm(conn, campus="CEN", dept="000", acct="63040", vendor="Live Co",
+             name="Live Contract")
+    # name-based, name gone -> stale
+    _seed_lm(conn, campus="OPK", dept="000", acct="63040", vendor="Gone Co",
+             name="Rose Paving")
+    # gid-pinned, gid open -> keep (even though this name isn't in open_names)
+    _seed_lm(conn, campus="MWC", dept="000", acct="63040", vendor="Pinned Co",
+             name="whatever", gid="gid-open")
+    # gid-pinned, gid gone -> stale
+    _seed_lm(conn, campus="NKC", dept="000", acct="63040", vendor="Pin Gone",
+             name="Capital Equipment", gid="gid-gone")
+    # cross-campus proxy: name still open -> NOT stale
+    _seed_lm(conn, campus="OKC", dept="000", acct="63090", vendor="BeClean",
+             name="Be Clean OKC")
+    # neither gid nor name -> left alone
+    _seed_lm(conn, campus="STO", dept="000", acct="63040", vendor="Empty",
+             name="")
+
+    open_gids = frozenset({"gid-open"})
+    open_names = frozenset({"Live Contract", "Be Clean OKC"})
+    stale = find_stale_learned_mappings(conn, open_gids, open_names)
+    stale_vendors = {r["Vendor"] for r in stale}
+    assert stale_vendors == {"Gone Co", "Pin Gone"}
+
+
+def test_find_stale_learned_mappings_none_when_all_resolve(conn):
+    from engine.sqlite_client import find_stale_learned_mappings
+    _seed_lm(conn, campus="CEN", dept="000", acct="63040", vendor="A", name="C1")
+    _seed_lm(conn, campus="EDM", dept="000", acct="63040", vendor="B",
+             name="ignored", gid="g1")
+    stale = find_stale_learned_mappings(
+        conn, frozenset({"g1"}), frozenset({"C1"}),
+    )
+    assert stale == []

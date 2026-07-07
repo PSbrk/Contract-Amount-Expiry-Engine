@@ -20,6 +20,11 @@
   <h2>{{ spec.title }}</h2>
   <p><small>{{ spec.intro }}</small></p>
   <p><span class="pill">{{ rows|length }} row{{ '' if rows|length == 1 else 's' }}</span></p>
+  {% if spec.purge_stale_endpoint %}
+    <p><a href="{{ url_for(spec.purge_stale_endpoint) }}" role="button" class="secondary outline" style="margin:0;">
+      Unlearn stale mappings…</a>
+      <small>Live Asana check for mappings whose contract is gone.</small></p>
+  {% endif %}
 </header>
 
 <figure>

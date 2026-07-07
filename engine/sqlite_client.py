@@ -1270,6 +1270,36 @@ def delete_learned_mapping(conn: sqlite3.Connection, *, record_id: int) -> None:
     conn.commit()
 
 
+def find_stale_learned_mappings(
+    conn: sqlite3.Connection,
+    open_gids: frozenset[str],
+    open_names: frozenset[str],
+) -> list[sqlite3.Row]:
+    """Return Learned Mapping rows whose target contract no longer exists in
+    the open Asana contract set — the same "stale" the attribution step logs
+    before falling through to fuzzy match.
+
+    Matches attribution's own resolution order so this can't disagree with it:
+      - gid-pinned row (Contract Gid set) → stale iff that gid is not open.
+      - name-based row (blank gid)        → stale iff that name has no open
+                                            contract.
+
+    A cross-campus mapping (name/gid still exists, just serves another campus)
+    is NOT stale and is deliberately excluded — that's an operator decision to
+    make, not a cleanup. Rows with neither a gid nor a name are left alone.
+    """
+    stale: list[sqlite3.Row] = []
+    for r in conn.execute('SELECT * FROM "Learned Mappings" ORDER BY id'):
+        gid = (r["Contract Gid"] or "").strip()
+        name = (r["Contract Name"] or "").strip()
+        if gid:
+            if gid not in open_gids:
+                stale.append(r)
+        elif name and name not in open_names:
+            stale.append(r)
+    return stale
+
+
 # ---------------------------------------------------------------------------
 # Amendment Links -- operator-declared "task A is amendment of task B"
 # ---------------------------------------------------------------------------
@@ -1961,6 +1991,7 @@ __all__ = [
     "insert_learned_mapping",
     "update_learned_mapping",
     "delete_learned_mapping",
+    "find_stale_learned_mappings",
     "load_amendment_links",
     "insert_amendment_link",
     "delete_amendment_link",

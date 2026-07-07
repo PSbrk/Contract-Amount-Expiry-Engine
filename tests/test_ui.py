@@ -2345,3 +2345,72 @@ def test_no_home_classifies_wildcard_and_survives_bad_json(client, conn):
     assert "TUL|000|63040|Chiller" in body  # A listed
     assert "MWC|000|63040|Chiller" in body  # C listed (no crash)
     assert "Belfor" not in body             # B suppressed by All-Campuses wildcard
+
+
+# ---------------------------------------------------------------------------
+# /learned-mappings/purge-stale — operator-triggered "unlearning"
+# ---------------------------------------------------------------------------
+
+import types as _types
+
+
+def _fake_contracts(pairs):
+    """pairs: list of (gid, name) -> objects with .gid/.name attrs."""
+    return [_types.SimpleNamespace(gid=g, name=n) for g, n in pairs]
+
+
+def _patch_asana(monkeypatch, contracts):
+    from engine import asana_client, asana_contracts
+    monkeypatch.setattr(asana_client, "get_api_client", lambda: None)
+    monkeypatch.setattr(
+        asana_contracts, "load_open_contracts", lambda _api: contracts,
+    )
+
+
+def _seed_lm_ui(conn, *, campus, vendor, name, gid=""):
+    conn.execute(
+        'INSERT INTO "Learned Mappings" '
+        '("Key","Campus","Dept","Account No","Vendor","Contract Name","Contract Gid") '
+        'VALUES (?,?,?,?,?,?,?)',
+        (f"{campus}|000|63040|{vendor}", campus, "000", "63040", vendor, name, gid),
+    )
+    conn.commit()
+
+
+def test_purge_stale_preview_lists_only_stale(client, conn, monkeypatch):
+    _seed_lm_ui(conn, campus="CEN", vendor="Live", name="Live Contract")
+    _seed_lm_ui(conn, campus="OPK", vendor="Gone", name="Rose Paving")
+    _patch_asana(monkeypatch, _fake_contracts([("g1", "Live Contract")]))
+    body = client.get("/learned-mappings/purge-stale").get_data(as_text=True)
+    assert "Rose Paving" in body       # stale, listed
+    assert "Live Contract" not in body  # not stale, not listed
+
+
+def test_purge_stale_confirm_deletes_only_stale(client, conn, monkeypatch):
+    _seed_lm_ui(conn, campus="CEN", vendor="Live", name="Live Contract")
+    _seed_lm_ui(conn, campus="OPK", vendor="Gone", name="Rose Paving")
+    _patch_asana(monkeypatch, _fake_contracts([("g1", "Live Contract")]))
+    resp = client.post("/learned-mappings/purge-stale", follow_redirects=True)
+    assert resp.status_code == 200
+    names = {r["Contract Name"] for r in
+             conn.execute('SELECT "Contract Name" FROM "Learned Mappings"')}
+    assert names == {"Live Contract"}   # stale one deleted, live one kept
+
+
+def test_purge_stale_guard_refuses_when_asana_load_empty(client, conn, monkeypatch):
+    _seed_lm_ui(conn, campus="CEN", vendor="Live", name="Live Contract")
+    _patch_asana(monkeypatch, [])       # empty/failed load
+    resp = client.post("/learned-mappings/purge-stale", follow_redirects=True)
+    remaining = conn.execute('SELECT COUNT(*) FROM "Learned Mappings"').fetchone()[0]
+    assert remaining == 1               # nothing deleted on a bad load
+
+
+def test_purge_stale_guard_refuses_oversized_purge(client, conn, monkeypatch):
+    # 3 mappings, 2 would be stale (>50%) -> refuse, delete nothing.
+    _seed_lm_ui(conn, campus="CEN", vendor="Live", name="Live Contract")
+    _seed_lm_ui(conn, campus="OPK", vendor="G1", name="Gone One")
+    _seed_lm_ui(conn, campus="NKC", vendor="G2", name="Gone Two")
+    _patch_asana(monkeypatch, _fake_contracts([("g1", "Live Contract")]))
+    client.post("/learned-mappings/purge-stale", follow_redirects=True)
+    remaining = conn.execute('SELECT COUNT(*) FROM "Learned Mappings"').fetchone()[0]
+    assert remaining == 3               # over-guard blocked the purge
