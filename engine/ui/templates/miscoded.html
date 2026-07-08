@@ -12,7 +12,9 @@
       (the coding check is bypassed, and it keeps showing here until the source
       coding is fixed); <em>Correctly coded</em> confirms the difference is
       real and leaves the spend unattributed (it counts as genuinely-separate,
-      no-contract spend).
+      no-contract spend); <em>Ignore</em> parks a group that can't be allocated
+      (e.g. the charge pre-dates the CapEx project's budget window) &mdash; left
+      unattributed and hidden, and it won't resurface on the next ingest.
     </small>
   </p>
   <nav>
@@ -23,6 +25,8 @@
              {% if show == 'accepted' %}aria-current="page"{% endif %}>Accepted as miscoded ({{ accepted_count }})</a></li>
       <li><a href="{{ url_for('miscoded', show='confirmed') }}"
              {% if show == 'confirmed' %}aria-current="page"{% endif %}>Confirmed correct ({{ confirmed_count }})</a></li>
+      <li><a href="{{ url_for('miscoded', show='ignored') }}"
+             {% if show == 'ignored' %}aria-current="page"{% endif %}>Ignored ({{ ignored_count }})</a></li>
     </ul>
   </nav>
 </header>
@@ -74,6 +78,7 @@
       <td>
         <strong>{{ r["Vendor"] or "" }}</strong>
         {% if show == 'confirmed' %}<span class="pill">confirmed correct</span>{% endif %}
+        {% if show == 'ignored' %}<span class="pill">ignored</span>{% endif %}
         <br>
         <small>{{ r["Campus"] or "" }} &middot; Dept {{ r["Dept"] or "—" }} &middot; acct {{ r["Account No"] or "" }}</small>
         <br><small style="color: var(--pico-muted-color);">{{ (r["Sample Record Description"] or "")[:90] }}</small>
@@ -94,6 +99,10 @@
           <form method="post" action="{{ url_for('miscoded_unconfirm', record_id=r['id']) }}" style="margin:0;">
             <button type="submit" class="secondary" style="margin:0;">Reopen</button>
           </form>
+        {% elif show == 'ignored' %}
+          <form method="post" action="{{ url_for('miscoded_unignore', record_id=r['id']) }}" style="margin:0;">
+            <button type="submit" class="secondary" style="margin:0;">Reopen</button>
+          </form>
         {% else %}
           {% for c in item.candidates %}
           <form method="post" action="{{ url_for('miscoded_accept', record_id=r['id']) }}"
@@ -112,6 +121,9 @@
             <button type="submit" class="secondary outline" style="margin:0; font-size:0.85rem;">Acknowledged &mdash; fix coding at source</button>
             {% endif %}
           </form>
+          <form method="post" action="{{ url_for('miscoded_ignore', record_id=r['id']) }}" style="margin:0.3rem 0 0 0;">
+            <button type="submit" class="secondary outline" style="margin:0; font-size:0.85rem;">Ignore (unallocatable &mdash; won't resurface)</button>
+          </form>
         {% endif %}
       </td>
     </tr>
@@ -123,6 +135,8 @@
 {% else %}
   {% if show == 'confirmed' %}
     <p>No groups confirmed as correctly-coded.</p>
+  {% elif show == 'ignored' %}
+    <p>No ignored groups. Use <em>Ignore</em> on an Open row for spend that can't be allocated (e.g. it pre-dates the CapEx project's budget window).</p>
   {% else %}
     <p>No coding mismatches awaiting a decision. The engine routes a group here only when a live contract matches on vendor, campus, and term but the Dept/Acct differs.</p>
   {% endif %}

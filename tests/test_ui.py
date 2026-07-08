@@ -281,6 +281,25 @@ def test_miscoded_confirm_correct_moves_to_confirmed_view(client, conn):
     assert "Lux Lawns" in client.get("/miscoded?show=confirmed").get_data(as_text=True)
 
 
+def test_miscoded_ignore_dismisses_and_reopen_restores(client, conn):
+    """Ignore (e.g. spend outside the CapEx budget window, unallocatable):
+    sets Dismissed=1 so the row leaves Open, shows under Ignored, won't
+    resurface on re-ingest, and Reopen restores it."""
+    rid = _seed_miscoded(conn)
+    client.post(f"/miscoded/{rid}/ignore")
+    assert conn.execute(
+        'SELECT "Dismissed" FROM "Needs Tagging" WHERE id=?', (rid,)
+    ).fetchone()[0] == 1
+    assert "Lux Lawns" not in client.get("/miscoded?show=open").get_data(as_text=True)
+    assert "Lux Lawns" in client.get("/miscoded?show=ignored").get_data(as_text=True)
+    # Reopen → back to Open, Dismissed cleared.
+    client.post(f"/miscoded/{rid}/unignore")
+    assert conn.execute(
+        'SELECT "Dismissed" FROM "Needs Tagging" WHERE id=?', (rid,)
+    ).fetchone()[0] == 0
+    assert "Lux Lawns" in client.get("/miscoded?show=open").get_data(as_text=True)
+
+
 def test_miscoded_cross_tier_offers_accept_to_capex_contract(client, conn):
     """A cross-tier coding mismatch surfaces the matched CapEx contract as its
     candidate, so the operator can Accept and link the opex charge to the CapEx

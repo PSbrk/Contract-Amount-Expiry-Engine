@@ -1455,15 +1455,25 @@ def register_routes(app: Flask) -> None:
                 })
             return out
 
-        base = ('FROM "Needs Tagging" WHERE COALESCE("Coding Mismatch", 0) = 1 '
-                'AND COALESCE("Dismissed", 0) = 0 '
-                'AND COALESCE("Once Off", 0) = 0 '
-                'AND COALESCE("Is P-Card", 0) = 0')
+        # A coding-mismatch group. Dismissed=1 is the "Ignore" state (e.g. spend
+        # outside the CapEx budget window, unallocatable) — it leaves the active
+        # queue and, being Dismissed, the ingest upsert never refreshes it, so it
+        # won't resurface.
+        mismatch = ('FROM "Needs Tagging" WHERE COALESCE("Coding Mismatch", 0) = 1 '
+                    'AND COALESCE("Once Off", 0) = 0 '
+                    'AND COALESCE("Is P-Card", 0) = 0')
+        active = mismatch + ' AND COALESCE("Dismissed", 0) = 0'
+        ignored = mismatch + ' AND COALESCE("Dismissed", 0) = 1'
         accepted = []
         items = []
         if show == "confirmed":
             items = with_candidates(g.conn.execute(
-                f'SELECT * {base} AND COALESCE("Coding Confirmed", 0) = 1 '
+                f'SELECT * {active} AND COALESCE("Coding Confirmed", 0) = 1 '
+                'ORDER BY COALESCE("$ in group", 0) DESC, "Group Key"'
+            ).fetchall())
+        elif show == "ignored":
+            items = with_candidates(g.conn.execute(
+                f'SELECT * {ignored} '
                 'ORDER BY COALESCE("$ in group", 0) DESC, "Group Key"'
             ).fetchall())
         elif show == "accepted":
@@ -1475,16 +1485,17 @@ def register_routes(app: Flask) -> None:
         else:
             show = "open"
             items = with_candidates(g.conn.execute(
-                f'SELECT * {base} AND COALESCE("Coding Confirmed", 0) = 0 '
+                f'SELECT * {active} AND COALESCE("Coding Confirmed", 0) = 0 '
                 'ORDER BY COALESCE("$ in group", 0) DESC, "Group Key"'
             ).fetchall())
 
         open_count = g.conn.execute(
-            f'SELECT COUNT(*) {base} AND COALESCE("Coding Confirmed", 0) = 0'
+            f'SELECT COUNT(*) {active} AND COALESCE("Coding Confirmed", 0) = 0'
         ).fetchone()[0]
         confirmed_count = g.conn.execute(
-            f'SELECT COUNT(*) {base} AND COALESCE("Coding Confirmed", 0) = 1'
+            f'SELECT COUNT(*) {active} AND COALESCE("Coding Confirmed", 0) = 1'
         ).fetchone()[0]
+        ignored_count = g.conn.execute(f'SELECT COUNT(*) {ignored}').fetchone()[0]
         accepted_count = g.conn.execute(
             'SELECT COUNT(*) FROM "Learned Mappings" '
             'WHERE COALESCE("Ignore Coding", 0) = 1'
@@ -1493,7 +1504,7 @@ def register_routes(app: Flask) -> None:
             "miscoded.html",
             show=show, items=items, accepted=accepted,
             open_count=open_count, accepted_count=accepted_count,
-            confirmed_count=confirmed_count,
+            confirmed_count=confirmed_count, ignored_count=ignored_count,
         )
 
     @app.route("/miscoded/<int:record_id>/accept", methods=["POST"])
@@ -1573,6 +1584,36 @@ def register_routes(app: Flask) -> None:
         g.conn.commit()
         flash("Reopened in Miscoded?.", "success")
         return redirect(url_for("miscoded", show="confirmed"))
+
+    @app.route("/miscoded/<int:record_id>/ignore", methods=["POST"])
+    def miscoded_ignore(record_id: int):
+        """Ignore this group — unallocatable (e.g. the charge pre-dates the
+        CapEx project budget window). Sets Dismissed=1: it leaves the Open
+        queue, stays unattributed, and the ingest upsert never refreshes a
+        Dismissed row so it won't resurface. Reversible via Reopen."""
+        existing = g.conn.execute(
+            'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if existing is None:
+            abort(404)
+        sqlite_client.set_needs_tagging_dismissed(
+            g.conn, record_id=record_id, dismissed=True)
+        flash("Ignored — left unattributed; it won't resurface. Reopen from "
+              "the Ignored tab if needed.", "success")
+        return redirect(url_for("miscoded"))
+
+    @app.route("/miscoded/<int:record_id>/unignore", methods=["POST"])
+    def miscoded_unignore(record_id: int):
+        """Undo Ignore -> back to the open Miscoded? queue."""
+        existing = g.conn.execute(
+            'SELECT 1 FROM "Needs Tagging" WHERE id = ?', (record_id,)
+        ).fetchone()
+        if existing is None:
+            abort(404)
+        sqlite_client.set_needs_tagging_dismissed(
+            g.conn, record_id=record_id, dismissed=False)
+        flash("Reopened in Miscoded?.", "success")
+        return redirect(url_for("miscoded", show="ignored"))
 
     @app.route("/miscoded/lm/<int:record_id>/revert", methods=["POST"])
     def miscoded_revert(record_id: int):
