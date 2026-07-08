@@ -742,6 +742,7 @@ def _attribute_row(
     fuzzy_threshold: int,
     stale_learned_seen: set[tuple[str, str, str, str]],
     campus_codes: frozenset[str] = frozenset(),
+    ignore_rules: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> tuple[str, str | None, tuple[Contract, ...], tuple[Contract, ...]]:
     """Attribute a single row.
 
@@ -759,6 +760,14 @@ def _attribute_row(
 
     # 1. Drop-code short-circuit.
     if crosswalk.is_drop_code(campus):
+        return "dropped", None, (), ()
+
+    # 1b. Ignore-rule short-circuit: operator-configured (Campus, Dept, Account
+    # No) triples another team owns (e.g. CEN/000/63080). Dropped BEFORE the LM
+    # and fuzzy paths so their spend never attributes and any stale LM keyed to
+    # the triple is inert. Exact-triple match only — the same account attributes
+    # normally at any other campus/dept, and 63015 (CapEx) is never in the set.
+    if (campus, dept, account_no) in ignore_rules:
         return "dropped", None, (), ()
 
     # 2. Learned Mappings take precedence over fuzzy matching when the name
@@ -991,6 +1000,42 @@ def _attribute_row(
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def find_contracts_matching_ignore_rules(
+    contracts: Iterable[Contract],
+    ignore_rules: frozenset[tuple[str, str, str]],
+    crosswalk: CampusCrosswalk,
+) -> list[tuple[Contract, tuple[str, str, str]]]:
+    """Read-only detector: open contracts coded to an ignore-rule triple.
+
+    Once the engine drops a (Campus, Dept, Account No) triple's spend, any
+    contract coded to that triple reads 0% forever — surface it so the operator
+    can retire/recode it in Asana. A contract matches a rule when its Acc equals
+    the rule account, its Dept set contains the rule dept, and its Campus options
+    map (crosswalk, specific — wildcard excluded) to the rule's Tableau code.
+    Returns (contract, rule) pairs, one per matched contract.
+
+    Only LIVE contracts are flagged — an Inactive/archived contract already
+    reads 0% by design, so surfacing it is noise. "Live" mirrors passes_live_gate's
+    active test (section == write-gate OR status Active), minus the term window
+    the detector doesn't need.
+    """
+    write_gate = settings.ASANA_WRITE_GATE_SECTION
+    hits: list[tuple[Contract, tuple[str, str, str]]] = []
+    for c in contracts:
+        if not (c.section_name == write_gate or c.status == "Active"):
+            continue
+        for rule in ignore_rules:
+            r_campus, r_dept, r_acc = rule
+            if (c.acc or "") != r_acc:
+                continue
+            if r_dept not in _dept_set(c.dept):
+                continue
+            if crosswalk.contract_matches_specific(c.campus_options, r_campus):
+                hits.append((c, rule))
+                break  # one flag per contract is enough
+    return hits
+
+
 def attribute(
     df: pd.DataFrame,
     contracts: list[Contract],
@@ -1002,11 +1047,15 @@ def attribute(
     ],
     *,
     fuzzy_threshold: int = DEFAULT_FUZZY_THRESHOLD,
+    ignore_rules: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> AttributionRun:
     """Run attribution against an in-scope DataFrame.
 
     df must already be in-scope (ACCOUNTS_IN_SCOPE × DEPTS_IN_SCOPE filtered)
     and have Amount as a signed float, plus a Date column (datetime / Timestamp).
+
+    ignore_rules: (Campus, Dept, Account No) triples to drop outright (another
+    team's spend). See _attribute_row step 1b.
     """
     # Build the search corpus once: (string, contract) pairs covering contract
     # names AND every alias. Same contract may appear multiple times so we
@@ -1088,6 +1137,7 @@ def attribute(
             fuzzy_threshold=fuzzy_threshold,
             stale_learned_seen=stale_learned_seen,
             campus_codes=campus_codes,
+            ignore_rules=ignore_rules,
         )
         row_raw_gids.append(gid)
 

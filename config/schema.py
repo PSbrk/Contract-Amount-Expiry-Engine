@@ -291,6 +291,24 @@ TABLES_SCHEMA: Final = [
         ],
     },
     {
+        "name": "Ignore Rules",
+        "description": (
+            "(Campus, Dept, Account No) triples another team owns in Tableau. "
+            "The engine drops matching transactions (status 'dropped') BEFORE "
+            "attribution. Operator-editable -- add/remove combos with no rebuild. "
+            "Never list 63015 (the CapEx foundation account)."
+        ),
+        "fields": [
+            {"name": "Campus", "type": "singleLineText",
+             "description": "Tableau campus code (e.g. CEN)."},
+            {"name": "Dept", "type": "singleLineText",
+             "description": "Tableau dept code (e.g. 000)."},
+            {"name": "Account No", "type": "singleLineText",
+             "description": "Tableau account number (e.g. 63080)."},
+            {"name": "Notes", "type": "multilineText"},
+        ],
+    },
+    {
         "name": "Learned Mappings",
         "description": (
             "(Campus, Dept, Account No, Vendor) -> Contract attribution, "

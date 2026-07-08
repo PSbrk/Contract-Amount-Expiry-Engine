@@ -2414,3 +2414,26 @@ def test_purge_stale_guard_refuses_oversized_purge(client, conn, monkeypatch):
     client.post("/learned-mappings/purge-stale", follow_redirects=True)
     remaining = conn.execute('SELECT COUNT(*) FROM "Learned Mappings"').fetchone()[0]
     assert remaining == 3               # over-guard blocked the purge
+
+
+def test_ignore_rules_crud_and_detector_page(client, conn, monkeypatch):
+    """Ignore Rules admin page does add/delete; the detector page renders even
+    when Asana is unreachable (hermetic)."""
+    from engine import asana_client
+
+    monkeypatch.setattr(asana_client, "get_api_client",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no asana")))
+
+    assert client.get("/ignore-rules").status_code == 200
+    client.post("/ignore-rules", data={
+        "campus": "CEN", "dept": "000", "account_no": "63080", "notes": "x"})
+    assert sqlite_client.load_ignore_rules(conn) == frozenset({("CEN", "000", "63080")})
+
+    row = conn.execute('SELECT id FROM "Ignore Rules"').fetchone()
+    client.post(f"/ignore-rules/{row['id']}/delete")
+    assert sqlite_client.load_ignore_rules(conn) == frozenset()
+
+    # Detector page: Asana down → renders with the error banner, no 500.
+    resp = client.get("/ignore-rule-contracts")
+    assert resp.status_code == 200
+    assert b"Asana unreachable" in resp.data

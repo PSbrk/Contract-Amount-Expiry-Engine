@@ -1343,3 +1343,46 @@ def test_find_stale_learned_mappings_none_when_all_resolve(conn):
         conn, frozenset({"g1"}), frozenset({"C1"}),
     )
     assert stale == []
+
+
+# ---------------------------------------------------------------------------
+# Ignore Rules — operator-editable (Campus, Dept, Account No) drop triples
+# ---------------------------------------------------------------------------
+
+def test_ignore_rules_seed_load_and_delete(conn):
+    from engine.sqlite_client import (
+        delete_learned_mappings_for_ignore_rules,
+        insert_learned_mapping,
+        load_ignore_rules,
+        seed_default_ignore_rules,
+    )
+
+    # Fresh table is empty until seeded.
+    assert load_ignore_rules(conn) == frozenset()
+
+    seeded = seed_default_ignore_rules(conn)
+    assert seeded == 3
+    rules = load_ignore_rules(conn)
+    assert ("CEN", "000", "63080") in rules
+    assert ("CEN", "000", "63015") not in rules  # CapEx never seeded
+
+    # Idempotent: seeding again while rows exist inserts nothing.
+    assert seed_default_ignore_rules(conn) == 0
+
+    # A blank-field row is ignored (an incomplete rule can't match).
+    conn.execute('INSERT INTO "Ignore Rules" ("Campus","Dept","Account No") '
+                 'VALUES (?, ?, ?)', ("CEN", "", "63080"))
+    conn.commit()
+    assert len(load_ignore_rules(conn)) == 3
+
+    # Unlearn LMs keyed to an ignore triple; leave others alone.
+    insert_learned_mapping(conn, key="CEN|000|63080|Other Team",
+                           campus="CEN", dept="000", account_no="63080",
+                           vendor="Other Team", contract_name="X")
+    insert_learned_mapping(conn, key="OKC|000|63040|Real",
+                           campus="OKC", dept="000", account_no="63040",
+                           vendor="Real", contract_name="Y")
+    deleted = delete_learned_mappings_for_ignore_rules(conn, rules)
+    assert deleted == 1
+    remaining = conn.execute('SELECT "Campus" FROM "Learned Mappings"').fetchall()
+    assert [r["Campus"] for r in remaining] == ["OKC"]

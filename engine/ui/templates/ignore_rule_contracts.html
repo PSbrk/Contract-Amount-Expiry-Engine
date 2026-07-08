@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Mis-coded contracts (Ignore Rules) — Contract Engine{% endblock %}
+
+{% block content %}
+<header>
+  <h2>Contracts coded to an ignored combo</h2>
+  <p><small>
+    Read-only. These open Asana contracts are coded to a (Campus, Dept, Account No)
+    triple the engine now <strong>drops</strong> — so their spend never attributes
+    and they read 0% forever. Retire or re-code each one in Asana. The engine never
+    edits Asana contracts. Edit the triples on the
+    <a href="{{ url_for('ignore_rules_list') }}">Ignore Rules</a> page.
+  </small></p>
+  <p>
+    {% for r in rules %}<span class="pill">{{ r[0] }}|{{ r[1] }}|{{ r[2] }}</span> {% endfor %}
+  </p>
+</header>
+
+{% if asana_error %}
+  <article style="border-left:4px solid var(--del-color, #c00); padding-left:1rem;">
+    <strong>⚠ Asana unreachable</strong> ({{ asana_error }}) — can't check contracts right now. Retry in a minute.
+  </article>
+{% elif hits %}
+  <figure>
+  <table role="grid">
+    <thead>
+      <tr><th>Contract</th><th>Matched rule</th><th>Campus</th><th>Dept</th><th>Account</th><th>GID</th></tr>
+    </thead>
+    <tbody>
+      {% for h in hits %}
+        <tr>
+          <td>{{ h.name }}</td>
+          <td><span class="pill">{{ h.rule }}</span></td>
+          <td>{{ h.campus }}</td>
+          <td>{{ h.dept or "—" }}</td>
+          <td>{{ h.acc or "—" }}</td>
+          <td><small>{{ h.gid }}</small></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </figure>
+{% else %}
+  <p>No open contracts are coded to an ignored combo. ✓</p>
+{% endif %}
+{% endblock %}

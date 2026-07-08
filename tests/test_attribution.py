@@ -376,6 +376,81 @@ def test_dropped_when_campus_is_int():
 
 
 # ---------------------------------------------------------------------------
+# Ignore Rules — operator-editable (Campus, Dept, Account No) drop triples.
+# Another team owns CEN/000/{63080,63090,63040}; our team must ignore them.
+# ---------------------------------------------------------------------------
+
+_IGNORE = frozenset({("CEN", "000", "63080"), ("CEN", "000", "63090"),
+                     ("CEN", "000", "63040")})
+
+
+def test_ignore_rule_drops_matching_triple():
+    """A row matching a (Campus, Dept, Account No) ignore rule is dropped
+    BEFORE any attribution — even though vendor+campus would auto-attribute."""
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63080",
+         "Vendor": "Other Team Vendor", "Record Description": "x", "Amount": 5000.0},
+    )
+    contracts = [_contract("Other Team Vendor", frozenset({"CEN"}))]
+    run = attribute(df, contracts, aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings={}, ignore_rules=_IGNORE)
+    assert len(run.dropped) == 1
+    assert len(run.auto) == 0
+
+
+def test_ignore_rule_never_touches_capex_account():
+    """GUARDRAIL: CEN/000/63015 is the CapEx foundation — the ignore rules
+    must never drop it, even when all three ignore accounts are configured."""
+    df = _df(
+        {"Record No": "R1", "Campus": "CEN", "Dept": "000", "Account No": "63015",
+         "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 1000.0},
+    )
+    contracts = [_contract("Acme SaaS", frozenset({"CEN"}))]
+    run = attribute(df, contracts, aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings={}, ignore_rules=_IGNORE)
+    assert len(run.dropped) == 0
+    assert len(run.auto) == 1
+
+
+def test_ignore_rule_scoped_to_exact_triple():
+    """63040 is a live opex account ELSEWHERE — only the exact CEN/000 triple
+    is ignored; the same account at another campus/dept still attributes."""
+    df = _df(
+        {"Record No": "R1", "Campus": "OKC", "Dept": "000", "Account No": "63040",
+         "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 1000.0},
+        {"Record No": "R2", "Campus": "CEN", "Dept": "107", "Account No": "63040",
+         "Vendor": "Acme SaaS", "Record Description": "x", "Amount": 1000.0},
+    )
+    contracts = [_contract("Acme SaaS", frozenset({"CEN", "OKC"}))]
+    run = attribute(df, contracts, aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings={}, ignore_rules=_IGNORE)
+    assert len(run.dropped) == 0
+    assert len(run.auto) == 2
+
+
+def test_detector_finds_contracts_coded_to_ignore_rule():
+    """Read-only detector: after we start dropping CEN/000/63080 spend, any
+    open contract coded to that triple would read 0% forever — flag it."""
+    import dataclasses
+    from engine.attribution import find_contracts_matching_ignore_rules
+
+    bad = dataclasses.replace(
+        _contract("Other Team Thing", frozenset({"CEN"})), dept="000", acc="63080")
+    ok_capex = dataclasses.replace(
+        _contract("Our CapEx Thing", frozenset({"CEN"})), dept="000", acc="63015")
+    ok_campus = dataclasses.replace(
+        _contract("Our OKC Thing", frozenset({"OKC"})), dept="000", acc="63080")
+    # Inactive/archived contract coded to the triple: irrelevant (already 0%),
+    # so the detector must NOT flag it.
+    archived = dataclasses.replace(
+        _contract("Archived Thing", frozenset({"CEN"})),
+        dept="000", acc="63080", section_name="Inactive/archived", status=None)
+    hits = find_contracts_matching_ignore_rules(
+        [bad, ok_capex, ok_campus, archived], _IGNORE, campus_map.build())
+    assert [c.name for c, _rule in hits] == ["Other Team Thing"]
+
+
+# ---------------------------------------------------------------------------
 # "All Campuses" wildcard — prefer specific, ask on wildcard-only (2026-07-02)
 # ---------------------------------------------------------------------------
 

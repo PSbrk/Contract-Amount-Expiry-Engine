@@ -531,6 +531,69 @@ def load_campus_map_overrides(
     )
 
 
+# (Campus, Dept, Account No) triples another team owns; the engine drops
+# matching transactions before attribution. Seeded once on table creation,
+# then fully operator-editable via the Ignore Rules admin page.
+_DEFAULT_IGNORE_RULES: tuple[tuple[str, str, str], ...] = (
+    ("CEN", "000", "63080"),
+    ("CEN", "000", "63090"),
+    ("CEN", "000", "63040"),
+)
+
+
+def load_ignore_rules(
+    conn: sqlite3.Connection,
+) -> frozenset[tuple[str, str, str]]:
+    """Return the set of (Campus, Dept, Account No) triples to drop. Rows with
+    any blank field are skipped (an incomplete rule can't match a real row)."""
+    out: set[tuple[str, str, str]] = set()
+    for row in conn.execute(
+        'SELECT "Campus", "Dept", "Account No" FROM "Ignore Rules"'
+    ):
+        campus = (row["Campus"] or "").strip()
+        dept = (row["Dept"] or "").strip()
+        acct = (row["Account No"] or "").strip()
+        if campus and dept and acct:
+            out.add((campus, dept, acct))
+    return frozenset(out)
+
+
+def seed_default_ignore_rules(conn: sqlite3.Connection) -> int:
+    """Insert the default ignore triples IF the table is empty (fresh create).
+    Idempotent: once any row exists (incl. after the operator deletes all of
+    them) this is a no-op, so operator edits are never resurrected. Returns the
+    number of rows inserted."""
+    already = conn.execute('SELECT COUNT(*) FROM "Ignore Rules"').fetchone()[0]
+    if already:
+        return 0
+    conn.executemany(
+        'INSERT INTO "Ignore Rules" ("Campus", "Dept", "Account No", "Notes") '
+        "VALUES (?, ?, ?, ?)",
+        [(c, d, a, "Seeded default: another team owns this combination.")
+         for c, d, a in _DEFAULT_IGNORE_RULES],
+    )
+    conn.commit()
+    return len(_DEFAULT_IGNORE_RULES)
+
+
+def delete_learned_mappings_for_ignore_rules(
+    conn: sqlite3.Connection,
+    ignore_rules: frozenset[tuple[str, str, str]],
+) -> int:
+    """Delete Learned Mappings keyed to any ignore triple — their spend is now
+    dropped before the LM path, so they can never match again. Returns count."""
+    n = 0
+    for campus, dept, acct in ignore_rules:
+        cur = conn.execute(
+            'DELETE FROM "Learned Mappings" '
+            'WHERE "Campus" = ? AND "Dept" = ? AND "Account No" = ?',
+            (campus, dept, acct),
+        )
+        n += cur.rowcount
+    conn.commit()
+    return n
+
+
 def load_learned_mappings(
     conn: sqlite3.Connection,
 ) -> dict[tuple[str, str, str, str], list[tuple[str, str | None, str | None, bool]]]:
@@ -1210,6 +1273,45 @@ def update_campus_map(
 
 def delete_campus_map(conn: sqlite3.Connection, *, record_id: int) -> None:
     conn.execute('DELETE FROM "Campus Map" WHERE id = ?', (record_id,))
+    conn.commit()
+
+
+def insert_ignore_rule(
+    conn: sqlite3.Connection,
+    *,
+    campus: str,
+    dept: str,
+    account_no: str,
+    notes: str = "",
+) -> dict:
+    cur = conn.execute(
+        'INSERT INTO "Ignore Rules" ("Campus", "Dept", "Account No", "Notes") '
+        "VALUES (?, ?, ?, ?)",
+        (campus, dept, account_no, notes),
+    )
+    conn.commit()
+    return _fetch_by_id(conn, "Ignore Rules", cur.lastrowid)
+
+
+def update_ignore_rule(
+    conn: sqlite3.Connection,
+    *,
+    record_id: int,
+    campus: str,
+    dept: str,
+    account_no: str,
+    notes: str = "",
+) -> None:
+    conn.execute(
+        'UPDATE "Ignore Rules" SET "Campus" = ?, "Dept" = ?, '
+        '"Account No" = ?, "Notes" = ? WHERE id = ?',
+        (campus, dept, account_no, notes, record_id),
+    )
+    conn.commit()
+
+
+def delete_ignore_rule(conn: sqlite3.Connection, *, record_id: int) -> None:
+    conn.execute('DELETE FROM "Ignore Rules" WHERE id = ?', (record_id,))
     conn.commit()
 
 
@@ -1988,6 +2090,12 @@ __all__ = [
     "insert_campus_map",
     "update_campus_map",
     "delete_campus_map",
+    "load_ignore_rules",
+    "seed_default_ignore_rules",
+    "delete_learned_mappings_for_ignore_rules",
+    "insert_ignore_rule",
+    "update_ignore_rule",
+    "delete_ignore_rule",
     "insert_learned_mapping",
     "update_learned_mapping",
     "delete_learned_mapping",

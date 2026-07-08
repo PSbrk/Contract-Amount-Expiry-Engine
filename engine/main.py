@@ -721,7 +721,12 @@ def _run_ingest() -> int:
     try:
         # Idempotent — a fresh install gets the 8 tables created here,
         # an existing install is a no-op.
-        sqlite_client.ensure_schema(conn)
+        _plan = sqlite_client.ensure_schema(conn)
+        # Seed default Ignore Rules ONLY when the table is first created, so a
+        # later operator "delete all" is never resurrected on the next ingest.
+        if "Ignore Rules" in _plan.tables_created:
+            _seeded = sqlite_client.seed_default_ignore_rules(conn)
+            print(f"  seeded {_seeded} default Ignore Rule(s).")
 
         source = _build_transaction_source(conn)
 
@@ -891,6 +896,7 @@ def _run_attribution_and_needs_tagging(
     from engine.sqlite_client import (
         cleanup_stale_needs_tagging,
         load_campus_map_overrides,
+        load_ignore_rules,
         load_learned_mappings,
         load_pcard_links,
         load_vendor_aliases,
@@ -949,6 +955,19 @@ def _run_attribution_and_needs_tagging(
     forward_overrides, drop_override = load_campus_map_overrides(conn)
     crosswalk = campus_map.build(forward_overrides, drop_override)
 
+    # Ignore Rules: (Campus, Dept, Account No) triples another team owns —
+    # dropped before attribution. Detector: any OPEN contract coded to a triple
+    # now reads 0% forever, so flag it for the operator to retire/recode in
+    # Asana (read-only — the engine never mutates Asana contracts).
+    ignore_rules = load_ignore_rules(conn)
+    _miscoded = attribution.find_contracts_matching_ignore_rules(
+        contracts, ignore_rules, crosswalk)
+    if _miscoded:
+        print(f"  ⚠ {len(_miscoded)} tracked contract(s) coded to an ignored "
+              f"combo — review in Asana (see /ignore-rule-contracts):")
+        for _c, _rule in _miscoded:
+            print(f"      {_c.name}  [{'|'.join(_rule)}]  gid={_c.gid}")
+
     # name -> [Contract, ...] over ALL open contracts, so promotion can tell
     # whether an operator's Assign Contract pick is same-campus or a deliberate
     # cross-campus exception (flagged on the LM; honored by attribution).
@@ -998,7 +1017,8 @@ def _run_attribution_and_needs_tagging(
               f"{len({l['gid'] for l in _pcard_links})} linked contract(s).")
 
     # Attribute the OPEX tier only (CapEx is deterministic, handled below).
-    run = attribution.attribute(opex_df, opex_contracts, aliases, crosswalk, learned)
+    run = attribution.attribute(opex_df, opex_contracts, aliases, crosswalk, learned,
+                                ignore_rules=ignore_rules)
 
     summary = run.summary_dict()
     print()
@@ -1632,7 +1652,12 @@ def _run_ui(*, port: int, open_browser: bool) -> int:
     # would error with 'no such table').
     bootstrap = sqlite_client.get_db_connection()
     try:
-        sqlite_client.ensure_schema(bootstrap)
+        _plan = sqlite_client.ensure_schema(bootstrap)
+        # Seed default Ignore Rules if THIS boot created the table, so a fresh
+        # install opened via the UI (before any ingest) still gets them, and a
+        # later "delete all" is never resurrected. Mirrors _run_ingest.
+        if "Ignore Rules" in _plan.tables_created:
+            sqlite_client.seed_default_ignore_rules(bootstrap)
     finally:
         bootstrap.close()
 

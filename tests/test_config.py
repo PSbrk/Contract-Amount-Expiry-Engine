@@ -80,10 +80,10 @@ def test_engine_table_names_in_schema():
         "Inbox", "Dashboard", "Needs Tagging", "Vendor Aliases",
         "Campus Map", "CapEx Budgets", "Learned Mappings", "Resolved Contracts",
         "Attributed Lines", "Unlinked CapEx", "Amendment Links", "State", "Run Log",
-        "Alarm Rearm",
+        "Alarm Rearm", "Ignore Rules",
     }
     assert set(schema.TABLE_NAMES) == expected
-    assert len(schema.TABLE_NAMES) == 14  # no duplicates
+    assert len(schema.TABLE_NAMES) == 15  # no duplicates
 
 
 def test_write_gate_section_is_active_compliant():

@@ -129,6 +129,26 @@ _ADMIN_LEARNED_MAPPINGS = {
     "unique_col": "Key",
 }
 
+_ADMIN_IGNORE_RULES = {
+    "title": "Ignore Rules",
+    "table_name": "Ignore Rules",
+    "save_endpoint": "ignore_rules_save",
+    "delete_endpoint": "ignore_rules_delete",
+    "add_endpoint": "ignore_rules_add",
+    "intro": (
+        "(Campus, Dept, Account No) triples another team owns in Tableau. "
+        "Matching transactions are dropped before attribution (no rebuild "
+        "needed). Never add 63015 — that's the CapEx foundation account."
+    ),
+    "columns": [
+        {"name": "Campus", "form": "campus", "type": "text", "required": True},
+        {"name": "Dept", "form": "dept", "type": "text", "required": True},
+        {"name": "Account No", "form": "account_no", "type": "text", "required": True},
+        {"name": "Notes", "form": "notes", "type": "textarea"},
+    ],
+    "unique_col": None,  # composite (Campus, Dept, Account No); dedup on load
+}
+
 
 # ---------------------------------------------------------------------------
 # Vendor Conflicts: description ↔ Asana Contract Reason Text scoring
@@ -2235,6 +2255,39 @@ def register_routes(app: Flask) -> None:
                            insert=sqlite_client.insert_learned_mapping,
                            update=sqlite_client.update_learned_mapping,
                            delete=sqlite_client.delete_learned_mapping)
+    _register_admin_routes(app, _ADMIN_IGNORE_RULES, "ignore_rules",
+                           "/ignore-rules",
+                           insert=sqlite_client.insert_ignore_rule,
+                           update=sqlite_client.update_ignore_rule,
+                           delete=sqlite_client.delete_ignore_rule)
+
+    @app.route("/ignore-rule-contracts", methods=["GET"])
+    def ignore_rule_contracts():
+        """Read-only detector: open Asana contracts coded to an Ignore Rule
+        triple. Once we drop that triple's spend, such a contract reads 0%
+        forever — surface it so the operator retires/recodes it in Asana. The
+        engine never mutates Asana here."""
+        from engine import asana_client, asana_contracts, attribution, campus_map
+        ignore_rules = sqlite_client.load_ignore_rules(g.conn)
+        forward_overrides, drop_override = sqlite_client.load_campus_map_overrides(g.conn)
+        crosswalk = campus_map.build(forward_overrides, drop_override)
+        asana_error = None
+        hits = []
+        try:
+            contracts = asana_contracts.load_open_contracts(
+                asana_client.get_api_client())
+            hits = attribution.find_contracts_matching_ignore_rules(
+                contracts, ignore_rules, crosswalk)
+        except Exception as exc:  # noqa: BLE001 — surfaced via the page banner
+            asana_error = str(exc)
+        return render_template(
+            "ignore_rule_contracts.html",
+            hits=[{"name": c.name, "gid": c.gid, "campus": "|".join(sorted(c.campus_options)),
+                   "dept": c.dept, "acc": c.acc, "rule": "|".join(rule)}
+                  for c, rule in hits],
+            rules=sorted(ignore_rules),
+            asana_error=asana_error,
+        )
 
     # ------------------------------------------------------------------
     # /learned-mappings/purge-stale — operator-triggered "unlearning"
