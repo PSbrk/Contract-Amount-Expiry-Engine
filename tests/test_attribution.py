@@ -620,6 +620,39 @@ def test_coding_mismatch_with_campus_mismatch_stays_unmatched():
     assert len(run.unmatched) == 1
 
 
+def test_miscoded_candidate_must_be_live():
+    """A coding-mismatch whose only vendor match is a Pending/not-Active task is
+    NOT offered as 'miscoded' — accepting a dead target could never attribute.
+    It stays unmatched (the pending task still shows as a vendor-only hint)."""
+    df = _df(
+        {"Record No": "R1", "Campus": "EKC", "Dept": "000", "Account No": "63040",
+         "Vendor": "Travis Hutton", "Record Description": "x", "Amount": 500.0},
+    )
+    pending = Contract(
+        gid="g_pend", name="Travis Hutton", campus_options=frozenset({"EKC"}),
+        contract_amount=10000.0, target_start=None, due_on=date(2027, 7, 9),
+        status="Pending", expire_countdown=None, pm_email=None,
+        section_name="Pending Onboarding", dept="000", acc="63080",
+    )
+    run = attribute(df, [pending], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings={})
+    assert len(run.miscoded) == 0
+    assert len(run.unmatched) == 1
+
+
+def test_miscoded_live_candidate_still_offered():
+    """Regression guard: a LIVE coding-mismatch candidate is still surfaced as
+    miscoded (the live-filter must not swallow real targets)."""
+    df = _df(
+        {"Record No": "R1", "Campus": "EKC", "Dept": "000", "Account No": "63040",
+         "Vendor": "Travis Hutton", "Record Description": "x", "Amount": 500.0},
+    )
+    live = _coded("Travis Hutton", frozenset({"EKC"}), dept="000", acc="63080")
+    run = attribute(df, [live], aliases={}, crosswalk=campus_map.build(),
+                    learned_mappings={})
+    assert len(run.miscoded) == 1
+
+
 def test_capex_account_charge_not_routed_to_miscoded():
     """A charge coded to the CapEx account (63015) whose vendor matches an
     OPEX contract is NOT 'miscoded' — CapEx is the other tier (matched by

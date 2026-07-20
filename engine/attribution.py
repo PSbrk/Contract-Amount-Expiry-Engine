@@ -967,15 +967,22 @@ def _attribute_row(
         # for opex-vs-opex coding only. A 63015 charge stays "unmatched" here;
         # the CapEx tier and the cross-tier hint own the CapEx concerns.
         if account_no != settings.CAPEX_ACCOUNT_NO:
-            mc_winner, mc_surviving = _narrow_and_pick(
-                vendor_candidates, campus=campus, row_date=row_date,
-                record_description=record_description, crosswalk=crosswalk,
-            )
-            miscoded_candidates = (
-                (mc_winner,) if mc_winner is not None else tuple(mc_surviving)
-            )
-            if miscoded_candidates:
-                return "miscoded", None, miscoded_candidates, tuple(vendor_candidates)
+            # Only LIVE contracts can be miscoded-accept targets. A Pending /
+            # not-yet-Active task can never attribute the spend if accepted (it
+            # isn't on the live Dashboard), so offering it strands the operator
+            # on identical-named dead GIDs. Drop non-live vendor matches before
+            # narrowing; if none remain live, it's a plain unmatched miss.
+            live_vendor_candidates = [c for c in vendor_candidates if _is_live(c)]
+            if live_vendor_candidates:
+                mc_winner, mc_surviving = _narrow_and_pick(
+                    live_vendor_candidates, campus=campus, row_date=row_date,
+                    record_description=record_description, crosswalk=crosswalk,
+                )
+                miscoded_candidates = (
+                    (mc_winner,) if mc_winner is not None else tuple(mc_surviving)
+                )
+                if miscoded_candidates:
+                    return "miscoded", None, miscoded_candidates, tuple(vendor_candidates)
         return "unmatched", None, (), tuple(vendor_candidates)
 
     # 4-7. Campus + date + description + tiebreak.
@@ -1000,6 +1007,15 @@ def _attribute_row(
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def _is_live(c: Contract) -> bool:
+    """A contract eligible to receive attribution: in the write-gate section
+    (e.g. "Active - Compliant") OR explicitly Active. Mirrors
+    passes_live_gate's active test, minus the term window. Pending/Onboarding
+    tasks fail it — they can never attribute spend, so they must not be offered
+    as miscoded-accept targets."""
+    return c.section_name == settings.ASANA_WRITE_GATE_SECTION or c.status == "Active"
+
+
 def find_contracts_matching_ignore_rules(
     contracts: Iterable[Contract],
     ignore_rules: frozenset[tuple[str, str, str]],
@@ -1019,10 +1035,9 @@ def find_contracts_matching_ignore_rules(
     active test (section == write-gate OR status Active), minus the term window
     the detector doesn't need.
     """
-    write_gate = settings.ASANA_WRITE_GATE_SECTION
     hits: list[tuple[Contract, tuple[str, str, str]]] = []
     for c in contracts:
-        if not (c.section_name == write_gate or c.status == "Active"):
+        if not _is_live(c):
             continue
         for rule in ignore_rules:
             r_campus, r_dept, r_acc = rule
