@@ -41,6 +41,7 @@ from typing import Protocol, runtime_checkable
 
 import pandas as pd
 
+from engine.filters import snd_no_vendor_mask
 from engine.sqlite_client import file_hash_already_processed, sha256_hex
 
 
@@ -360,6 +361,16 @@ def parse_tableau_export(
     # from 'Bill - X:' descriptions; force 'Reversed --' rows negative so
     # they net out against the original charge. See _apply_description_repairs.
     df = _apply_description_repairs(df)
+
+    # Drop SND-tagged vendorless rows entirely (case-sensitive 'SND' in
+    # Reference + blank Vendor) — operator-declared noise, not real spend.
+    # Done AFTER the Vendor backfill so a 'Bill - X:' row that now has a
+    # vendor survives, and BEFORE the in/out-of-scope split so these rows
+    # never inflate the sanity gate's out-of-scope ratio.
+    snd = snd_no_vendor_mask(df)
+    if snd.any():
+        log.info("ingest: dropped %d SND vendorless row(s).", int(snd.sum()))
+        df = df.loc[~snd].copy()
 
     # Parse Date: M/D/YYYY (unpadded month/day OK with this format string).
     df["Date"] = pd.to_datetime(df["Date"], format="%m/%d/%Y", errors="raise")
